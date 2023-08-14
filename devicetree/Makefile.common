@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: GPL-2.0
+
+ARCH?=arm64
+
+TECHPACK_BINDING_DIR=$(PWD)
+TECHPACK_DTSTREE=$(TECHPACK_BINDING_DIR)
+
+#set KERNEL_DIR to appropriate mainline kernel top directory which is built already
+#atlest to the extent of generating .config file
+
+#Include the paths for DT binding header files. First two are standard paths
+# found in mainline kernel. Post that, add any paths for module specific, out
+# of tree defination of the device tree bindings. Here, last two paths contain
+# the out of tree device tree bindings.
+TECHPACK_INCLUDE := $(KERNEL_DIR)/scripts/dtc/include-prefixes
+TECHPACK_INCLUDE += $(KERNEL_DIR)/include
+TECHPACK_INCLUDE += $(TECHPACK_BINDING_DIR)
+
+dtbs:
+	$(MAKE) -C $(KERNEL_DIR) ARCH=$(ARCH) dtstree=$(TECHPACK_DTSTREE) \
+		DTC_INCLUDE="$(TECHPACK_INCLUDE)" dtbs
