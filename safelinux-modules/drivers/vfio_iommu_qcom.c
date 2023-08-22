@@ -17,7 +17,6 @@
 #include <linux/vfio.h>
 #include <linux/workqueue.h>
 #include <linux/notifier.h>
-#include <linux/dma-iommu.h>
 #include <linux/irqdomain.h>
 #include "vfio.h"
 #define DRIVER_VERSION  "0.1"
