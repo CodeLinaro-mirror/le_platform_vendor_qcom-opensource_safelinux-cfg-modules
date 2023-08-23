@@ -53,9 +53,11 @@ rm -rf $RPM_BUILD_ROOT
 %{_includedir}/linux/iommu_iova_map.h
 %{_includedir}/uapi/misc/iommu_iova_map_user.h
 %{_includedir}/uapi/misc/kiumd.h
+%{_includedir}/uapi/misc/scm_user_intf.h
 
 %files
 /lib/modules/%{kversion}/extra/drivers/apps_pinctrl.ko
+/lib/modules/%{kversion}/extra/drivers/scm_user_intf.ko
 /lib/modules/%{kversion}/extra/drivers/vfio_iommu_qcom.ko
 /lib/modules/%{kversion}/extra/drivers/iommu_iova_map.ko
 /lib/modules/%{kversion}/extra/drivers/kiumd.ko
