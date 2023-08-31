@@ -24,6 +24,10 @@
 #define IOMMU_PRIV      (1 << 5)
 #define DMA_ATTR_PRIVILEGED	(1UL << 9)
 
+#define HANDLE_TO_FD    -1
+#define FD_TO_HANDLE    -2
+#define CLOSE_HANDLE    -3
+
 enum kiumd_iova_addr_type {
 	KGSL_SMMU_GLOBALPT_FIXED_ADDR_SET,
 	KGSL_SMMU_GLOBALPT_FIXED_ADDR_CLEAR,
@@ -55,6 +59,7 @@ struct kiumd_user {
 	int dma_attr;
 	int dma_direction;
 	int ptselect;
+	__u32 handle;
 };
 
 #endif /* __KIUMD_H__ */
