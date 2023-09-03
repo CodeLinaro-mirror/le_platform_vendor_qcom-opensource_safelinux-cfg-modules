@@ -22,4 +22,5 @@ obj-m += drivers/vfio_iommu_qcom.o
 obj-m += drivers/kiumd.o
 obj-m += drivers/qcom_uscmi.o
 obj-m += drivers/kryo_arm64_edac.o
+obj-m += drivers/kiumd_kgsl.o
 

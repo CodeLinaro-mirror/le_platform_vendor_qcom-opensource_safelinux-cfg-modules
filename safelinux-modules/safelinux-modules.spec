@@ -64,6 +64,7 @@ rm -rf $RPM_BUILD_ROOT
 /lib/modules/%{kversion}/extra/drivers/kiumd.ko
 /lib/modules/%{kversion}/extra/drivers/qcom_uscmi.ko
 /lib/modules/%{kversion}/extra/drivers/kryo_arm64_edac.ko
+/lib/modules/%{kversion}/extra/drivers/kiumd_kgsl.ko
 
 %changelog
 * Wed Aug 28 2023 Deepti Jaggi <quic_djaggi@quicinc.com> 1.1
