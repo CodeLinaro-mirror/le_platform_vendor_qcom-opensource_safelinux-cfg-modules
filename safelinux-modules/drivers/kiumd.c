@@ -4,7 +4,6 @@
 #include <linux/completion.h>
 #include <linux/device.h>
 #include <linux/dma-buf.h>
-#include <linux/dma-mapping.h>
 #include <linux/idr.h>
 #include <linux/list.h>
 #include <linux/miscdevice.h>
@@ -20,7 +19,6 @@
 #include <uapi/misc/kiumd.h>
 #include <linux/iommu.h>
 #include <linux/types.h>
-#include <linux/dma-iommu.h>
 #include <linux/iova.h>
 #include <linux/adreno-smmu-priv.h>
 #include <linux/io-pgtable.h>
@@ -28,13 +26,13 @@
 #include <linux/kvm_host.h>
 #include <linux/cdev.h>
 #include <linux/module.h>
-#include <linux/qcom_scm.h>
+#include <linux/firmware/qcom/qcom_scm.h>
 #include <linux/iommu_iova_map.h>
 #include <linux/sizes.h>
 
 #include "arm-smmu.h"
 
-extern int qcom_adreno_smmu_set_ttbr0_cfg(const void *cookie, const struct io_pgtable_cfg *pgtbl_cfg);
+//extern int qcom_adreno_smmu_set_ttbr0_cfg(const void *cookie, const struct io_pgtable_cfg *pgtbl_cfg);
 
 /*Global Data structures needed for buffer sharing */
 static DEFINE_MUTEX(g_kiumd_lock);
@@ -152,11 +150,14 @@ int kiumd_perprocess_set_user_context(struct kiumd_dev *ki_dev, char __user *arg
 		return -ENOMEM;
 	}
 	cookie = (void*)smmu_dom;
+	//Temporally commenting below code to compile against upstream kernel,will uncomment
+	//this code after fix
+	/*
 	qcom_adreno_smmu_set_ttbr0_cfg(cookie, &cfg);
 	ret = qcom_scm_kgsl_set_smmu_aperture(cbindx);
 	if (ret == -EBUSY)
 		ret = qcom_scm_kgsl_set_smmu_aperture(cbindx);
-
+	*/
 	if (ret) {
 		pr_err("%s:Setting smmu aperture error \n",__func__);
 		return ret;
@@ -472,11 +473,14 @@ int kiumd_dmabuf_vfio_map(struct kiumd_dev *ki_dev, char __user *arg)
 		return -ENOTTY;
 	}
 
+	//temporally commenting the below code to compile against upstearm kernel
+	//will remove this later.
+	/*
 	if(kiusr.dma_attr == DMA_ATTR_PRIVILEGED)
 		dmabufattach->dma_map_attrs = kiusr.dma_attr;
 	else
 		dmabufattach->dma_map_attrs = 0;
-
+        */
 	if(kiusr.dma_direction == 1 )
 		kiumd_dma_direction = kiusr.dma_direction;
 	else
