@@ -17,6 +17,7 @@ EXTRA_CFLAGS += $(INCS)
 
 obj-m += drivers/apps_pinctrl.o
 obj-m += drivers/iommu_iova_map.o
+obj-m += drivers/scm_user_intf.o
 obj-m += drivers/vfio_iommu_qcom.o
 obj-m += drivers/kiumd.o
 
