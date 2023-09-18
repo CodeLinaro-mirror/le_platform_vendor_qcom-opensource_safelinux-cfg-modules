@@ -5,6 +5,7 @@
  */
 #include <linux/module.h>
 #include <linux/of_address.h>
+#include <linux/pinctrl/consumer.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/gpio.h>
