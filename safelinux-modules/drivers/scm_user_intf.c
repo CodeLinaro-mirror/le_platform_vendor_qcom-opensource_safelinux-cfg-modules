@@ -140,10 +140,11 @@ static int qcom_scm_intf_probe(struct platform_device *pdev)
 	if (!dev_data)
 		return -ENOMEM;
 
+	scm_id++;
 	device_initialize(&dev_data->dev);
 	dev_data->dev.devt = MKDEV(MAJOR(scm_user_intf_devt), scm_id);
         dev_data->dev.parent = &pdev->dev;
-        dev_set_name(&dev_data->dev, "scm_dev%d", scm_id++);
+        dev_set_name(&dev_data->dev, "scmnode");
 	dev_data->scm_pdev = scm_pdev;
 
 	cdev_init(&dev_data->cdev, &qcom_scm_fops);
