@@ -3,3 +3,5 @@
  */
 
 #define SCM_HAND_SHAKE_IOCTL       _IOWR('R', 10, struct scm_hand_shake)
+
+int qcom_scm_kgsl_set_smmu_aperture(unsigned int num_context_bank);

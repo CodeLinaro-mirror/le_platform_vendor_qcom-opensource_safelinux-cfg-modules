@@ -30,10 +30,9 @@
 #include <linux/iommu_iova_map.h>
 #include <linux/sizes.h>
 #include <linux/xarray.h>
+#include <uapi/misc/scm_user_intf.h>
 
 #include "arm-smmu.h"
-
-//extern int qcom_adreno_smmu_set_ttbr0_cfg(const void *cookie, const struct io_pgtable_cfg *pgtbl_cfg);
 
 /*Global Data structures needed for buffer sharing */
 static DEFINE_MUTEX(g_kiumd_lock);
