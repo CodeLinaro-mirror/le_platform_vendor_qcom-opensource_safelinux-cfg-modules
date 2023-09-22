@@ -39,11 +39,11 @@
 static DEFINE_MUTEX(g_kiumd_lock);
 static DEFINE_XARRAY_ALLOC(kiumd_xa);
 
-unsigned long *global_map = NULL;
-unsigned long *perprocess_map = NULL;
+/*No.of pages for 3GB IOVA space with 4K page size*/
+#define KGSL_PT_MEM_PAGES 0xC0000
+static DECLARE_BITMAP(global_map, KGSL_PT_MEM_PAGES);
+static DECLARE_BITMAP(perprocess_map, KGSL_PT_MEM_PAGES);
 
-#define KGSL_PT_MEM_SIZE (1024 * SZ_1M)
-#define KGSL_PT_MEM_PAGES (KGSL_PT_MEM_SIZE >> PAGE_SHIFT)
 #define KGSL_GLOBAL_PT_BASE_IOVA 0xFFFFFF8000000000
 #define KGSL_PER_PROCESS_PT_BASE_IOVA 0x60000000
 #define KGSL_GLOBAL_PT 1
@@ -350,44 +350,32 @@ void clear_map_iova(u64 iova, u64 size, int ptselect)
 	}
 }
 
-u64 get_map_offset(u64 size, int ptselect)
+s64 get_map_offset(u64 size, int ptselect)
 {
 	int start = 0;
 	u64 bit, offset;
 	if (ptselect == KGSL_GLOBAL_PT){
-		if(global_map == NULL) {
-			global_map = kcalloc(BITS_TO_LONGS(KGSL_PT_MEM_PAGES),
-                                        sizeof(unsigned long), GFP_KERNEL);
-			if (!global_map)
-				return (u64) -ENOMEM;
-		}
 		bit = bitmap_find_next_zero_area(global_map, KGSL_PT_MEM_PAGES, start, size >> PAGE_SHIFT, 0);
-		if(bit < 0) {
+		if(bit > KGSL_PT_MEM_PAGES-2) {
 			pr_err( "Invalid next zero area in bitmap\n");
-			return (u64) -ENOTTY;
+			return (s64) -ENOTTY;
 		}
 		bitmap_set(global_map, bit, size >> PAGE_SHIFT);
 		offset = bit << PAGE_SHIFT;
 	}
 	else if (ptselect == KGSL_PER_PROCESS_PT)
 	{
-		if(perprocess_map == NULL) {
-			perprocess_map = kcalloc(BITS_TO_LONGS(KGSL_PT_MEM_PAGES),
-						sizeof(unsigned long), GFP_KERNEL);
-			if (!perprocess_map)
-				return (u64) -ENOMEM;
-		}
 		bit = bitmap_find_next_zero_area(perprocess_map, KGSL_PT_MEM_PAGES, start, size >> PAGE_SHIFT, 0);
-		if(bit < 0) {
+		if(bit > KGSL_PT_MEM_PAGES-2) {
 			pr_err("Invalid next zero area in bitmap\n");
-			return (u64) -ENOTTY;
+			return (s64) -ENOTTY;
 		}
 		bitmap_set(perprocess_map, bit, size >> PAGE_SHIFT);
 		offset = bit << PAGE_SHIFT;
 	}
 	else {
 		pr_err("Invalid ptselect\n");
-		return (u64) -EINVAL;
+		return (s64) -EINVAL;
 	}
 
 	return offset;
@@ -434,7 +422,8 @@ int kiumd_dmabuf_vfio_map(struct kiumd_dev *ki_dev, char __user *arg)
 	struct dma_buf_attachment *dmabufattach = NULL;
 	struct sg_table *sgt = NULL;
 	int kiumd_dma_direction, ret;
-	u64 offset, size;
+	u64 size;
+	s64 offset;
 
 	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user)))
 		return -EFAULT;
@@ -464,7 +453,7 @@ int kiumd_dmabuf_vfio_map(struct kiumd_dev *ki_dev, char __user *arg)
 			 return -ENOMEM;
 		}
 
-		ret = set_map_iova(offset, vfio_dev, kiusr.ptselect);
+		ret = set_map_iova((u64)offset, vfio_dev, kiusr.ptselect);
 		if(ret < 0) {
 			pr_err("%s:failed to set offset \n",__func__);
 			return -ENOMEM;
