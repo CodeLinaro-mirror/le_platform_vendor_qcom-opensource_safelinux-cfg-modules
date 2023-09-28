@@ -43,6 +43,10 @@ static DECLARE_BITMAP(perprocess_map, KGSL_PT_MEM_PAGES);
 #define KGSL_GLOBAL_PT_BASE_IOVA 0xFFFFFF8000000000
 #define KGSL_PER_PROCESS_PT_BASE_IOVA 0x60000000
 
+#define MAX_KIUMD_ACL_ENTRIES 64
+#define KIUMD_MAX_VMID        64
+#define KIUMD_MAX_PERMS       8
+
 struct dmabuf_fd {
 	struct dma_buf *kiumd_dmabuf; //Value
 	uint32_t token;  //Key
@@ -1199,6 +1203,502 @@ int kiumd_fd_dmabuf_handler(char __user *arg)
 	return 0;
 }
 
+static int kiumd_io_pgtable_hyp_assign_page(u32 *vmid, u64 page, u32 nr_acl_entries)
+{
+	int ret;
+	int i = 0;
+	u64 src_vmid_list = BIT(QCOM_SCM_VMID_HLOS);
+	struct qcom_scm_vmperm *dst_vmids;
+
+	dst_vmids = kcalloc((nr_acl_entries + 1), sizeof(struct qcom_scm_vmperm), GFP_KERNEL);
+	if (!dst_vmids)
+		return -ENOMEM;
+
+	dst_vmids[i].vmid = QCOM_SCM_VMID_HLOS;
+	dst_vmids[i].perm = QCOM_SCM_PERM_RW;
+	pr_debug("Hyp assign page for dst:%d vmid:%d perm:%d total vmids:%d\n",
+		 i, dst_vmids[i].vmid, dst_vmids[i].perm, nr_acl_entries + 1);
+	i++;
+
+	for (; i < nr_acl_entries + 1; i++) {
+		dst_vmids[i].vmid = vmid[i - 1];
+		dst_vmids[i].perm = QCOM_SCM_PERM_READ;
+		pr_debug("Hyp assign page for dst:%d vmid:%d perm:%d\n",
+			 i, dst_vmids[i].vmid, dst_vmids[i].perm);
+	}
+
+	ret = qcom_scm_assign_mem(page, PAGE_SIZE, &src_vmid_list, dst_vmids, nr_acl_entries + 1);
+	if (ret)
+		pr_err("hyp assign for %llu address of size %lx rc:%d\n",
+		       page, PAGE_SIZE, ret);
+	kfree(dst_vmids);
+	return ret;
+}
+
+static int kiumd_io_pgtable_hyp_unassign_page(u32 *vmid, u64 page, u32 nr_acl_entries)
+{
+	int ret;
+	u64 src_vmid_list = BIT(QCOM_SCM_VMID_HLOS);
+
+	struct qcom_scm_vmperm dst_vmids[] = { {QCOM_SCM_VMID_HLOS,
+						QCOM_SCM_PERM_RWX } };
+	for (int i = 0; i < nr_acl_entries ; i++) {
+		src_vmid_list |= BIT(vmid[i]);
+		pr_debug("Hyp unassign page for dst:%d vmid:%d\n",
+			 i, vmid[i]);
+	}
+
+	ret = qcom_scm_assign_mem(page, PAGE_SIZE, &src_vmid_list,
+				  dst_vmids, ARRAY_SIZE(dst_vmids));
+	if (ret)
+		pr_err("hyp unassign failed %llu address of size %lx rc:%d\n",
+		       page, PAGE_SIZE, ret);
+	return ret;
+}
+
+static int kiumd_hyp_unassign_sg(struct sg_table *sgt, int *source_vm_list,
+				 int source_nelems, bool clear_page_private)
+{
+	u64 src_vmid_list = 0;
+	struct qcom_scm_vmperm dst_vmids[] = { {QCOM_SCM_VMID_HLOS,
+						QCOM_SCM_PERM_RWX } };
+	struct scatterlist *sg;
+	int ret, i;
+
+	if (source_nelems <= 0)
+		return -EINVAL;
+
+	if (!sgt)
+		return -EINVAL;
+
+	if (!sgt->sgl)
+		return -EINVAL;
+
+	sg = sgt->sgl;
+
+	for (int j = 0; j < source_nelems ; j++) {
+		src_vmid_list |= BIT(source_vm_list[j]);
+		pr_debug("Hyp unassign sg for dst:%d vmid:%d\n",
+			 j, source_vm_list[j]);
+	}
+
+	do {
+		pr_debug("%s: memory ownership transfer start\n", __func__);
+		ret = qcom_scm_assign_mem(page_to_phys(sg_page(sg)), sg->length, &src_vmid_list,
+					  dst_vmids, ARRAY_SIZE(dst_vmids));
+		if (ret) {
+			pr_err("Hyp unassign failed %llu address of size %x rc:%d\n",
+			       page_to_phys(sg_page(sg)), sg->length, ret);
+			goto out;
+		}
+		pr_debug("%s: memory ownership transfer end:%d\n", __func__, ret);
+		sg = sg_next(sg);
+	} while (sg);
+
+	if (clear_page_private)
+		for_each_sg(sgt->sgl, sg, sgt->nents, i)
+			ClearPagePrivate(sg_page(sg));
+out:
+	return ret;
+}
+
+static int kiumd_hyp_assign_sg(struct sg_table *sgt, int *dest_vm_list,
+			       int dest_nelems, bool set_page_private, int *dest_perms)
+{
+	u64 src_vmid_list = BIT(QCOM_SCM_VMID_HLOS);
+	int ret;
+	struct qcom_scm_vmperm *dst_vmids;
+	struct scatterlist *sg;
+
+	if (dest_nelems <= 0) {
+		pr_err("%s: dest_nelems invalid\n", __func__);
+		return -EINVAL;
+	}
+
+	if (!sgt)
+		return -EINVAL;
+
+	sg = sgt->sgl;
+	if (!sg)
+		return -EINVAL;
+
+	dst_vmids = kcalloc(dest_nelems, sizeof(struct qcom_scm_vmperm), GFP_KERNEL);
+	if (!dst_vmids)
+		return -ENOMEM;
+
+	for (int i = 0; i < dest_nelems; i++) {
+		dst_vmids[i].vmid = dest_vm_list[i];
+		dst_vmids[i].perm = dest_perms[i];
+		pr_debug("Hyp assign sg for dst:%d vmid:%d perm:%d\n",
+			 i, dst_vmids[i].vmid, dst_vmids[i].perm);
+	}
+
+	do {
+		pr_debug("Assign call initiated\n");
+		ret = qcom_scm_assign_mem(page_to_phys(sg_page(sg)), sg->length, &src_vmid_list,
+					  dst_vmids, dest_nelems);
+		if (ret) {
+			pr_err("failed qcom_assign for assigning %llu address of size %x rc:%d\n",
+			       page_to_phys(sg_page(sg)), sg->length, ret);
+			goto err;
+		}
+		pr_debug("Assign call success:%d\n", ret);
+		sg = sg_next(sg);
+	} while (sg);
+	pr_debug("%s success\n", __func__);
+err:
+	kfree(dst_vmids);
+	return ret;
+}
+
+int kiumd_acl_to_vmid_perms_list(unsigned int nr_acl_entries, const void __user *acl_entries,
+				 int **dst_vmids, int **dst_perms)
+{
+	int ret, i, *vmids, *perms;
+	struct kiumd_acl_entry entry;
+
+	if (!nr_acl_entries || !acl_entries) {
+		pr_err("%s:%d Invalid params entries:%d\n", __func__, __LINE__, nr_acl_entries);
+		return -EINVAL;
+	}
+
+	if (nr_acl_entries > MAX_KIUMD_ACL_ENTRIES) {
+		pr_err("%s:%d Invalid params\n", __func__, __LINE__);
+		return -EINVAL;
+	}
+
+	vmids = kmalloc_array(nr_acl_entries, sizeof(*vmids), GFP_KERNEL);
+	if (!vmids)
+		return -ENOMEM;
+
+	perms = kmalloc_array(nr_acl_entries, sizeof(*perms), GFP_KERNEL);
+	if (!perms) {
+		kfree(vmids);
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < nr_acl_entries; i++) {
+		ret = copy_struct_from_user(&entry, sizeof(entry),
+					    acl_entries + (sizeof(entry) * i),
+					    sizeof(entry));
+		if (ret < 0) {
+			pr_err("%s:%d Invalid params\n", __func__, __LINE__);
+			goto out;
+		}
+
+		vmids[i] = entry.vmid;
+		perms[i] = entry.perms;
+		pr_debug("%d vmid:%d perms:%d\n", i, vmids[i], perms[i]);
+		if (vmids[i] < 0 || perms[i] < 0 ||
+		    vmids[i] > KIUMD_MAX_VMID ||
+		    perms[i] > KIUMD_MAX_PERMS) {
+			ret = -EINVAL;
+			goto out;
+		}
+	}
+
+	*dst_vmids = vmids;
+	*dst_perms = perms;
+	return ret;
+
+out:
+	kfree(perms);
+	kfree(vmids);
+	return ret;
+}
+
+int kiumd_get_pgd(struct vfio_device *vfio_dev, u64 *pgd)
+{
+	struct iommu_domain *iommu_dom;
+	struct arm_smmu_domain *smmu_dom;
+	struct io_pgtable *pgtable;
+
+	if (!pgd) {
+		pr_err("%s:%d invalid params\n", __func__, __LINE__);
+		return -EINVAL;
+	}
+
+	iommu_dom = kiumd_iommu_get_dma_domain(vfio_dev->dev);
+	if (!iommu_dom) {
+		pr_err("%s:%d Failed to get IOMMU DOMAIN VFIO\n", __func__, __LINE__);
+		return -EINVAL;
+	}
+
+	smmu_dom = container_of(iommu_dom, struct arm_smmu_domain, domain);
+	if (!smmu_dom || !smmu_dom->pgtbl_ops) {
+		pr_err("%s:%d failed to get smmu_dom\n", __func__, __LINE__);
+		return -EINVAL;
+	}
+
+	pgtable = io_pgtable_ops_to_pgtable(smmu_dom->pgtbl_ops);
+	if (!pgtable) {
+		pr_err("%s:%d failed to get pgtabl ops\n", __func__, __LINE__);
+		return -EINVAL;
+	}
+
+	*pgd = pgtable->cfg.arm_lpae_s1_cfg.ttbr;
+
+	return 0;
+}
+
+int kiumd_dmabuf_vfio_secure_map(char __user *arg)
+{
+	struct kiumd_user kiusr;
+	struct vfio_device *vfio_dev = NULL;
+	struct file *file = NULL;
+	struct dma_buf *kiumd_dmabuf = NULL;
+	struct dma_buf_attachment *dmabufattach = NULL;
+	struct sg_table *sgt = NULL;
+	int kiumd_dma_direction;
+	u64 pgd = 0;
+	int ret = 0;
+	int *vmids, *perms;
+
+	pr_debug(" %s: Entering.....\n", __func__);
+	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user))) {
+		pr_err("%s:%d bad params from user\n", __func__, __LINE__);
+		return -EFAULT;
+	}
+
+	if (kiusr.vfio_fd < 0) {
+		pr_err("%s:%d invalid fd from user\n", __func__, __LINE__);
+		return -EBADF;
+	}
+
+	file = fget(kiusr.vfio_fd);
+	if (!file) {
+		pr_err("%s:%d failed to get file from vfio fd\n", __func__, __LINE__);
+		return -EBADF;
+	}
+
+	vfio_dev = (struct vfio_device *)file->private_data;
+	if (!vfio_dev) {
+		pr_err("%s:%d vfio_dev is NULL\n", __func__, __LINE__);
+		ret = -EINVAL;
+		goto close_file;
+	}
+
+	if (!vfio_dev->dev) {
+		ret = -EINVAL;
+		pr_err("%s:%d invalid device\n", __func__, __LINE__);
+		goto close_file;
+	}
+
+	ret = kiumd_get_pgd(vfio_dev, &pgd);
+	if (ret) {
+		pr_err("%s:%d invalid params\n", __func__, __LINE__);
+		goto close_file;
+	}
+
+	pr_debug("Kiumd VM page table ttbr:%llx\n", pgd);
+
+	kiumd_dmabuf = dma_buf_get(kiusr.dma_buf_fd);
+	if (IS_ERR_OR_NULL(kiumd_dmabuf)) {
+		pr_err("%s:%d invalid params\n", __func__, __LINE__);
+		ret = !kiumd_dmabuf ? -EINVAL : PTR_ERR(kiumd_dmabuf);
+		goto close_file;
+	}
+
+	ret = kiumd_acl_to_vmid_perms_list(kiusr.mem_parcel.nr_acl_entries,
+					   (void *)kiusr.mem_parcel.acl_list, &vmids, &perms);
+	if (ret) {
+		pr_err("%s:%d Invalid params\n", __func__, __LINE__);
+		goto close_file;
+	}
+
+	dmabufattach = dma_buf_attach(kiumd_dmabuf, vfio_dev->dev);
+	if (IS_ERR(dmabufattach)) {
+		pr_err("%s:%d dmabufattach is invalid\n", __func__, __LINE__);
+		ret = PTR_ERR(dmabufattach);
+		goto free_mem;
+	}
+
+	if (!dmabufattach->priv) {
+		ret = -EINVAL;
+		pr_err("%s:%d dma heap attachment is NULL\n", __func__, __LINE__);
+		goto detach;
+	}
+
+	sgt = ((struct kiumd_dma_heap_attachment *)(dmabufattach->priv))->table;
+	if (!sgt) {
+		pr_err("%s:%d sgt is NULL\n", __func__, __LINE__);
+		ret = -EINVAL;
+		goto detach;
+	}
+
+	if (!sgt->sgl) {
+		ret = -EINVAL;
+		pr_err("%s:%d sgl is NULL\n", __func__, __LINE__);
+		goto detach;
+	}
+
+	pr_debug("%s:sgt from attachment:%p %llx\n", __func__, sgt, sg_phys(sgt->sgl));
+
+	/* Grant Page table read access to peripheral VM*/
+	ret = kiumd_io_pgtable_hyp_assign_page(vmids, pgd, kiusr.mem_parcel.nr_acl_entries);
+	if (ret < 0) {
+		pr_err("%s:%d ownership transfer error:%d\n", __func__, __LINE__, ret);
+		goto detach;
+	}
+	pr_debug("Pgtable ownership transfer success\n");
+
+	ret = kiumd_hyp_assign_sg(sgt, vmids, kiusr.mem_parcel.nr_acl_entries, true, perms);
+	if (ret < 0) {
+		pr_err("%s:%d ownership transfer error\n", __func__, __LINE__);
+		goto hyp_unassign_table;
+	}
+
+	if (kiusr.dma_direction == 1)
+		kiumd_dma_direction = kiusr.dma_direction;
+	else
+		kiumd_dma_direction = 0;
+
+	sgt = dma_buf_map_attachment(dmabufattach, kiumd_dma_direction);
+	if (IS_ERR(sgt)) {
+		ret = PTR_ERR(sgt);
+		pr_err("%s:%d sgt is invalid\n", __func__, __LINE__);
+		goto hyp_unassign_sg;
+	}
+
+	kiusr.sgt_ptr = (long)sgt;
+	kiusr.dmabufattach = (long)dmabufattach;
+	kiusr.dma_addr = sg_dma_address(sgt->sgl);
+	kiusr.dmabuf_ptr = (long)kiumd_dmabuf;
+
+	if (copy_to_user(arg, &kiusr, sizeof(kiusr))) {
+		pr_err("%s:%d copy_to_user failed...\n", __func__, __LINE__);
+		ret = -EFAULT;
+		goto unmap;
+	}
+
+	kfree(vmids);
+	kfree(perms);
+	fput(file);
+	pr_debug("returning from ioctl ret:%d\n", ret);
+	return ret;
+unmap:
+	dma_buf_unmap_attachment(dmabufattach, (struct sg_table *)sgt,
+				 DMA_BIDIRECTIONAL);
+hyp_unassign_sg:
+	kiumd_hyp_unassign_sg((struct sg_table *)sgt, vmids,
+			      kiusr.mem_parcel.nr_acl_entries, true);
+hyp_unassign_table:
+	kiumd_io_pgtable_hyp_unassign_page(vmids, pgd, kiusr.mem_parcel.nr_acl_entries);
+detach:
+	dma_buf_detach(kiumd_dmabuf, dmabufattach);
+	dma_buf_put(kiumd_dmabuf);
+free_mem:
+	kfree(vmids);
+	kfree(perms);
+close_file:
+	fput(file);
+	return ret;
+}
+
+int kiumd_dmabuf_vfio_secure_unmap(char __user *arg)
+{
+	struct vfio_device *vfio_dev = NULL;
+	struct file *file = NULL;
+	u64 pgd;
+	int ret = 0;
+	struct kiumd_user kiusr;
+	struct dma_buf_attachment *dmabufattach = NULL;
+	struct dma_buf *kiumd_dmabuf = NULL;
+	int *vmids, *perms;
+
+	pr_debug("%s entering\n", __func__);
+
+	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user))) {
+		pr_err("%s:%d invalid args from user\n", __func__, __LINE__);
+		return -EFAULT;
+	}
+
+	if (kiusr.vfio_fd < 0) {
+		pr_err("%s:%d invalid vfio fd\n", __func__, __LINE__);
+		return -EBADF;
+	}
+
+	file = fget(kiusr.vfio_fd);
+	if (!file) {
+		pr_err("%s:%d failed to get file from vfio fd\n", __func__, __LINE__);
+		return -EBADF;
+	}
+
+	vfio_dev = (struct vfio_device *)file->private_data;
+	if (!vfio_dev) {
+		pr_err("%s:%d vfio_dev is NULL\n", __func__, __LINE__);
+		ret = -EINVAL;
+		goto close_file;
+	}
+
+	if (!vfio_dev->dev) {
+		pr_err("%s:%d invalid params\n", __func__, __LINE__);
+		ret = -EINVAL;
+		goto close_file;
+	}
+
+	ret = kiumd_get_pgd(vfio_dev, &pgd);
+	if (ret) {
+		pr_err("%s:%d invalid params\n", __func__, __LINE__);
+		goto close_file;
+	}
+
+	/*Input param error checking for ACL happens in kiumd_acl_to_vmid_perms*/
+	ret = kiumd_acl_to_vmid_perms_list(kiusr.mem_parcel.nr_acl_entries,
+					   (void *)kiusr.mem_parcel.acl_list, &vmids, &perms);
+	if (ret) {
+		pr_err("%s:%d invalid params\n", __func__, __LINE__);
+		goto close_file;
+	}
+
+	dmabufattach = (struct dma_buf_attachment *)kiusr.dmabufattach;
+	if (!dmabufattach) {
+		pr_err("%s:%d invalid params:%d\n", __func__, __LINE__, ret);
+		ret = -EINVAL;
+		goto free_mem;
+	}
+
+	if (!kiusr.sgt_ptr) {
+		ret = -EINVAL;
+		pr_err("%s:%d invalid params:%d\n", __func__, __LINE__, ret);
+		goto free_mem;
+	}
+
+	dma_buf_unmap_attachment(dmabufattach, (struct sg_table *)kiusr.sgt_ptr,
+				 DMA_BIDIRECTIONAL);
+
+	ret = kiumd_hyp_unassign_sg((struct sg_table *)kiusr.sgt_ptr, vmids,
+				    kiusr.mem_parcel.nr_acl_entries, true);
+	if (ret < 0) {
+		pr_err("%s:%d memory ownership transfer error:%d\n", __func__, __LINE__, ret);
+		goto free_mem;
+	}
+
+	ret = kiumd_io_pgtable_hyp_unassign_page(vmids, pgd, kiusr.mem_parcel.nr_acl_entries);
+	if (ret < 0) {
+		pr_err("%s:%d memory ownership transfer error:%d\n", __func__, __LINE__, ret);
+		ret = -EINVAL;
+		goto free_mem;
+	}
+
+	pr_debug("memory ownership transfer success\n");
+
+	kiumd_dmabuf = (struct dma_buf *)kiusr.dmabuf_ptr;
+	if (!kiumd_dmabuf) {
+		pr_err("%s:%d invalid params:%d\n", __func__, __LINE__, ret);
+		ret = -EINVAL;
+		goto free_mem;
+	}
+	dma_buf_detach(kiumd_dmabuf, dmabufattach);
+	dma_buf_put(kiumd_dmabuf);
+free_mem:
+	kfree(vmids);
+	kfree(perms);
+close_file:
+	fput(file);
+
+	return ret;
+}
 
 static int kiumd_open(struct inode *inode, struct file *filp)
 {
@@ -1242,7 +1742,12 @@ static long kiumd_ioctl(struct file *file, unsigned int cmd,
 	case KIUMD_GLOBAL_PT_SET:
 		err = kiumd_global_pgtble_set(argp);
 		break;
-
+	case KIUMD_SMMU_SECURE_MAP:
+		err = kiumd_dmabuf_vfio_secure_map(argp);
+		break;
+	case KIUMD_SMMU_SECURE_UNMAP:
+		err = kiumd_dmabuf_vfio_secure_unmap(argp);
+		break;
 	default:
 		err = -ENOTTY;
 		break;

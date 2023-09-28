@@ -17,6 +17,8 @@
 #define KIUMD_FD_DMABUF_HANDLE          _IOWR('R', 19, struct kiumd_user)
 #define KIUMD_CUSTOM_IOVA_INIT          _IOWR('R', 20, struct kiumd_user)
 #define KIUMD_GLOBAL_PT_SET            _IOWR('R', 21, struct kiumd_smmu_user)
+#define KIUMD_SMMU_SECURE_MAP           _IOWR('R', 22, struct kiumd_user)
+#define KIUMD_SMMU_SECURE_UNMAP         _IOWR('R', 23, struct kiumd_user)
 
 #define IOMMU_NOEXEC    (1 << 3)
 #define IOMMU_MMIO      (1 << 4)
@@ -56,6 +58,16 @@ struct kiumd_smmu_user {
 	__u16 asid;
 };
 
+struct kiumd_acl_entry {
+	__u32 vmid;
+	__u32 perms;
+};
+
+struct kiumd_mem_parcel {
+	__u32 nr_acl_entries;
+	struct kimud_acl_entry *acl_list;
+};
+
 struct kiumd_user {
 	int vfio_fd;
 	int dma_buf_fd;
@@ -71,6 +83,7 @@ struct kiumd_user {
 	int ptselect;
 	__u32 handle;
 	int is_iova_zero;
+	struct kiumd_mem_parcel mem_parcel;
 };
 
 #endif /* __KIUMD_H__ */
