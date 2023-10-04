@@ -119,6 +119,83 @@ static const struct iommu_flush_ops kgsl_iopgtbl_tlb_ops = {
 
 struct io_pgtable *pgtable;
 
+void kiumd_smmuv2_write_context_bank(struct arm_smmu_device *smmu, int idx)
+{
+        u32 reg;
+        bool stage1;
+        struct arm_smmu_cb *cb = &smmu->cbs[idx];
+        struct arm_smmu_cfg *cfg = cb->cfg;
+
+        stage1 = cfg->cbar != CBAR_TYPE_S2_TRANS;
+
+        if (cfg->fmt == ARM_SMMU_CTX_FMT_AARCH64)
+                reg = ARM_SMMU_CBA2R_VA64;
+        else
+                reg = 0;
+
+        arm_smmu_gr1_write(smmu, ARM_SMMU_GR1_CBA2R(idx), reg);
+        reg = FIELD_PREP(ARM_SMMU_CBAR_TYPE, cfg->cbar);
+
+        if (stage1) {
+                reg |= FIELD_PREP(ARM_SMMU_CBAR_S1_BPSHCFG,
+                        ARM_SMMU_CBAR_S1_BPSHCFG_NSH) |
+                        FIELD_PREP(ARM_SMMU_CBAR_S1_MEMATTR,
+                                ARM_SMMU_CBAR_S1_MEMATTR_WB);
+        } else if (!(smmu->features & ARM_SMMU_FEAT_VMID16)) {
+                /* 8-bit VMIDs live in CBAR */
+                reg |= FIELD_PREP(ARM_SMMU_CBAR_VMID, cfg->vmid);
+        }
+
+        arm_smmu_gr1_write(smmu, ARM_SMMU_GR1_CBAR(idx), reg);
+
+        if (stage1)
+                arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_TCR2, cb->tcr[1]);
+
+                arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_TCR, cb->tcr[0]);
+
+                arm_smmu_cb_writeq(smmu, idx, ARM_SMMU_CB_TTBR0, cb->ttbr[0]);
+
+                if (stage1)
+                        arm_smmu_cb_writeq(smmu, idx, ARM_SMMU_CB_TTBR1, cb->ttbr[1]);
+
+                arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_S1_MAIR0, cb->mair[0]);
+                arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_S1_MAIR1, cb->mair[1]);
+
+                reg = ARM_SMMU_SCTLR_CFIE | ARM_SMMU_SCTLR_CFRE | ARM_SMMU_SCTLR_AFE |
+                                        ARM_SMMU_SCTLR_TRE | ARM_SMMU_SCTLR_M;
+
+                reg |= ARM_SMMU_SCTLR_S1_ASIDPNE;
+
+                smmu->impl->write_sctlr(smmu, idx, reg);
+}
+
+int kiumd_smmuv2_set_ttbr0_cfg(const void *cookie,
+                const struct io_pgtable_cfg *pgtbl_cfg)
+{
+
+        struct arm_smmu_domain *smmu_domain = (void *)cookie;
+        struct io_pgtable *pgtable = io_pgtable_ops_to_pgtable(smmu_domain->pgtbl_ops);
+        struct arm_smmu_cfg *cfg = &smmu_domain->cfg;
+        struct arm_smmu_cb *cb = &smmu_domain->smmu->cbs[cfg->cbndx];
+        u32 tcr = cb->tcr[0];
+
+        if (!(cb->tcr[0] & ARM_SMMU_TCR_EPD0)) {
+                pr_err("TTBR0 translation is already enabled");
+                return -EINVAL;
+        }
+
+        tcr |= arm_smmu_lpae_tcr(pgtbl_cfg);
+        tcr &= ~(ARM_SMMU_TCR_EPD0 | ARM_SMMU_TCR_EPD1);
+
+        cb->tcr[0] = tcr;
+        cb->ttbr[0] = pgtbl_cfg->arm_lpae_s1_cfg.ttbr;
+        cb->ttbr[0] |= FIELD_PREP(ARM_SMMU_TTBRn_ASID, cb->cfg->asid);
+
+        kiumd_smmuv2_write_context_bank(smmu_domain->smmu, cb->cfg->cbndx);
+
+        return 0;
+}
+
 int kiumd_perprocess_set_user_context(struct kiumd_dev *ki_dev, char __user *arg)
 {
 	struct kiumd_smmu_user kismmu_pproc;
@@ -163,18 +240,16 @@ int kiumd_perprocess_set_user_context(struct kiumd_dev *ki_dev, char __user *arg
 		return -ENOMEM;
 	}
 	cookie = (void*)smmu_dom;
-	//Temporally commenting below code to compile against upstream kernel,will uncomment
-	//this code after fix
-	/*
-	qcom_adreno_smmu_set_ttbr0_cfg(cookie, &cfg);
+	kiumd_smmuv2_set_ttbr0_cfg(cookie, &cfg);
 	ret = qcom_scm_kgsl_set_smmu_aperture(cbindx);
 	if (ret == -EBUSY)
 		ret = qcom_scm_kgsl_set_smmu_aperture(cbindx);
-	*/
+
 	if (ret) {
 		pr_err("%s:Setting smmu aperture error \n",__func__);
 		return ret;
 	}
+
         fput(file);
 	return 0;
 }
