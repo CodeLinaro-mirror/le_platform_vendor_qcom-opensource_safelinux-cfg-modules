@@ -9,8 +9,6 @@
 
 #define KIUMD_SMMU_MAP_BUF		_IOWR('R', 10, struct kiumd_user)
 #define KIUMD_SMMU_UNMAP_BUF	_IOWR('R', 11, struct kiumd_user)
-#define KIUMD_EXPORT_DMABUF		_IOWR('R', 12, struct kiumd_user)
-#define KIUMD_IMPORT_DMABUF		_IOWR('R', 13, struct kiumd_user)
 #define KIUMD_IOVA_MAP_CTRL             _IOWR('R', 14, struct kiumd_user)
 #define KIUMD_SET_USER_CONTEXT         _IOWR('R', 15, struct kiumd_smmu_user)
 #define KIUMD_PER_PROCESS_ALLOC 	_IOWR('R', 16, struct kiumd_smmu_user)
@@ -28,6 +26,12 @@
 #define HANDLE_TO_FD    -1
 #define FD_TO_HANDLE    -2
 #define CLOSE_HANDLE    -3
+
+#define KGSL_DEFAULT_PT   0
+#define KGSL_GLOBAL_PT 1
+#define KGSL_PER_PROCESS_PT 2
+
+
 
 enum kiumd_iova_addr_type {
 	KGSL_SMMU_GLOBALPT_FIXED_ADDR_SET,
