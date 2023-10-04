@@ -94,6 +94,22 @@ struct kiumd_iommu_dma_cookie {
          };
          struct list_head                msi_page_list;
          struct iommu_domain             *fq_domain;
+	 struct mutex			mutex;
+};
+
+struct kiumd_iommu_group {
+	struct kobject kobj;
+	struct kobject *devices_kobj;
+	struct list_head devices;
+	struct mutex mutex;
+	struct blocking_notifier_head notifier;
+	void *iommu_data;
+	void (*iommu_data_release)(void *iommu_data);
+	char *name;
+	int id;
+	struct iommu_domain *default_domain;
+	struct iommu_domain *domain;
+	struct list_head entry;
 };
 
 static void _tlb_flush_all(void *cookie)
@@ -117,6 +133,18 @@ static const struct iommu_flush_ops kgsl_iopgtbl_tlb_ops = {
 };
 
 struct io_pgtable *pgtable;
+
+struct iommu_domain *kiumd_iommu_get_dma_domain(struct device *dev)
+{
+	struct kiumd_iommu_group *iommu_group;
+	iommu_group = (struct kiumd_iommu_group *) dev->iommu_group;
+	if(!iommu_group) {
+		dev_err(dev, "%s:iommu group is invalid \n",__func__);
+		return -EINVAL;
+	}
+
+	return iommu_group->default_domain;
+}
 
 void kiumd_smmuv2_write_context_bank(struct arm_smmu_device *smmu, int idx)
 {
@@ -216,7 +244,7 @@ int kiumd_perprocess_set_user_context(struct kiumd_dev *ki_dev, char __user *arg
 		return -ENOTTY;
 	}
 
-	iommu_dom = iommu_get_domain_for_dev(vfio_dev->dev);
+	iommu_dom = kiumd_iommu_get_dma_domain(vfio_dev->dev);
 	smmu_dom = container_of(iommu_dom, struct arm_smmu_domain, domain);
 	if(smmu_dom->pgtbl_ops == NULL){
 		pr_err("%s:pagetable ops is NULL \n",__func__);
@@ -272,7 +300,7 @@ int kiumd_perprocess_pt_alloc(struct kiumd_dev *ki_dev, char __user *arg)
 		return -ENOTTY;
 	}
 
-	iommu_dom = iommu_get_domain_for_dev(vfio_dev->dev);
+	iommu_dom = kiumd_iommu_get_dma_domain(vfio_dev->dev);
 	smmu_dom = container_of(iommu_dom, struct arm_smmu_domain, domain);
 	if(smmu_dom->pgtbl_ops == NULL) {
 		pr_err("%s:pagetable ops is NULL \n",__func__);
@@ -318,7 +346,7 @@ int kiumd_perprocess_pgtble_set(struct kiumd_dev *ki_dev, char __user *arg)
 		return -ENOTTY;
 	}
 
-	iommu_dom = iommu_get_domain_for_dev(vfio_dev->dev);
+	iommu_dom = kiumd_iommu_get_dma_domain(vfio_dev->dev);
 	if(iommu_dom == NULL) {
 		pr_err("%s:IOMMU domain is NULL \n",__func__);
 		return -ENOMEM;
@@ -397,7 +425,7 @@ int kiumd_dmabuf_custom_iova_init(struct kiumd_dev *ki_dev, char __user *arg)
 		return -ENOTTY;
 	}
 
-	domain = iommu_get_domain_for_dev(vfio_dev->dev);
+	domain = kiumd_iommu_get_dma_domain(vfio_dev->dev);
 	if (domain == NULL) {
 		pr_err("%s:vfio_dev is NULL \n",__func__);
 		return -ENOTTY;
@@ -466,7 +494,7 @@ int set_map_iova(u64 offset, struct vfio_device *vfio_dev, int ptselect)
 {
 	struct iommu_domain *domain = NULL;
 	struct kiumd_iommu_dma_cookie *cookie = NULL;
-	domain = iommu_get_domain_for_dev(vfio_dev->dev);
+	domain = kiumd_iommu_get_dma_domain(vfio_dev->dev);
 	cookie = (struct kiumd_iommu_dma_cookie*)domain->iova_cookie;
 	if(!cookie){
 		pr_err("kiumd_iova_ctrl: cookie not found\n");
@@ -675,7 +703,7 @@ int kiumd_dmabuf_vfio_unmap(struct kiumd_dev *ki_dev, char __user *arg)
 				return -EFAULT;
 			}
 
-			iommu_dom = iommu_get_domain_for_dev(vfio_dev->dev);
+			iommu_dom = kiumd_iommu_get_dma_domain(vfio_dev->dev);
 			if (iommu_dom == NULL) {
 				pr_err("%s:iommu_dom is NULL \n", __func__);
 				return -EFAULT;
@@ -801,7 +829,7 @@ int kiumd_iova_ctrl(struct kiumd_dev *ki_dev, char __user *arg)
 
 	file = fget(iovausr.vfio_fd);
 	vfio_dev = (struct vfio_device *)file->private_data;
-	domain = iommu_get_domain_for_dev(vfio_dev->dev);
+	domain = kiumd_iommu_get_dma_domain(vfio_dev->dev);
 	cookie = (struct kiumd_iommu_dma_cookie*)domain->iova_cookie;
 	if(!cookie)	{
 		pr_err("kiumd_iova_ctrl: cookie not found\n");
