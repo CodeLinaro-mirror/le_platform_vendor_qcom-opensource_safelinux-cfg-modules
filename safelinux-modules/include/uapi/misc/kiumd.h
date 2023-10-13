@@ -18,6 +18,7 @@
 #define KIUMD_PER_PROCESS_FREE        _IOWR('R', 18, struct kiumd_smmu_user)
 #define KIUMD_FD_DMABUF_HANDLE          _IOWR('R', 19, struct kiumd_user)
 #define KIUMD_CUSTOM_IOVA_INIT          _IOWR('R', 20, struct kiumd_user)
+#define KIUMD_GLOBAL_PT_SET            _IOWR('R', 21, struct kiumd_smmu_user)
 
 #define IOMMU_NOEXEC    (1 << 3)
 #define IOMMU_MMIO      (1 << 4)
