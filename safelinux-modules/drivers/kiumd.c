@@ -251,11 +251,14 @@ int kiumd_perprocess_set_user_context(struct kiumd_dev *ki_dev, char __user *arg
 		return -ENOMEM;
 	}
 
-	pgtable = io_pgtable_ops_to_pgtable(smmu_dom->pgtbl_ops);
-	if(pgtable == NULL) {
-		pr_err("%s:pagetable is NULL \n",__func__);
-		return -ENOMEM;
+	if(!pgtable) {
+		pgtable = io_pgtable_ops_to_pgtable(smmu_dom->pgtbl_ops);
+		if(!pgtable) {
+			pr_err("%s:pagetable is NULL \n",__func__);
+			return -EINVAL;
+		}
 	}
+
 	cbindx = smmu_dom->cfg.cbndx;
 	memcpy(&cfg, &pgtable->cfg, sizeof(struct io_pgtable_cfg));
 	cfg.quirks &= ~IO_PGTABLE_QUIRK_ARM_TTBR1;
@@ -322,6 +325,68 @@ int kiumd_perprocess_pt_alloc(struct kiumd_dev *ki_dev, char __user *arg)
 
 	copy_to_user(arg, &kismmu_pproc, sizeof(kismmu_pproc));
 	return 0;
+}
+
+int kiumd_global_pgtble_set(struct kiumd_dev *ki_dev, char __user *arg)
+{
+
+        struct kiumd_smmu_user kismmu_pproc;
+        struct file *file;
+        struct vfio_device *vfio_dev;
+        struct iommu_domain *iommu_dom;
+        struct arm_smmu_domain *smmu_dom;
+        struct io_pgtable_ops *ki_pgtbl_ops;
+
+        if (copy_from_user(&kismmu_pproc, arg, sizeof(struct kiumd_smmu_user)))
+                return -EFAULT;
+
+        if(kismmu_pproc.vfio_fd < 0) {
+                pr_err("%s: Invalid fd from user\n",__func__);
+                return -EBADF;
+        }
+
+        file = fget(kismmu_pproc.vfio_fd);
+        if (!file) {
+                pr_err("%s:failed to get file from vfio fd \n",__func__);
+                return -EBADF;
+        }
+
+        vfio_dev = (struct vfio_device *)file->private_data;
+        if (!vfio_dev) {
+                pr_err("%s:vfio_dev is NULL \n",__func__);
+                return -ENOTTY;
+        }
+
+        iommu_dom = iommu_get_domain_for_dev(vfio_dev->dev);
+        if (!iommu_dom) {
+                pr_err("%s:IOMMU domain is NULL \n",__func__);
+                return -ENOMEM;
+        }
+
+        smmu_dom = container_of(iommu_dom, struct arm_smmu_domain, domain);
+        if (!smmu_dom) {
+                pr_err("%s:SMMU domain is NULL \n",__func__);
+                return -ENOMEM;
+        }
+
+        if(!pgtable) {
+                pgtable = io_pgtable_ops_to_pgtable(smmu_dom->pgtbl_ops);
+                if(!pgtable) {
+                        pr_err("%s:pagetable is NULL \n",__func__);
+                        return -EINVAL;
+                }
+        }
+
+        ki_pgtbl_ops = (struct io_pgtable_ops*) (&pgtable->ops);
+        if (!ki_pgtbl_ops) {
+                pr_err("%s:pagetable ops is NULL \n",__func__);
+                return -ENOMEM;
+        }
+
+        smmu_dom->pgtbl_ops = ki_pgtbl_ops;
+        fput(file);
+
+        return 0;
 }
 
 int kiumd_perprocess_pgtble_set(struct kiumd_dev *ki_dev, char __user *arg)
@@ -1009,6 +1074,9 @@ static long kiumd_ioctl(struct file *file, unsigned int cmd,
                 break;
 	case KIUMD_CUSTOM_IOVA_INIT:
 		err = kiumd_dmabuf_custom_iova_init(ki_dev, argp);
+		break;
+	case KIUMD_GLOBAL_PT_SET:
+		err = kiumd_global_pgtble_set(ki_dev, argp);
 		break;
         default:
 		err = -ENOTTY;
