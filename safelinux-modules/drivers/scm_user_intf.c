@@ -28,16 +28,6 @@ static dev_t scm_user_intf_devt;
 
 static int  scm_id;
 
-struct scm_hand_shake {
-       unsigned int svc;
-       unsigned int cmd;
-       unsigned int arginfo;
-       unsigned int args_buffer[MAX_QCOM_SCM_ARGS];
-       unsigned int ret;
-       unsigned int arg_type;
-       unsigned int qcom_scm_res[MAX_QCOM_SCM_RETS];
-};
-
 struct scm_dev_data {
 	struct platform_device *scm_pdev;
 	struct device dev;
