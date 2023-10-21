@@ -1,26 +1,25 @@
-SAFELINUX_CFG_MODULES_ROOT :=$(M)
+LINUXINCLUDE += -I$(SAFELINUX_MODULES_ROOT)/include
 
-############ UAPI ############
-UAPI_DIR :=     uapi/misc
-UAPI_INC :=	-I$(SAFELINUX_CFG_MODULES_ROOT)/include/$(UAPI_DIR)
+obj-m += apps_pinctrl.o
+apps_pinctrl-objs := drivers/apps_pinctrl.o
 
-############ COMMON ############
-COMMON_DIR :=	include
-COMMON_INC :=	-I$(SAFELINUX_CFG_MODULES_ROOT)/$(COMMON_DIR)
+obj-m += scm_user_intf.o
+scm_user_intf-objs := drivers/scm_user_intf.o
 
-LINUX_INC +=	-Iinclude/linux
+obj-m += iommu_iova_map.o
+iommu_iova_map-objs := drivers/iommu_iova_map.o
 
-INCS +=		$(COMMON_INC) \
-		$(UAPI_INC)
+obj-m += vfio_iommu_qcom.o
+vfio_iommu_qcom-objs := drivers/vfio_iommu_qcom.o
 
-EXTRA_CFLAGS += $(INCS)
+obj-m += kiumd.o
+kiumd-objs := drivers/kiumd.o
 
-obj-m += drivers/apps_pinctrl.o
-obj-m += drivers/iommu_iova_map.o
-obj-m += drivers/scm_user_intf.o
-obj-m += drivers/vfio_iommu_qcom.o
-obj-m += drivers/kiumd.o
-obj-m += drivers/qcom_uscmi.o
-obj-m += drivers/kryo_arm64_edac.o
-obj-m += drivers/kiumd_kgsl.o
+obj-m += qcom_uscmi.o
+qcom_uscmi-objs := drivers/qcom_uscmi.o
 
+obj-m += kryo_arm64_edac.o
+kryo_arm64_edac-objs := drivers/kryo_arm64_edac.o
+
+obj-m += kiumd_kgsl.o
+kiumd_kgsl-objs := drivers/kiumd_kgsl.o
