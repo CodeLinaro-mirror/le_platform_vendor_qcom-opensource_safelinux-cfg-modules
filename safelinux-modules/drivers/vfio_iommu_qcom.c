@@ -22,6 +22,8 @@
 #define DRIVER_VERSION  "0.1"
 #define DRIVER_DESC     "QCOM IOMMU driver for VFIO"
 
+extern void *kiumd_iommu_group_default_domain(void *group);
+
 static void *vfio_iommu_qcom_open(unsigned long arg)
 {
 	return NULL;
@@ -61,6 +63,9 @@ static long vfio_iommu_qcom_ioctl(void *data,
 static int vfio_iommu_qcom_attach_group(void *data,
 			struct iommu_group *iommu_group, enum vfio_group_type type)
 {
+	if (!kiumd_iommu_group_default_domain(iommu_group))
+		return -EINVAL;
+
 	pr_err("%s: IOMMU: Group is = %d\n", __func__, iommu_group_id(iommu_group));
 	return 0;
 }
