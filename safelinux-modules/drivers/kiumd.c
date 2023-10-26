@@ -159,6 +159,17 @@ struct iommu_domain *kiumd_iommu_get_dma_domain(struct device *dev)
 	return iommu_group->default_domain;
 }
 
+void *kiumd_iommu_group_default_domain(void *group)
+{
+	struct kiumd_iommu_group *iommu_group = (struct kiumd_iommu_group *) group;
+
+	if (!iommu_group)
+		return NULL;
+
+	return (void *)iommu_group->default_domain;
+}
+EXPORT_SYMBOL_GPL(kiumd_iommu_group_default_domain);
+
 void kiumd_smmuv2_write_context_bank(struct arm_smmu_device *smmu, int idx)
 {
         u32 reg;
