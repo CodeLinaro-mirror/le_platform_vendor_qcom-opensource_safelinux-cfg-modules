@@ -1,23 +1,12 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
  */
-#include <linux/compat.h>
 #include <linux/device.h>
-#include <linux/fs.h>
-#include <linux/highmem.h>
 #include <linux/iommu.h>
 #include <linux/module.h>
-#include <linux/mm.h>
-#include <linux/kthread.h>
-#include <linux/rbtree.h>
-#include <linux/sched/signal.h>
-#include <linux/sched/mm.h>
-#include <linux/slab.h>
-#include <linux/uaccess.h>
 #include <linux/vfio.h>
-#include <linux/workqueue.h>
 #include <linux/notifier.h>
-#include <linux/irqdomain.h>
+
 #include "vfio.h"
 #define DRIVER_VERSION  "0.1"
 #define DRIVER_DESC     "QCOM IOMMU driver for VFIO"
@@ -66,7 +55,7 @@ static int vfio_iommu_qcom_attach_group(void *data,
 	if (!kiumd_iommu_group_default_domain(iommu_group))
 		return -EINVAL;
 
-	pr_err("%s: IOMMU: Group is = %d\n", __func__, iommu_group_id(iommu_group));
+	pr_info("%s: IOMMU: Group is = %d\n", __func__, iommu_group_id(iommu_group));
 	return 0;
 }
 
@@ -143,12 +132,6 @@ int __init vfio_iommu_qcom_init(void)
 {
 	return vfio_register_iommu_driver(&vfio_iommu_driver_ops_qcom);
 }
-//EXPORT_SYMBOL_GPL(vfio_iommu_qcom_init);
-/* Note: This is a workaround for now, the above statement will be
- * removed when we can ensure this driver is modprobed after
- * the vfio core driver.
- * The associated header file and vfio change will also be removed
- * then*/
 
 static void __exit vfio_iommu_qcom_exit(void)
 {
