@@ -31,8 +31,8 @@ Requires: %{name} = %{version}-%{release}
 %setup -qn %{name}
 
 %build
-KSRC=%{_usrsrc}/kernels/%{kversion}
-make KDIR=${KSRC} modules
+KERNEL_SRC=%{_usrsrc}/kernels/%{kversion}
+make KDIR=${KERNEL_SRC} modules
 
 %post
 depmod %{kversion}
@@ -41,9 +41,9 @@ depmod %{kversion}
 depmod %{kversion}
 
 %install
-KSRC=%{_usrsrc}/kernels/%{kversion}
-make KDIR=${KSRC} INSTALL_MOD_PATH=$RPM_BUILD_ROOT modules_install
-make KDIR=${KSRC} HDR_INSTAL_PATH=$RPM_BUILD_ROOT/usr/include headers_install
+KERNEL_SRC=%{_usrsrc}/kernels/%{kversion}
+make KDIR=${KERNEL_SRC} INSTALL_MOD_PATH=$RPM_BUILD_ROOT modules_install
+make KDIR=${KERNEL_SRC} HDR_INSTAL_PATH=$RPM_BUILD_ROOT/usr/include headers_install
 rm -rf "$RPM_BUILD_ROOT/lib/modules/%{kversion}/modules."*
 
 %clean
@@ -54,14 +54,20 @@ rm -rf $RPM_BUILD_ROOT
 %{_includedir}/uapi/misc/iommu_iova_map_user.h
 %{_includedir}/uapi/misc/kiumd.h
 %{_includedir}/uapi/misc/scm_user_intf.h
+%{_includedir}/uapi/misc/qcom_uscmi.h
 
 %files
-/lib/modules/%{kversion}/extra/drivers/apps_pinctrl.ko
-/lib/modules/%{kversion}/extra/drivers/scm_user_intf.ko
-/lib/modules/%{kversion}/extra/drivers/vfio_iommu_qcom.ko
-/lib/modules/%{kversion}/extra/drivers/iommu_iova_map.ko
-/lib/modules/%{kversion}/extra/drivers/kiumd.ko
+/lib/modules/%{kversion}/extra/apps_pinctrl.ko
+/lib/modules/%{kversion}/extra/scm_user_intf.ko
+/lib/modules/%{kversion}/extra/vfio_iommu_qcom.ko
+/lib/modules/%{kversion}/extra/iommu_iova_map.ko
+/lib/modules/%{kversion}/extra/kiumd.ko
+/lib/modules/%{kversion}/extra/qcom_uscmi.ko
+/lib/modules/%{kversion}/extra/kryo_arm64_edac.ko
+/lib/modules/%{kversion}/extra/kiumd_kgsl.ko
 
 %changelog
+* Wed Aug 28 2023 Deepti Jaggi <quic_djaggi@quicinc.com> 1.1
+- Add Edac driver
 * Fri Jul 27 2023 Venkatakrishnaiah Pari <quic_vpari@quicinc.com> 1.0
 - First commit!

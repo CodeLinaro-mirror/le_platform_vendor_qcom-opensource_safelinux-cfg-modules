@@ -19,27 +19,43 @@
 #include <linux/cdev.h>
 #include <uapi/misc/scm_user_intf.h>
 
+#define QCOM_SCM_MP_CP_SMMU_APERTURE_ID		0x1b
+#define QCOM_SCM_CP_APERTURE_REG		0x0
+
 #define MAX_SCM_USER_INTFS      32 /*maximum number of user intf devices*/
 
 static dev_t scm_user_intf_devt;
 
 static int  scm_id;
 
-struct scm_hand_shake {
-       unsigned int svc;
-       unsigned int cmd;
-       unsigned int arginfo;
-       unsigned int args_buffer[MAX_QCOM_SCM_ARGS];
-       unsigned int ret;
-       unsigned int arg_type;
-       unsigned int qcom_scm_res[MAX_QCOM_SCM_RETS];
-};
-
 struct scm_dev_data {
 	struct platform_device *scm_pdev;
 	struct device dev;
 	struct cdev cdev;
 };
+
+static struct scm_dev_data * __scm_dev;
+
+int qcom_scm_kgsl_set_smmu_aperture(unsigned int num_context_bank)
+{
+
+	struct qcom_scm_desc desc = {
+		.svc = QCOM_SCM_SVC_MP,
+		.cmd = QCOM_SCM_MP_CP_SMMU_APERTURE_ID,
+		.owner = ARM_SMCCC_OWNER_SIP,
+		.args[0] = 0xffff0000
+			   | ((QCOM_SCM_CP_APERTURE_REG & 0xff) << 8)
+			   | (num_context_bank & 0xff),
+		.args[1] = 0xffffffff,
+		.args[2] = 0xffffffff,
+		.args[3] = 0xffffffff,
+		.arginfo = 4,
+	};
+
+	return qcom_scm_call(&__scm_dev->dev, &desc, NULL);
+}
+
+EXPORT_SYMBOL(qcom_scm_kgsl_set_smmu_aperture);
 
 static int qcom_scm_open(struct inode *inode, struct file *filp)
 {
@@ -140,11 +156,15 @@ static int qcom_scm_intf_probe(struct platform_device *pdev)
 	if (!dev_data)
 		return -ENOMEM;
 
+	scm_id++;
 	device_initialize(&dev_data->dev);
 	dev_data->dev.devt = MKDEV(MAJOR(scm_user_intf_devt), scm_id);
         dev_data->dev.parent = &pdev->dev;
-        dev_set_name(&dev_data->dev, "scm_dev%d", scm_id++);
+        dev_set_name(&dev_data->dev, "scmnode");
 	dev_data->scm_pdev = scm_pdev;
+
+	__scm_dev = dev_data;
+	__scm_dev->dev = dev_data->dev;
 
 	cdev_init(&dev_data->cdev, &qcom_scm_fops);
 
