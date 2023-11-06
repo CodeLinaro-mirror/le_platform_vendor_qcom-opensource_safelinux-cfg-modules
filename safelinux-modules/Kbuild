@@ -1,0 +1,25 @@
+LINUXINCLUDE += -I$(SAFELINUX_MODULES_ROOT)/include
+
+obj-m += apps_pinctrl.o
+apps_pinctrl-objs := drivers/apps_pinctrl.o
+
+obj-m += scm_user_intf.o
+scm_user_intf-objs := drivers/scm_user_intf.o
+
+obj-m += iommu_iova_map.o
+iommu_iova_map-objs := drivers/iommu_iova_map.o
+
+obj-m += vfio_iommu_qcom.o
+vfio_iommu_qcom-objs := drivers/vfio_iommu_qcom.o
+
+obj-m += kiumd.o
+kiumd-objs := drivers/kiumd.o
+
+obj-m += qcom_uscmi.o
+qcom_uscmi-objs := drivers/qcom_uscmi.o
+
+obj-m += kryo_arm64_edac.o
+kryo_arm64_edac-objs := drivers/kryo_arm64_edac.o
+
+obj-m += kiumd_kgsl.o
+kiumd_kgsl-objs := drivers/kiumd_kgsl.o
