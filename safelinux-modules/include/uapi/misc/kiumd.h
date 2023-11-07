@@ -31,6 +31,13 @@
 #define KGSL_GLOBAL_PT 1
 #define KGSL_PER_PROCESS_PT 2
 
+/*
+ * Choosing an arbitrary value other than 0 and 1
+ * to avoid setting this condition, if user doesnt calloc
+ * or pre-initialize the values
+ * */
+#define FIXED_IOVA_AT_ZERO 5
+
 enum kiumd_iova_addr_type {
 	KGSL_SMMU_GLOBALPT_FIXED_ADDR_SET,
 	KGSL_SMMU_GLOBALPT_FIXED_ADDR_CLEAR,
@@ -63,6 +70,7 @@ struct kiumd_user {
 	int dma_direction;
 	int ptselect;
 	__u32 handle;
+	int is_iova_zero;
 };
 
 #endif /* __KIUMD_H__ */

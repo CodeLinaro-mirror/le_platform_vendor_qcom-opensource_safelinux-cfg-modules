@@ -27,6 +27,8 @@
 #include <linux/sizes.h>
 #include <linux/xarray.h>
 #include <uapi/misc/scm_user_intf.h>
+#include <linux/dma-direction.h>
+
 
 #include "arm-smmu.h"
 
@@ -693,6 +695,9 @@ int kiumd_dmabuf_vfio_map(char __user *arg)
 	u64 size;
 	s64 offset;
 	struct kiumd_dma_heap_attachment *dmaheapattachment;
+	struct iommu_domain *iommu_dom;
+	dma_addr_t iova_zero = 0;
+	int prot = 0;
 
 	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user)))
 		return -EFAULT;
@@ -751,12 +756,18 @@ int kiumd_dmabuf_vfio_map(char __user *arg)
 		goto fail_put;
 	}
 
-	if (kiusr.dma_direction == 1)
+	if ((kiusr.dma_direction < DMA_BIDIRECTIONAL) || (kiusr.dma_direction > DMA_NONE)) {
+		pr_err("%s:Invalid DMA direction: %d\n", __func__, kiusr.dma_direction);
+		ret = -EINVAL;
+		goto fail_detach;
+	}
+
+	if (kiusr.dma_direction == DMA_TO_DEVICE)
 		kiumd_dma_direction = kiusr.dma_direction;
 	else
-		kiumd_dma_direction = 0;
+		kiumd_dma_direction = DMA_BIDIRECTIONAL;
 
-	if (kiusr.dma_attr == DMA_ATTR_PRIVILEGED) {
+	if ((kiusr.dma_attr == DMA_ATTR_PRIVILEGED) && (kiusr.is_iova_zero != FIXED_IOVA_AT_ZERO)) {
 		if (!(dmabufattach->priv)) {
 			pr_err("%s:dmabufattach-priv is NULL\n", __func__);
 			ret = -EINVAL;
@@ -769,6 +780,7 @@ int kiumd_dmabuf_vfio_map(char __user *arg)
 			ret = -EINVAL;
 			goto fail_detach;
 		}
+
 		sgt = dmaheapattachment->table;
 		if (!sgt) {
 			pr_err("%s:sglist is NULL\n", __func__);
@@ -788,11 +800,42 @@ int kiumd_dmabuf_vfio_map(char __user *arg)
 			ret = (sgt == NULL ? -EINVAL : PTR_ERR(sgt));
 			goto fail_detach;
 		}
+
+		if (kiusr.is_iova_zero == FIXED_IOVA_AT_ZERO) {
+			if (kiusr.dma_attr == DMA_ATTR_PRIVILEGED)
+				prot = IOMMU_CACHE | IOMMU_READ | IOMMU_WRITE | IOMMU_PRIV;
+			else
+				prot = IOMMU_CACHE | IOMMU_READ | IOMMU_WRITE;
+
+			iommu_dom = kiumd_iommu_get_dma_domain(vfio_dev->dev);
+			if (!iommu_dom) {
+				pr_err("%s:IOMMU domain is NULL\n", __func__);
+				ret = -EINVAL;
+				goto fail_fput;
+			}
+
+			/*
+			 * For mapping at 0x0 we create a mapping using
+			 * dma_buf_map_attachment and then take the sg list
+			 * and map it at iova - 0x0
+			 * */
+			size = iommu_map_sg(iommu_dom, iova_zero, sgt->sgl, sgt->orig_nents, prot, GFP_ATOMIC);
+			if (size < 0) {
+				pr_err("%s:iommu_map_sg failed\n", __func__);
+				dma_buf_unmap_attachment(dmabufattach, sgt, kiumd_dma_direction);
+				ret = -EFAULT;
+				goto fail_detach;
+			}
+		}
 	}
 
 	kiusr.sgt_ptr = (long) sgt;
 	kiusr.dmabufattach = (long) dmabufattach;
-	kiusr.dma_addr = (unsigned long) sg_dma_address(sgt->sgl);
+	if (kiusr.is_iova_zero == FIXED_IOVA_AT_ZERO)
+		kiusr.dma_addr = (unsigned long) iova_zero;
+	else
+		kiusr.dma_addr = (unsigned long) sg_dma_address(sgt->sgl);
+
 	kiusr.dmabuf_ptr = (long) kiumd_dmabuf;
 
 	if (copy_to_user(arg, &kiusr, sizeof(kiusr))) {
@@ -817,6 +860,42 @@ fail_fput:
 	return ret;
 }
 
+struct iommu_domain *kiumd_get_iommu_domain(int vfio_fd)
+{
+	struct file *file;
+	struct vfio_device *vfio_dev;
+	struct iommu_domain *iommu_dom;
+
+	file = fget(vfio_fd);
+	if (!file) {
+		pr_err("%s:fget returns NULL\n", __func__);
+		return NULL;
+	}
+
+	vfio_dev = (struct vfio_device *)file->private_data;
+	if (!vfio_dev) {
+		pr_err("%s:vfio dev returns NULL\n", __func__);
+		fput(file);
+		return NULL;
+	}
+
+	if (!(vfio_dev->dev)) {
+		pr_err("%s:vfio device returns NULL\n", __func__);
+		fput(file);
+		return NULL;
+	}
+
+	iommu_dom = kiumd_iommu_get_dma_domain(vfio_dev->dev);
+	if (!iommu_dom) {
+		pr_err("%s:iommu_dom is NULL\n", __func__);
+		fput(file);
+		return NULL;
+	}
+
+	fput(file);
+	return iommu_dom;
+}
+
 /**
  * kiumd_dmabuf_vfio_unmap(struct kiumd_dev *ki_dev, char __user *arg)
  *
@@ -838,6 +917,8 @@ int kiumd_dmabuf_vfio_unmap(char __user *arg)
 	int kiumd_dma_direction, ret = 0;
 	struct sg_table *sgtable = NULL;
 	struct kiumd_dma_heap_attachment *dmaheapattachment = NULL;
+	dma_addr_t iova_zero = 0;
+	u64 size;
 
 	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user)))
 		return -EFAULT;
@@ -862,7 +943,7 @@ int kiumd_dmabuf_vfio_unmap(char __user *arg)
 	else
 		kiumd_dma_direction = 0;
 
-	if (kiusr.dma_attr == DMA_ATTR_PRIVILEGED) {
+	if ((kiusr.dma_attr == DMA_ATTR_PRIVILEGED) && (kiusr.is_iova_zero != FIXED_IOVA_AT_ZERO)) {
 		file = fget(kiusr.vfio_fd);
 		if (!file) {
 			pr_err("%s:fget returns NULL\n", __func__);
@@ -872,70 +953,63 @@ int kiumd_dmabuf_vfio_unmap(char __user *arg)
 		vfio_dev = (struct vfio_device *)file->private_data;
 		if (!vfio_dev) {
 			pr_err("%s:vfio dev returns NULL\n", __func__);
-			ret = -EINVAL;
-			goto fail_fput;
+			fput(file);
+			return -EINVAL;
 		}
 
 		if (!(dmabufattach->priv)) {
 			pr_err("%s:dmabufattach-priv is NULL\n", __func__);
-			ret = -EINVAL;
-			goto fail_fput;
+			fput(file);
+			return -EINVAL;
 		}
 
 		dmaheapattachment = (struct kiumd_dma_heap_attachment *)dmabufattach->priv;
 		if (!dmaheapattachment) {
 			pr_err("%s:dmaheapattachment is NULL\n", __func__);
-			ret = -EINVAL;
-			goto fail_fput;
+			fput(file);
+			return -EINVAL;
 		}
 
 		sgtable = dmaheapattachment->table;
 		if (!sgtable) {
 			pr_err("%s:sglist is NULL\n", __func__);
-			ret = -EINVAL;
-			goto fail_fput;
+			fput(file);
+			return -EINVAL;
 		}
 
 		dma_unmap_sgtable(vfio_dev->dev, sgtable, kiumd_dma_direction, DMA_ATTR_PRIVILEGED);
+		fput(file);
 	} else {
 		dma_buf_unmap_attachment(dmabufattach, (struct sg_table *)kiusr.sgt_ptr,
 									kiumd_dma_direction);
 		if (kiusr.ptselect == KGSL_GLOBAL_PT || kiusr.ptselect == KGSL_PER_PROCESS_PT) {
-			file = fget(kiusr.vfio_fd);
-			if (!file) {
-				pr_err("%s:fget returns NULL\n", __func__);
+
+			iommu_dom = kiumd_get_iommu_domain(kiusr.vfio_fd);
+			if (!iommu_dom) {
+				pr_err("%s:iommu_dom is NULL\n", __func__);
 				return -EINVAL;
 			}
 
-			vfio_dev = (struct vfio_device *)file->private_data;
-			if (!vfio_dev) {
-				pr_err("%s:vfio dev returns NULL\n", __func__);
-				ret = -EINVAL;
-				goto fail_fput;
-			}
+			iommu_flush_iotlb_all(iommu_dom);
+		}
 
-			if (!(vfio_dev->dev)) {
-				pr_err("%s:vfio device returns NULL\n", __func__);
-				ret = -EINVAL;
-				goto fail_fput;
-			}
-
-			iommu_dom = kiumd_iommu_get_dma_domain(vfio_dev->dev);
+		if (kiusr.is_iova_zero == FIXED_IOVA_AT_ZERO) {
+			iommu_dom = kiumd_get_iommu_domain(kiusr.vfio_fd);
 			if (!iommu_dom) {
 				pr_err("%s:iommu_dom is NULL\n", __func__);
-				ret = -EINVAL;
-				goto fail_fput;
+				return -EINVAL;
 			}
 
-			iommu_flush_iotlb_all(iommu_dom);
+			size = iommu_unmap(iommu_dom, iova_zero, kiumd_dmabuf->size);
+			if (size != kiumd_dmabuf->size) {
+				pr_err("%s:iommu_unmap failed\n", __func__);
+				return -EINVAL;
+			}
 		}
 	}
 
 	dma_buf_detach(kiumd_dmabuf, dmabufattach);
 	dma_buf_put(kiumd_dmabuf);
-
-fail_fput:
-	fput(file);
 
 	return ret;
 }
@@ -1165,6 +1239,7 @@ static long kiumd_ioctl(struct file *file, unsigned int cmd,
 	case KIUMD_GLOBAL_PT_SET:
 		err = kiumd_global_pgtble_set(argp);
 		break;
+
 	default:
 		err = -ENOTTY;
 		break;
