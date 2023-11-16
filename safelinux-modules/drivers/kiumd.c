@@ -28,9 +28,29 @@
 #include <linux/xarray.h>
 #include <uapi/misc/scm_user_intf.h>
 #include <linux/dma-direction.h>
-
 #include "arm-smmu.h"
 #include "vfio.h"
+#include <linux/kobject.h>
+#include <linux/sysfs.h>
+#include <linux/init.h>
+#include <linux/fs.h>
+#include <linux/string.h>
+
+#include "arm-smmu.h"
+
+static struct kobject *smmu_obj;
+static struct kobject *device_obj;
+
+struct smmu_device_obj {
+	struct kobject *kobj;
+	int smmu_fsr;
+	int smmu_iova;
+	int flag;
+	struct smmu_device_obj *next;
+};
+
+struct smmu_device_obj *head = NULL;
+
 /*Global Data structures needed for buffer sharing */
 static DEFINE_XARRAY_ALLOC(kiumd_xa);
 
@@ -299,6 +319,52 @@ static int kiumd_set_dma_cookie_unlocked(struct kiumd_iommu_dma_cookie *cookie,
 	ret = kiumd_set_dma_cookie(cookie, type, iova);
 	mutex_unlock(&cookie->mutex);
 	return ret;
+}
+
+struct iommu_domain *kiumd_get_iommu_domain(int vfio_fd)
+{
+	struct vfio_device *vfio_dev = NULL;
+	struct iommu_domain *domain = NULL;
+	int retval = 0;
+
+	do {
+		vfio_dev = kiumd_get_vfio_device(vfio_fd);
+		if (!vfio_dev) {
+			pr_err("%s:vfio_dev is NULL \n",__func__);
+			break;
+		}
+		domain = kiumd_iommu_get_dma_domain(vfio_dev->dev);
+		if (!domain) {
+			pr_err("%s:iommu domain is NULL\n", __func__);
+			break;
+		}
+
+	} while(0);
+
+	return domain;
+}
+
+struct arm_smmu_domain *kiumd_get_smmu_domain(int vfio_fd)
+{
+	struct iommu_domain *iommu_dom = NULL;
+	struct arm_smmu_domain *smmu_domain = NULL;
+	int retval = 0;
+
+	do {
+		iommu_dom = kiumd_get_iommu_domain(vfio_fd);
+		if (!iommu_dom) {
+			pr_err("%s:IOMMU domain is NULL\n", __func__);
+			break;
+		}
+		smmu_domain= container_of(iommu_dom, struct arm_smmu_domain, domain);
+		if (!smmu_domain) {
+			pr_err("%s:SMMU domain is NULL\n", __func__);
+			break;
+		}
+
+	} while(0);
+
+	return smmu_domain;
 }
 
 void kiumd_smmuv2_write_context_bank(struct arm_smmu_device *smmu, int idx)
@@ -1035,7 +1101,6 @@ int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 		ret = -EFAULT;
 		goto fail_detach;
 	}
-
 	fput(file);
 	return 0;
 
@@ -1049,44 +1114,6 @@ fail_fput:
 	fput(file);
 
 	return ret;
-}
-
-struct iommu_domain *kiumd_get_iommu_domain(int vfio_fd)
-{
-	struct file *file;
-	struct vfio_device *vfio_dev;
-	struct vfio_device_file *df;
-	struct iommu_domain *iommu_dom;
-
-	file = fget(vfio_fd);
-	if (!file) {
-		pr_err("%s:fget returns NULL\n", __func__);
-		return NULL;
-	}
-
-	df = (struct vfio_device_file *)file->private_data;
-	vfio_dev = (struct vfio_device *)df->device;
-	if (!vfio_dev) {
-		pr_err("%s:vfio dev returns NULL\n", __func__);
-		fput(file);
-		return NULL;
-	}
-
-	if (!(vfio_dev->dev)) {
-		pr_err("%s:vfio device returns NULL\n", __func__);
-		fput(file);
-		return NULL;
-	}
-
-	iommu_dom = kiumd_iommu_get_dma_domain(vfio_dev->dev);
-	if (!iommu_dom) {
-		pr_err("%s:iommu_dom is NULL\n", __func__);
-		fput(file);
-		return NULL;
-	}
-
-	fput(file);
-	return iommu_dom;
 }
 
 /**
@@ -1982,6 +2009,194 @@ close_file:
 
 	return ret;
 }
+static ssize_t fsr_iova_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+	int local_fsr = 0;
+	int local_iova = 0;
+	struct smmu_device_obj *temp = head;
+
+	while(temp!=NULL && kobj!=NULL){
+		if (0 == strcmp(temp->kobj->name,kobj->name))
+		{
+			local_fsr = temp->smmu_fsr;
+			local_iova = temp->smmu_iova;
+			temp->smmu_fsr = 0;
+			temp->smmu_iova = 0;
+			temp->flag = 0;
+			break;
+		}
+		temp = temp->next;
+	}
+
+	return snprintf(buf, PAGE_SIZE, "0x%x:0x%x\n", local_fsr,local_iova);
+}
+
+static struct kobj_attribute fsr_iova_attribute = {
+	.attr = {
+		.name = "fsr_iova",
+		.mode = S_IWUSR | S_IRUGO,
+	},
+	.show = fsr_iova_show,
+};
+
+static int kiumd_smmu_fault_handler(struct iommu_domain *iomm_domain,
+		struct device *dev, unsigned long iova, int flags, void *token)
+{
+	struct arm_smmu_domain *smmu_domain = NULL;
+	struct arm_smmu_cfg *cfg = NULL;
+	struct smmu_device_obj *temp = head;
+	char *name = (char *)token;
+	int retval = 0;
+
+	do {
+		smmu_domain = container_of(iomm_domain, struct arm_smmu_domain, domain);
+		if ((!smmu_domain) || (!(smmu_domain->pgtbl_ops))) {
+			pr_err("%s:smmu domain/pagetable ops is invalid\n", __func__);
+			retval = -EINVAL;
+			break;
+		}
+		cfg = &smmu_domain->cfg;
+
+		while (temp!=NULL){
+			if (0 == strcmp(temp->kobj->name,name) && !(temp->flag))
+			{
+				temp->smmu_fsr = arm_smmu_cb_read(smmu_domain->smmu,cfg->cbndx,ARM_SMMU_CB_FSR);
+				temp->smmu_iova = iova;
+				temp->flag = 1;
+				break;
+			}
+			temp = temp->next;
+		}
+		sysfs_notify(device_obj,NULL,"fsr_iova");
+
+	} while(0);
+
+	return retval;
+}
+
+static int kiumd_smmu_fault_handler_deregister(char __user *arg)
+{
+	struct vfio_device *vfio_dev = NULL;
+	struct kiumd_user kiusr;
+	struct smmu_device_obj *temp = head;
+	struct smmu_device_obj *prev = NULL;
+
+	int retval = 0;
+
+	do {
+		if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user))) {
+			retval = -EFAULT;
+			break;
+		}
+
+		vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
+		if (!vfio_dev) {
+			pr_err("%s:vfio_dev is NULL \n",__func__);
+			retval = -ENOTTY;
+			break;
+		}
+
+		if (temp != NULL && !strcmp(temp->kobj->name,vfio_dev->dev->kobj.name))
+		{
+			head = head->next;
+			temp->next = NULL;
+			kobject_put(temp->kobj);
+			kfree(temp);
+		} else {
+			while(temp != NULL && strcmp(temp->kobj->name,vfio_dev->dev->kobj.name))
+			{
+				prev = temp;
+				temp = temp->next;
+			}
+			if (temp == NULL) {
+				pr_err("%s:vfio device is not present in list to deregister\n");
+				retval = -1;
+				break;
+			}
+
+			prev->next = temp->next;
+			temp->next = NULL;
+			kobject_put(temp->kobj);
+			kfree(temp);
+		}
+
+	} while(0);
+
+	return retval;
+}
+
+static int kiumd_smmu_fault_handler_register(char __user *arg)
+{
+	struct iommu_domain *domain = NULL;
+	struct vfio_device *vfio_dev = NULL;
+	struct smmu_device_obj *ptr = NULL;
+	struct smmu_device_obj *temp = NULL;
+
+	struct kiumd_user kiusr;
+	int retval = 0;
+	int err = 0;
+
+	do {
+		if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user))) {
+			retval = -EFAULT;
+			break;
+		}
+
+		vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
+		if (!vfio_dev) {
+			pr_err("%s:vfio_dev is NULL \n",__func__);
+			retval = -ENOTTY;
+			break;
+		}
+
+		domain = kiumd_iommu_get_dma_domain(vfio_dev->dev);
+		if (!domain) {
+			pr_err("%s:iommu domain is NULL\n", __func__);
+			retval = -EINVAL;
+			break;
+		}
+
+		device_obj = kobject_create_and_add(vfio_dev->dev->kobj.name,smmu_obj);
+		if (!device_obj){
+			pr_err("/sys/kernel/smmu_fault/%s creation failed\n",vfio_dev->dev->kobj.name);
+			retval = -ENOMEM;
+			break;
+		}
+
+		err = sysfs_create_file(device_obj,&(fsr_iova_attribute.attr));
+		if (err) {
+			pr_err("failed to create sysfs file in /sys/kernel/\n");
+			retval = err;
+			break;
+		}
+
+		ptr = (struct smmu_device_obj *)kzalloc(sizeof(struct smmu_device_obj),GFP_KERNEL);
+		if (NULL == ptr){
+			pr_err("allocation of smmu_device_obj failed\n");
+			retval = -ENOMEM;
+			break;
+		}
+		ptr->kobj = device_obj;
+		ptr->flag = 0;
+		ptr->next = NULL;
+
+		if (NULL == head){
+			head = ptr;
+		} else{
+			temp = head;
+			while(temp->next!=NULL){
+				temp = temp->next;
+			}
+			temp->next = ptr;
+		}
+
+		iommu_set_fault_handler(domain, kiumd_smmu_fault_handler, device_obj->name);
+
+	} while(0);
+
+	return retval;
+}
+
 
 static int kiumd_mmio_smmu_map(char __user *arg, struct file *fp)
 {
@@ -2290,6 +2505,12 @@ static long kiumd_ioctl(struct file *file, unsigned int cmd,
 	case KIUMD_SMMU_MMIO_UNMAP:
 		err = kiumd_mmio_smmu_unmap(argp, file);
 		break;
+	case KIUMD_SMMU_FAULT_HANDLE_REGISTER:
+		err = kiumd_smmu_fault_handler_register(argp);
+		break;
+	case KIUMD_SMMU_FAULT_HANDLE_DEREGISTER:
+		err = kiumd_smmu_fault_handler_deregister(argp);
+		break;
 	default:
 		err = -ENOTTY;
 		break;
@@ -2330,7 +2551,11 @@ static int kiumd_probe(struct platform_device *pdev)
 		pr_err("kiumd misc device %s creation failure\n", devname);
 		return err;
 	}
-
+	smmu_obj = kobject_create_and_add("smmu_faults",kernel_kobj);
+	if(!smmu_obj){
+		pr_err("smmu_faults kernel object creation failure\n");
+		return -ENOMEM;
+	}
 	return 0;
 }
 
