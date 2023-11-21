@@ -1179,29 +1179,50 @@ static const struct file_operations kiumd_fops = {
 	.compat_ioctl = kiumd_ioctl,
 };
 
-static int kiumd_init(void)
+static int kiumd_probe(struct platform_device *pdev)
 {
+	struct device *dev = &pdev->dev;
+	struct device_node *np = dev->of_node;
 	int err;
-	char *devname = "kiumd";
+	const char *name, *devname;
 	struct miscdevice *miscdev;
 
 	miscdev = kzalloc(sizeof(struct miscdevice), GFP_KERNEL);
 	if (!miscdev)
 		return -ENOMEM;
 
+	if (!of_property_read_string(np, "qcom,dev-name", &name))
+		devname = devm_kstrdup(dev, name, GFP_KERNEL);
+	else
+		devname = devm_kasprintf(dev, GFP_KERNEL, "%pOFn", np);
+
 	miscdev->minor = MISC_DYNAMIC_MINOR;
 	miscdev->name = devname;
 	miscdev->fops = &kiumd_fops;
 	err = misc_register(miscdev);
 	if (err) {
-		pr_err("kiumd misc device creation failure\n");
+		pr_err("kiumd misc device %s creation failure\n", devname);
 		return err;
 	}
 
 	return 0;
 }
 
-module_init(kiumd_init);
+static const struct of_device_id kiumd_match_table[] = {
+	{ .compatible = "qcom,kiumd", },
+	{ },
+};
+MODULE_DEVICE_TABLE(of, kiumd_match_table);
+
+static struct platform_driver kiumd_driver = {
+	.driver = {
+		.name = "kiumd",
+		.of_match_table = kiumd_match_table,
+	},
+	.probe = kiumd_probe,
+};
+module_platform_driver(kiumd_driver);
+
 MODULE_IMPORT_NS(DMA_BUF);
 MODULE_DESCRIPTION("KIUMD");
 MODULE_LICENSE("GPL v2");
