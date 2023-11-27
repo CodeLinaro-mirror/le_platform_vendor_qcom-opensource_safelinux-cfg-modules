@@ -23,6 +23,21 @@
 #define MAX_QCOM_SCM_RESULT                     3
 #define MAX_QCOM_SCM_IN                         10
 
+#define QCOM_SCM_ARGS_IMPL(num, a, b, c, d, e, f, g, h, i, j, ...) (\
+                           (((a) & 0x3) << 4) | \
+                           (((b) & 0x3) << 6) | \
+                           (((c) & 0x3) << 8) | \
+                           (((d) & 0x3) << 10) | \
+                           (((e) & 0x3) << 12) | \
+                           (((f) & 0x3) << 14) | \
+                           (((g) & 0x3) << 16) | \
+                           (((h) & 0x3) << 18) | \
+                           (((i) & 0x3) << 20) | \
+                           (((j) & 0x3) << 22) | \
+                           ((num) & 0xf))
+
+#define QCOM_SCM_ARGS(...) QCOM_SCM_ARGS_IMPL(__VA_ARGS__, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
 struct scm_hand_shake {
 	__u32 svc;
 	__u32 cmd;

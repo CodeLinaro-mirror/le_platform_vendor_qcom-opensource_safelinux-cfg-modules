@@ -50,7 +50,7 @@ int qcom_scm_kgsl_set_smmu_aperture(unsigned int num_context_bank)
 		.args[1] = 0xffffffff,
 		.args[2] = 0xffffffff,
 		.args[3] = 0xffffffff,
-		.arginfo = 4,
+		.arginfo = QCOM_SCM_ARGS(4),
 	};
 
 	return qcom_scm_call(__scm_dev->dev, &desc, NULL);
