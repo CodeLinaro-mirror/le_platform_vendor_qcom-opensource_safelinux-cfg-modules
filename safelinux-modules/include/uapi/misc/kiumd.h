@@ -31,8 +31,6 @@
 #define KGSL_GLOBAL_PT 1
 #define KGSL_PER_PROCESS_PT 2
 
-
-
 enum kiumd_iova_addr_type {
 	KGSL_SMMU_GLOBALPT_FIXED_ADDR_SET,
 	KGSL_SMMU_GLOBALPT_FIXED_ADDR_CLEAR,
@@ -46,7 +44,7 @@ struct kiumd_iova {
 
 struct kiumd_smmu_user {
 	int vfio_fd;
-	long int pgtbl_ops_ptr;
+	long pgtbl_ops_ptr;
 	__u64 ttbr0;
 	__u16 asid;
 };
@@ -56,9 +54,9 @@ struct kiumd_user {
 	int dma_buf_fd;
 	int heap_fd;
 	int flag;
-	long int sgt_ptr;
-	long int dmabuf_ptr;
-	long int dmabufattach;
+	long sgt_ptr;
+	long dmabuf_ptr;
+	long dmabufattach;
 	unsigned long dma_addr;
 	int buf_token;
 	int dma_attr;
