@@ -623,33 +623,43 @@ void clear_map_iova(u64 iova, u64 size, int ptselect)
 
 s64 get_map_offset(u64 size, int ptselect)
 {
-	int start = 0;
+	static u64 last_offset_global = 0;
+	static u64 last_offset_perprocess = 0;
+	u64 *last_offset = (ptselect == KGSL_GLOBAL_PT) ? &last_offset_global : &last_offset_perprocess;
 	u64 bit, offset;
 
-	if (ptselect == KGSL_GLOBAL_PT) {
-		bit = bitmap_find_next_zero_area(global_map, KGSL_PT_MEM_PAGES, start, size >> PAGE_SHIFT, 0);
-		if (bit > KGSL_PT_MEM_PAGES-2) { //KGSL_PT_MEM_PAGES-2 - indicates last 4k page represetd in the bit map.
-			pr_err("Invalid next zero area in bitmap\n");
-			return (s64) -ENOMEM;
-		}
-
-		bitmap_set(global_map, bit, size >> PAGE_SHIFT);
-		offset = bit << PAGE_SHIFT;
-	} else if (ptselect == KGSL_PER_PROCESS_PT) {
-		bit = bitmap_find_next_zero_area(perprocess_map, KGSL_PT_MEM_PAGES, start, size >> PAGE_SHIFT, 0);
-		if (bit > KGSL_PT_MEM_PAGES-2) {
-			pr_err("Invalid next zero area in bitmap\n");
-			return (s64) -ENOMEM;
-		}
-
-		bitmap_set(perprocess_map, bit, size >> PAGE_SHIFT);
-		offset = bit << PAGE_SHIFT;
-	} else {
-		pr_err("Invalid ptselect\n");
+	if (ptselect != KGSL_GLOBAL_PT && ptselect != KGSL_PER_PROCESS_PT) {
+		pr_err("%s: Invalid ptselect: %d\n", __func__, ptselect);
 		return (s64) -EINVAL;
 	}
 
-	return offset;
+	unsigned long *map = (ptselect == KGSL_GLOBAL_PT) ? global_map : perprocess_map;
+	if(map == NULL) {
+		pr_err("%s: Bitmap map is NULL for ptselect: %d\n", __func__, ptselect);
+		return (s64) -EFAULT;
+	}
+
+	if (size == 0 || (size >> PAGE_SHIFT) == 0) {
+		pr_err("%s: Invalid size: 0x%llx, for ptselect: %d\n", __func__, size, ptselect);
+		return (s64) -EINVAL;
+	}
+
+	bit = bitmap_find_next_zero_area(map, KGSL_PT_MEM_PAGES, *last_offset, size >> PAGE_SHIFT, 0);
+
+	if (bit + (size >> PAGE_SHIFT) >= KGSL_PT_MEM_PAGES) {
+		bit = bitmap_find_next_zero_area(map, KGSL_PT_MEM_PAGES, 0, size >> PAGE_SHIFT, 0);
+		if (bit >= KGSL_PT_MEM_PAGES) {
+			pr_err("%s: No free area in bitmap for size: 0x%llx, ptselect: %d\n", __func__, size, ptselect);
+			return (s64) -ENOSPC;
+		}
+	}
+
+	bitmap_set(map, bit, size >> PAGE_SHIFT);
+	offset = bit << PAGE_SHIFT;
+
+	*last_offset = (bit + (size >> PAGE_SHIFT)) % KGSL_PT_MEM_PAGES;
+
+	return (s64) offset;
 }
 
 int set_map_iova(u64 offset, struct vfio_device *vfio_dev, int ptselect)
@@ -989,16 +999,6 @@ int kiumd_dmabuf_vfio_unmap(char __user *arg)
 	} else {
 		dma_buf_unmap_attachment(dmabufattach, (struct sg_table *)kiusr.sgt_ptr,
 									kiumd_dma_direction);
-		if (kiusr.ptselect == KGSL_GLOBAL_PT || kiusr.ptselect == KGSL_PER_PROCESS_PT) {
-
-			iommu_dom = kiumd_get_iommu_domain(kiusr.vfio_fd);
-			if (!iommu_dom) {
-				pr_err("%s:iommu_dom is NULL\n", __func__);
-				return -EINVAL;
-			}
-
-			iommu_flush_iotlb_all(iommu_dom);
-		}
 
 		if (kiusr.is_iova_zero == FIXED_IOVA_AT_ZERO) {
 			iommu_dom = kiumd_get_iommu_domain(kiusr.vfio_fd);
@@ -1012,6 +1012,17 @@ int kiumd_dmabuf_vfio_unmap(char __user *arg)
 				pr_err("%s:iommu_unmap failed\n", __func__);
 				return -EINVAL;
 			}
+		}
+
+		if (kiusr.ptselect == KGSL_GLOBAL_PT || kiusr.ptselect == KGSL_PER_PROCESS_PT
+								 || kiusr.ptselect == KGSL_DEFAULT_PT) {
+			iommu_dom = kiumd_get_iommu_domain(kiusr.vfio_fd);
+			if (!iommu_dom) {
+				pr_err("%s:iommu_dom is NULL\n", __func__);
+				return -EINVAL;
+			}
+
+			iommu_flush_iotlb_all(iommu_dom);
 		}
 	}
 

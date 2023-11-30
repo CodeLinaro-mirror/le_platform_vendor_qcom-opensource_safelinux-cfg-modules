@@ -29,9 +29,9 @@
 #define FD_TO_HANDLE    -2
 #define CLOSE_HANDLE    -3
 
-#define KGSL_DEFAULT_PT   0
 #define KGSL_GLOBAL_PT 1
 #define KGSL_PER_PROCESS_PT 2
+#define KGSL_DEFAULT_PT  3
 
 /*
  * Choosing an arbitrary value other than 0 and 1
