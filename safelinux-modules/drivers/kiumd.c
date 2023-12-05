@@ -2097,6 +2097,7 @@ static int kiumd_mmio_smmu_map(char __user *arg, struct file *fp)
 	}
 
 	kiusr.iova = dma_addr;
+	kiusr.reg_len = size;
 
 	spin_lock(&kiumd_ctx->smmu_lock);
 	smap->id = kiumd_ctx->id++;
