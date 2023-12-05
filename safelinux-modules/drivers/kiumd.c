@@ -1244,7 +1244,9 @@ int kiumd_fd_dmabuf_handler(char __user *arg)
 			return -EINVAL;
 		}
 
-		kiusr.dma_buf_fd = dma_buf_fd((struct dma_buf *) dmabuf_handle->dmabuf, (O_CLOEXEC));
+		if (!IS_ERR_OR_NULL(dmabuf_handle->dmabuf)) {
+			kiusr.dma_buf_fd = dma_buf_fd((struct dma_buf *) dmabuf_handle->dmabuf, (O_CLOEXEC));
+		}
 		if (kiusr.dma_buf_fd < 0) {
 			pr_err("%s:dma_buf_fd failed\n", __func__);
 			return -EBADF;
@@ -1280,7 +1282,8 @@ int kiumd_fd_dmabuf_handler(char __user *arg)
 			}
 		}
 
-		dma_buf_put(kiumd_dmabuf);
+		if (!IS_ERR_OR_NULL(kiumd_dmabuf))
+			dma_buf_put(kiumd_dmabuf);
 		kiusr.dma_buf_fd = 0;
 	}
 	if (copy_to_user(arg, &kiusr, sizeof(kiusr))) {
