@@ -73,9 +73,6 @@ struct kiumd_user {
 	int dma_buf_fd;
 	int heap_fd;
 	int flag;
-	long sgt_ptr;
-	long dmabuf_ptr;
-	long dmabufattach;
 	unsigned long dma_addr;
 	int buf_token;
 	int dma_attr;
@@ -84,6 +81,7 @@ struct kiumd_user {
 	__u32 handle;
 	int is_iova_zero;
 	struct kiumd_mem_parcel mem_parcel;
+	int id;
 };
 
 #endif /* __KIUMD_H__ */
