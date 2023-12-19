@@ -13,6 +13,7 @@
 #include <linux/types.h>
 #include <linux/firmware/qcom/qcom_scm.h>
 #include <uapi/misc/scm_user_intf.h>
+#include <linux/dma-buf.h>
 
 #define CMD_LIST(type, ...) ((type[]) {__VA_ARGS__})
 
@@ -36,6 +37,53 @@ struct scm_dev_data {
 };
 
 static struct scm_dev_data *__scm_dev;
+
+static int get_pa_from_dmabuf_fd(struct dma_buf* dma_buf, __u64 *p_addr)
+{
+	int ret = 0;
+	struct dma_buf_attachment *buf_attach = NULL;
+	struct sg_table *sgt = NULL;
+	u64 dmabuf_p_addr;
+
+	buf_attach = dma_buf_attach(dma_buf, __scm_dev->dev);
+	if (IS_ERR(buf_attach)) {
+		ret = -ENOMEM;
+		dev_err(__scm_dev->dev, "dma buf attach failed, ret: %d\n", ret);
+		goto out;
+	}
+
+	sgt = dma_buf_map_attachment(buf_attach, DMA_BIDIRECTIONAL);
+	if (IS_ERR(sgt)) {
+		dev_err(__scm_dev->dev, "mapping dma buffers failed, ret: %ld\n", PTR_ERR(sgt));
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	/* contiguous only => nents=1 */
+	if (sgt->nents != 1) {
+		ret = -EINVAL;
+		dev_err(__scm_dev->dev, "sg entries are not contigous, ret: %d\n", ret);
+		goto out;
+	}
+
+	dmabuf_p_addr = sg_dma_address(sgt->sgl);
+	if (!dmabuf_p_addr) {
+		ret = -EINVAL;
+		dev_err(__scm_dev->dev, "invalid physical address, ret: %d\n", ret);
+		goto out;
+	}
+	*p_addr = dmabuf_p_addr;
+
+out:
+	if (sgt) {
+		dma_buf_unmap_attachment(buf_attach, sgt, DMA_BIDIRECTIONAL);
+	}
+	if (buf_attach) {
+		dma_buf_detach(dma_buf, buf_attach);
+	}
+	return ret;
+}
+
 
 int qcom_scm_kgsl_set_smmu_aperture(unsigned int num_context_bank)
 {
@@ -137,45 +185,81 @@ static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	struct scm_hand_shake scm_data;
 	struct qcom_scm_desc desc;
 	struct qcom_scm_res res;
-	int id, i, no_of_args;
+	int id, i, no_of_args, ret;
+	struct dma_buf *dma_buf = NULL;
+	ret = -EFAULT;
 
-	if (cmd != SCM_HAND_SHAKE_IOCTL)
-		return -EFAULT;
+	do {
+		if (cmd != SCM_HAND_SHAKE_IOCTL){
+			ret = -EFAULT;
+			break;
+		}
 
-	if (copy_from_user(&scm_data, ip, sizeof(struct scm_hand_shake)))
-		return -EFAULT;
+		if (copy_from_user(&scm_data, ip, sizeof(struct scm_hand_shake))) {
+			ret = -EFAULT;
+			break;
+		}
 
-	// Validate allowed SVC ID and CMD pairs
-	if (!validate_svc_cmd(scm_data.svc, scm_data.cmd)) {
-		dev_err(dev_data->dev, "Unsupported svc: %d and command:%d\n",
-			scm_data.svc, scm_data.cmd);
-		return -EINVAL;
+		// Validate allowed SVC ID and CMD pairs
+		if (!validate_svc_cmd(scm_data.svc, scm_data.cmd)) {
+			dev_err(dev_data->dev, "Unsupported svc: %d and command:%d\n",
+				scm_data.svc, scm_data.cmd);
+			ret = -EINVAL;
+			break;
+		}
+
+		desc.svc = scm_data.svc;
+		desc.cmd = scm_data.cmd;
+		desc.owner = ARM_SMCCC_OWNER_SIP;
+
+		// Validate number of args
+		no_of_args = scm_data.arginfo & 0x0F;
+		if (no_of_args > MAX_QCOM_SCM_ARGS) {
+			ret = -EINVAL;
+			break;
+		}
+
+		desc.arginfo = scm_data.arginfo;
+
+		for (id = 0; id < no_of_args; id++)
+			desc.args[id] = scm_data.args_buffer[id];
+
+		if (scm_data.svc == QCOM_SCM_SVC_SHE && desc.cmd == 0x01) {
+			//translate fd to pa
+			__u64 pa = 0;
+
+			dma_buf = dma_buf_get(desc.args[2]);
+			if (IS_ERR_OR_NULL(dma_buf)) {
+				dev_err(__scm_dev->dev, "dma buf get failed\n");
+				ret = -EFAULT;
+				break;
+			}
+			if (get_pa_from_dmabuf_fd(dma_buf, &pa) < 0) {
+				dev_err(__scm_dev->dev, "%s. get_pa_from_dmabuf_fd failed.\n", __func__);
+				ret = -EINVAL;
+				break;
+			}
+			desc.args[2] = pa;
+		}
+
+		scm_data.ret = qcom_scm_call(&scm_pdev->dev, &desc, &res);
+		dev_info(dev_data->dev, "scm ioctl - ret: %d\n", scm_data.ret);
+
+		for (i = 0; i < MAX_QCOM_SCM_RETS; i++)
+			scm_data.qcom_scm_res[i] = res.result[i];
+
+		if (copy_to_user(ip, &scm_data, sizeof(struct scm_hand_shake))){
+			ret = -EFAULT;
+			break;
+		}
+
+		ret = 0;
+	} while (0);
+
+	if (!IS_ERR_OR_NULL(dma_buf)) {
+		dma_buf_put(dma_buf);
 	}
-
-	desc.svc = scm_data.svc;
-	desc.cmd = scm_data.cmd;
-	desc.owner = ARM_SMCCC_OWNER_SIP;
-
-	// Validate number of args
-	no_of_args = scm_data.arginfo & 0x0F;
-	if (no_of_args > MAX_QCOM_SCM_ARGS)
-		return -EINVAL;
-
-	desc.arginfo = scm_data.arginfo;
-
-	for (id = 0; id < no_of_args; id++)
-		desc.args[id] = scm_data.args_buffer[id];
-
-	scm_data.ret = qcom_scm_call(&scm_pdev->dev, &desc, &res);
-	dev_info(dev_data->dev, "scm ioctl - ret: %d\n", scm_data.ret);
-
-	for (i = 0; i < MAX_QCOM_SCM_RETS; i++)
-		scm_data.qcom_scm_res[i] = res.result[i];
-
-	if (copy_to_user(ip, &scm_data, sizeof(struct scm_hand_shake)))
-		return -EFAULT;
-
-	return 0;
+	return ret;
 }
 
 static const struct file_operations qcom_scm_fops = {
@@ -241,6 +325,6 @@ static struct platform_driver qcom_scm_intf_driver = {
 };
 
 module_platform_driver(qcom_scm_intf_driver);
-
+MODULE_IMPORT_NS(DMA_BUF);
 MODULE_DESCRIPTION("Qualcomm Technologies, Inc. user interface SCM driver");
 MODULE_LICENSE("GPL v2");
