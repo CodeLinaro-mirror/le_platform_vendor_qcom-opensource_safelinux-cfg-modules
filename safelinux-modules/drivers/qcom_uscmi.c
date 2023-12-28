@@ -11,30 +11,18 @@
 #include <linux/pm_runtime.h>
 #include <linux/pm_opp.h>
 #include <linux/reset.h>
+#include <linux/pm_domain.h>
 #include <uapi/misc/qcom_uscmi.h>
 
 struct qcom_uscmi_dev {
 	struct miscdevice miscdev;
 	struct device *dev;
 	const char *name;
+	struct dev_pm_domain_list *pd_list;
+	int *is_on;
 };
 
 #define miscdev_to_data(d) container_of(d, struct qcom_uscmi_dev, miscdev)
-
-static int dev_pm_opp_set_level(struct device *dev,
-				unsigned int level)
-{
-	struct dev_pm_opp *opp = dev_pm_opp_find_level_exact(dev, level);
-	int ret = 0;
-
-	if (IS_ERR(opp))
-		return PTR_ERR(opp);
-
-	ret = dev_pm_opp_set_opp(dev, opp);
-	dev_pm_opp_put(opp);
-
-	return ret;
-}
 
 static int qcom_uscmi_open(struct inode *inode, struct file *filp)
 {
@@ -48,11 +36,82 @@ static int qcom_uscmi_release(struct inode *inode, struct file *filp)
         return 0;
 }
 
+static struct device * get_pd_dev(struct qcom_uscmi_dev *uscmi, const char *name, int *idx)
+{
+	int index = -EINVAL;
+
+	if (!uscmi->pd_list) { /* single domain */
+		*idx = 0;
+		return uscmi->dev;
+	}
+
+	if (strlen(name))
+		index = of_property_match_string(uscmi->dev->of_node, "power-domain-names",
+						 name);
+
+	if (index < 0) {
+		dev_err(uscmi->dev, "power domain %s not found\n", name);
+		return NULL;
+	}
+
+	*idx = index;
+	return uscmi->pd_list->pd_devs[index];
+}
+
+static int do_power_operation(scmi_oper_ioctl_t *req,
+			      struct qcom_uscmi_dev *uscmi)
+{
+	struct device *dev;
+	int ret = 0;
+	int index;
+	int is_on;
+
+	dev = get_pd_dev(uscmi, req->name, &index);
+	if (!dev)
+		return -EINVAL;
+
+	if (req->proto != SCMI_PROTO_POWER)
+		return -EINVAL;
+
+	is_on = uscmi->is_on[index];
+
+	switch(req->oper) {
+	  case SCMI_PWR_OFF:
+		  if (is_on) {
+			ret = pm_runtime_put_sync(dev);
+			if (!ret)
+				uscmi->is_on[index] = 0;
+		  }
+		  break;
+	  case SCMI_PWR_ON:
+		  if (!is_on) {
+			ret = pm_runtime_resume_and_get(dev);
+			if (ret >= 0)
+				uscmi->is_on[index] = 1;
+		  }
+		  break;
+
+	  default:
+		dev_warn(dev, "power operation(%d) not supported\n", req->oper);
+		ret = -EINVAL;
+	}
+
+	if (ret < 0)
+		dev_err(dev, "power operation(%d) failed with err=%d\n", req->oper, ret);
+
+	return ret >= 0 ? 0 : ret;
+}
+
 static int do_performance_operation(scmi_oper_ioctl_t *req,
 				    struct qcom_uscmi_dev *uscmi)
 {
-	struct device *dev = uscmi->dev;
+	struct device *dev;
 	int ret = 0;
+	int index;
+
+	dev = get_pd_dev(uscmi, req->name, &index);
+	if (!dev)
+		return -EINVAL;
 
 	if (req->proto != SCMI_PROTO_PERFORMANCE)
 		return -EINVAL;
@@ -62,12 +121,22 @@ static int do_performance_operation(scmi_oper_ioctl_t *req,
 
 	switch(req->oper) {
 	  case SCMI_PRF_LVL_SET:
-		ret = dev_pm_opp_set_level(dev, req->level);
+	//	ret = dev_pm_opp_set_level(dev, req->level);
 		break;
 
 	  default:
 		dev_warn(dev, "performance operation(%d) not supported\n", req->oper);
 		ret = -EINVAL;
+	}
+
+	if (!ret && uscmi->pd_list) {
+		/* multiple domains don't get turned on automatically hence
+		 * need to do refcount increment here to get the set level
+		 * request take effect.
+		 */
+		ret = pm_runtime_resume_and_get(dev);
+		if (ret >= 0)
+			ret = pm_runtime_put_sync(dev);
 	}
 
 	if (ret)
@@ -80,7 +149,7 @@ static int do_reset_operation(scmi_oper_ioctl_t *req,
 			      struct qcom_uscmi_dev *uscmi)
 {
 	struct device *dev = uscmi->dev;
-	const char *id = strlen(req->reset_id) ? req->reset_id : NULL;
+	const char *id = strlen(req->name) ? req->name : NULL;
 	struct reset_control *rstc;
 	int ret = 0;
 
@@ -135,6 +204,10 @@ static long qcom_uscmi_ioctl(struct file *file, unsigned int cmd,
 		err = do_reset_operation(&req, uscmi);
 		break;
 
+	  case SCMI_IOCTL_PWR:
+		err = do_power_operation(&req, uscmi);
+		break;
+
 	  default:
 		err = -ENOTTY;
 		break;
@@ -158,12 +231,29 @@ static int qcom_uscmi_probe(struct platform_device *pdev)
 	struct qcom_uscmi_dev *uscmi;
 	const char *name;
 	int err;
+	u32 count = 1;
 
 	uscmi = devm_kzalloc(dev, sizeof(*uscmi), GFP_KERNEL);
 	if (!uscmi)
 		return -ENOMEM;
 
 	uscmi->dev = dev;
+
+	if (!dev->pm_domain) {
+		/* multiple domains used */
+		err = dev_pm_domain_attach_list(dev, NULL, &uscmi->pd_list);
+		if (err < 0) {
+			dev_err(dev, "multi domain attach failed(ret=%d)\n", err);
+			return err;
+		}
+		count = uscmi->pd_list->num_pds;
+	}
+
+	uscmi->is_on = devm_kzalloc(dev, sizeof(int) * count, GFP_KERNEL);
+	if (!uscmi->is_on) {
+		dev_pm_domain_detach_list(uscmi->pd_list);
+		return -ENOMEM;
+	}
 
 	if (!of_property_read_string(np, "qcom,dev-name", &name))
 		uscmi->name = devm_kstrdup(dev, name, GFP_KERNEL);
@@ -177,11 +267,16 @@ static int qcom_uscmi_probe(struct platform_device *pdev)
 	err = misc_register(&uscmi->miscdev);
 	if (err) {
 		dev_err(dev, "misc_register failed(ret=%d)\n", err);
+		dev_pm_domain_detach_list(uscmi->pd_list);
 		return err;
 	}
 
-	pm_runtime_set_active(dev);
-	pm_runtime_enable(dev);
+	if (count == 1) {
+		pm_runtime_set_active(dev);
+		pm_runtime_enable(dev);
+		uscmi->is_on[0] = 1;
+	}
+
 	pm_runtime_forbid(dev);
 
 	dev_info(dev, "/dev/%s node created\n", uscmi->name);
