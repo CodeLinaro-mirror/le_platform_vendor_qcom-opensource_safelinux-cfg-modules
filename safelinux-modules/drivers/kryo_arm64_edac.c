@@ -62,6 +62,16 @@
 
 #define edac_cpu_printk(level, prefix, fmt, arg...) \
 	printk(level "EDAC " prefix ": " fmt, ##arg)
+
+#define NUM_KRYO_BLOCKS		3
+
+struct edac_cpu_sysfs {
+	struct kernfs_node *ue[NUM_KRYO_BLOCKS];
+	struct kernfs_node *ce[NUM_KRYO_BLOCKS];
+};
+
+DEFINE_PER_CPU(struct edac_cpu_sysfs, cpu_kn);
+
 static inline void set_errxctlr_el1(void)
 {
 	u64 val = 0x10f;
@@ -106,9 +116,22 @@ static void kryo_edac_handle_ce(struct edac_device_ctl_info *edac_dev,
 				int inst_nr, int block_nr, const char *msg)
 {
 	edac_device_handle_ce(edac_dev, inst_nr, block_nr, msg);
+	sysfs_notify_dirent(per_cpu(cpu_kn.ce[block_nr], smp_processor_id()));
 #ifdef CONFIG_EDAC_KRYO_ARM64_PANIC_ON_CE
 	panic("EDAC %s CE: %s\n", edac_dev->ctl_name, msg);
 #endif
+}
+
+static void kryo_edac_handle_ue(struct edac_device_ctl_info *edac_dev,
+				int inst_nr, int block_nr, const char *msg)
+{
+	edac_device_handle_ue(edac_dev, inst_nr, block_nr, msg);
+	/*
+	 * Use panic functionality provided by EDAC framework in case of UE
+	 * errors. Recommended to panic from kernel in case of uncorrectbale
+	 * errors.
+	 */
+	sysfs_notify_dirent(per_cpu(cpu_kn.ue[block_nr], smp_processor_id()));
 }
 
 struct errors_edac {
@@ -119,11 +142,11 @@ struct errors_edac {
 
 static const struct errors_edac errors[] = {
 	{"Kryo L1 Correctable Error", kryo_edac_handle_ce },
-	{"Kryo L1 Uncorrectable Error", edac_device_handle_ue },
+	{"Kryo L1 Uncorrectable Error", kryo_edac_handle_ue },
 	{"Kryo L2 Correctable Error", kryo_edac_handle_ce },
-	{"Kryo L2 Uncorrectable Error", edac_device_handle_ue },
+	{"Kryo L2 Uncorrectable Error", kryo_edac_handle_ue },
 	{"L3 Correctable Error", kryo_edac_handle_ce },
-	{"L3 Uncorrectable Error", edac_device_handle_ue },
+	{"L3 Uncorrectable Error", kryo_edac_handle_ue },
 };
 
 #define KRYO_L1_CE 0
@@ -472,11 +495,11 @@ static void init_regs_on_cpu(bool all_cpus)
 	if (all_cpus) {
 		for_each_online_cpu(cpu) {
 			record = 1;
-			if (last_cluster != topology_physical_package_id(cpu)) {
+			if (last_cluster != topology_cluster_id(cpu)) {
 				smp_call_function_single(cpu, initialize_registers,
 							(void*)&record, 1);
 			}
-			last_cluster = topology_physical_package_id(cpu);
+			last_cluster = topology_cluster_id(cpu);
 		}
 	}
 }
@@ -515,7 +538,7 @@ static int kryo_cpu_erp_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	drv->edev_ctl = edac_device_alloc_ctl_info(0, "cpu",
-					num_possible_cpus(), "L", 3, 1, NULL, 0,
+					num_possible_cpus(), "L", NUM_KRYO_BLOCKS, 1, NULL, 0,
 					edac_device_alloc_index());
 
 	if (!drv->edev_ctl)
@@ -538,6 +561,17 @@ static int kryo_cpu_erp_probe(struct platform_device *pdev)
 
 	panic_handler_drvdata = drv;
 
+	for_each_possible_cpu(cpu) {
+		struct edac_device_instance *instance = &drv->edev_ctl->instances[cpu];
+
+		for (int i = 0; i < NUM_KRYO_BLOCKS; i++) {
+			per_cpu(cpu_kn.ue[i], cpu) = sysfs_get_dirent(instance->blocks[i].kobj.sd,
+								      "ue_count");
+			per_cpu(cpu_kn.ce[i], cpu) = sysfs_get_dirent(instance->blocks[i].kobj.sd,
+								      "ce_count");
+		}
+	}
+
 	if (request_erp_irq(pdev, "l1-l2-faultirq",
 			"KRYO L1-L2 ECC FAULTIRQ",
 			kryo_l1_l2_handler, drv, 1 , &irq))
@@ -554,8 +588,12 @@ static int kryo_cpu_erp_probe(struct platform_device *pdev)
 		fail++;
 	else {
 		for_each_possible_cpu(cpu) {
-			if(0 == topology_physical_package_id(cpu)) {
-				irq_set_affinity(irq, topology_core_cpumask(cpu));
+			pr_debug("kryo : package id:%u mask:%*pb\n",
+				 topology_physical_package_id(cpu),
+				 cpumask_pr_args(topology_core_cpumask(cpu)));
+			if (topology_physical_package_id(cpu) == 0 ||
+			    topology_cluster_id(cpu) == 0) {
+				irq_set_affinity(irq, topology_llc_cpumask(cpu));
 				break;
 			}
 		}
@@ -567,8 +605,16 @@ static int kryo_cpu_erp_probe(struct platform_device *pdev)
 		fail++;
 	else {
 		for_each_possible_cpu(cpu) {
-			if(1 == topology_physical_package_id(cpu)) {
-				irq_set_affinity(irq, topology_core_cpumask(cpu));
+			pr_debug("kryo:package id:%u cluster id:%d core mask:%*pb llc :%*pb cluster mask:%*pb topology: %*pb\n",
+				 topology_physical_package_id(cpu),
+				 topology_cluster_id(cpu),
+				 cpumask_pr_args(topology_core_cpumask(cpu)),
+				 cpumask_pr_args(topology_llc_cpumask(cpu)),
+				 cpumask_pr_args(topology_cluster_cpumask(cpu)),
+				 cpumask_pr_args(topology_sibling_cpumask(cpu)));
+			if (topology_physical_package_id(cpu) == 1 ||
+			    topology_cluster_id(cpu) == 1) {
+				irq_set_affinity(irq, topology_llc_cpumask(cpu));
 				break;
 			}
 		}
