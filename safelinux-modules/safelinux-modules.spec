@@ -1,6 +1,8 @@
 # If kversion isn't defined on the rpmbuild line, define it here.
 %{!?kversion: %define kversion %(uname -r)}
 
+%{!?with_oot_debug: %define with_oot_debug 0}
+
 %define kmod_name safelinux-modules
 
 %define debug_package %{nil}
@@ -31,7 +33,11 @@ Requires: %{name} = %{version}-%{release}
 %setup -qn %{name}
 
 %build
+%if %{with_oot_debug}
+KERNEL_SRC=%{_usrsrc}/kernels/%{kversion}+debug
+%else
 KERNEL_SRC=%{_usrsrc}/kernels/%{kversion}
+%endif
 make KDIR=${KERNEL_SRC} modules
 
 %post
@@ -41,10 +47,18 @@ depmod %{kversion}
 depmod %{kversion}
 
 %install
+%if %{with_oot_debug}
+KERNEL_SRC=%{_usrsrc}/kernels/%{kversion}+debug
+%else
 KERNEL_SRC=%{_usrsrc}/kernels/%{kversion}
+%endif
 make KDIR=${KERNEL_SRC} INSTALL_MOD_PATH=$RPM_BUILD_ROOT modules_install
 make KDIR=${KERNEL_SRC} HDR_INSTAL_PATH=$RPM_BUILD_ROOT/usr/include headers_install
+%if %{with_oot_debug}
+rm -rf "$RPM_BUILD_ROOT/lib/modules/%{kversion}+debug/modules."*
+%else
 rm -rf "$RPM_BUILD_ROOT/lib/modules/%{kversion}/modules."*
+%endif
 
 %clean
 rm -rf $RPM_BUILD_ROOT
@@ -57,16 +71,21 @@ rm -rf $RPM_BUILD_ROOT
 %{_includedir}/uapi/misc/qcom_uscmi.h
 
 %files
-/lib/modules/%{kversion}/extra/apps_pinctrl.ko
-/lib/modules/%{kversion}/extra/scm_user_intf.ko
-/lib/modules/%{kversion}/extra/vfio_iommu_qcom.ko
-/lib/modules/%{kversion}/extra/iommu_iova_map.ko
-/lib/modules/%{kversion}/extra/kiumd.ko
-/lib/modules/%{kversion}/extra/qcom_uscmi.ko
-/lib/modules/%{kversion}/extra/kryo_arm64_edac.ko
-/lib/modules/%{kversion}/extra/kiumd_kgsl.ko
-/lib/modules/%{kversion}/extra/qcom_dma_heaps.ko
-/lib/modules/%{kversion}/extra/mhi_ep_net.ko
+%if %{with_oot_debug}
+%define kernel_module_path /lib/modules/%{kversion}+debug
+%else
+%define kernel_module_path /lib/modules/%{kversion}
+%endif
+%{kernel_module_path}/extra/apps_pinctrl.ko
+%{kernel_module_path}/extra/scm_user_intf.ko
+%{kernel_module_path}/extra/vfio_iommu_qcom.ko
+%{kernel_module_path}/extra/iommu_iova_map.ko
+%{kernel_module_path}/extra/kiumd.ko
+%{kernel_module_path}/extra/qcom_uscmi.ko
+%{kernel_module_path}/extra/kryo_arm64_edac.ko
+%{kernel_module_path}/extra/kiumd_kgsl.ko
+%{kernel_module_path}/extra/qcom_dma_heaps.ko
+%{kernel_module_path}/extra/mhi_ep_net.ko
 
 %changelog
 * Mon Aug 28 2023 Deepti Jaggi <quic_djaggi@quicinc.com> 1.1
