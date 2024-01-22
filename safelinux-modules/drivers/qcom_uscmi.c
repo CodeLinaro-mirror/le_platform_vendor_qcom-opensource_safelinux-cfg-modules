@@ -121,7 +121,7 @@ static int do_performance_operation(scmi_oper_ioctl_t *req,
 
 	switch(req->oper) {
 	  case SCMI_PRF_LVL_SET:
-	//	ret = dev_pm_opp_set_level(dev, req->level);
+		ret = dev_pm_opp_set_level(dev, req->level);
 		break;
 
 	  default:
