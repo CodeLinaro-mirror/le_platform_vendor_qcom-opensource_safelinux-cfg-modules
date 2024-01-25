@@ -1105,9 +1105,10 @@ int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 				return -EINVAL;
 			}
 		}
+	}
 
-		if (kiusr.ptselect == KGSL_GLOBAL_PT || kiusr.ptselect == KGSL_PER_PROCESS_PT
-								 || kiusr.ptselect == KGSL_DEFAULT_PT) {
+	if (kiusr.ptselect == KGSL_GLOBAL_PT || kiusr.ptselect == KGSL_PER_PROCESS_PT
+							|| kiusr.ptselect == KGSL_DEFAULT_PT) {
 			iommu_dom = kiumd_get_iommu_domain(kiusr.vfio_fd);
 			if (!iommu_dom) {
 				pr_err("%s:iommu_dom is NULL\n", __func__);
@@ -1115,8 +1116,8 @@ int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 			}
 
 			iommu_flush_iotlb_all(iommu_dom);
-		}
 	}
+
 
 	spin_lock(&kiumd_ctx->smmu_lock);
 	hash_del(&smap->node);
