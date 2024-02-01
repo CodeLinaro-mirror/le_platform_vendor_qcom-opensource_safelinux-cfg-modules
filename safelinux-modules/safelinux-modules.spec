@@ -65,9 +65,10 @@ rm -rf $RPM_BUILD_ROOT
 /lib/modules/%{kversion}/extra/qcom_uscmi.ko
 /lib/modules/%{kversion}/extra/kryo_arm64_edac.ko
 /lib/modules/%{kversion}/extra/kiumd_kgsl.ko
+/lib/modules/%{kversion}/extra/qcom_dma_heaps.ko
 
 %changelog
-* Wed Aug 28 2023 Deepti Jaggi <quic_djaggi@quicinc.com> 1.1
+* Mon Aug 28 2023 Deepti Jaggi <quic_djaggi@quicinc.com> 1.1
 - Add Edac driver
 * Fri Jul 27 2023 Venkatakrishnaiah Pari <quic_vpari@quicinc.com> 1.0
 - First commit!
