@@ -64,33 +64,32 @@ static void vfio_iommu_qcom_detach_group(void *data,
 {
 }
 
-static int vfio_iommu_qcom_pin_pages(void *data,
-			struct iommu_group *iommu_group,
-			unsigned long *user_pfn,
-			int npage, int prt,
-			unsigned long *phys_pfn)
+static int vfio_iommu_qcom_pin_pages(void *iommu_data,
+				      struct iommu_group *iommu_group,
+				      dma_addr_t user_iova,
+				      int npage, int prot,
+				      struct page **pages)
 {
+
 	return 0;
 }
 
-static int vfio_iommu_qcom_unpin_pages(void *data,
-			unsigned long *user_pfn,
-			int npage)
+static void vfio_iommu_qcom_unpin_pages(void *iommu_data,
+					 dma_addr_t user_iova, int npage)
 {
-	return 0;
+
 }
 
-static int vfio_iommu_qcom_register_notifier(void *data,
-			unsigned long *events,
-			struct notifier_block *nb)
+static void vfio_iommu_qcom_register_device(void *iommu_data,
+					     struct vfio_device *vdev)
 {
-	return 0;
+    return;
 }
 
-static int vfio_iommu_qcom_unregister_notifier(void *data,
-			struct notifier_block *nb)
+static void vfio_iommu_qcom_unregister_device(void *iommu_data,
+					       struct vfio_device *vdev)
 {
-	return 0;
+   return;
 }
 
 static int vfio_iommu_qcom_dma_rw(void *iommu_data, dma_addr_t user_iova,
@@ -106,11 +105,6 @@ vfio_iommu_qcom_group_iommu_domain(void *data,
 	return NULL;
 }
 
-static void vfio_iommu_qcom_notify(void *data,
-				enum vfio_iommu_notify_type event)
-{
-}
-
 static const struct vfio_iommu_driver_ops vfio_iommu_driver_ops_qcom = {
 	.name			= "vfio-iommu-qcom",
 	.owner			= THIS_MODULE,
@@ -121,11 +115,10 @@ static const struct vfio_iommu_driver_ops vfio_iommu_driver_ops_qcom = {
 	.detach_group		= vfio_iommu_qcom_detach_group,
 	.pin_pages		= vfio_iommu_qcom_pin_pages,
 	.unpin_pages		= vfio_iommu_qcom_unpin_pages,
-	.register_notifier	= vfio_iommu_qcom_register_notifier,
-	.unregister_notifier	= vfio_iommu_qcom_unregister_notifier,
+	.register_device	= vfio_iommu_qcom_register_device,
+	.unregister_device	= vfio_iommu_qcom_unregister_device,
 	.dma_rw			= vfio_iommu_qcom_dma_rw,
 	.group_iommu_domain	= vfio_iommu_qcom_group_iommu_domain,
-	.notify			= vfio_iommu_qcom_notify,
 };
 
 int __init vfio_iommu_qcom_init(void)

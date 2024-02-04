@@ -29,9 +29,8 @@
 #include <uapi/misc/scm_user_intf.h>
 #include <linux/dma-direction.h>
 
-
 #include "arm-smmu.h"
-
+#include "vfio.h"
 /*Global Data structures needed for buffer sharing */
 static DEFINE_XARRAY_ALLOC(kiumd_xa);
 
@@ -287,6 +286,7 @@ int kiumd_perprocess_set_user_context(char __user *arg)
 	struct kiumd_smmu_user kismmu_pproc;
 	struct file *file;
 	struct vfio_device *vfio_dev;
+	struct vfio_device_file *df;
 	struct io_pgtable_cfg cfg;
 	struct arm_smmu_domain *smmu_dom;
 	struct iommu_domain *iommu_dom;
@@ -306,7 +306,8 @@ int kiumd_perprocess_set_user_context(char __user *arg)
 		pr_err("%s:failed to get file from vfio fd\n", __func__);
 		return -EBADF;
 	}
-	vfio_dev = (struct vfio_device *)file->private_data;
+	df = (struct vfio_device_file *)file->private_data;
+	vfio_dev = (struct vfio_device *)df->device;
 	if (!vfio_dev) {
 		pr_err("%s:vfio_dev is NULL\n", __func__);
 		fput(file);
@@ -369,6 +370,7 @@ int kiumd_perprocess_pt_alloc(char __user *arg)
 	struct kiumd_smmu_user kismmu_pproc;
 	struct file *file;
 	struct vfio_device *vfio_dev;
+	struct vfio_device_file *df;
 	struct io_pgtable_cfg cfg;
 	struct arm_smmu_domain *smmu_dom;
 	struct iommu_domain *iommu_dom;
@@ -387,7 +389,8 @@ int kiumd_perprocess_pt_alloc(char __user *arg)
 		return -EBADF;
 	}
 
-	vfio_dev = (struct vfio_device *)file->private_data;
+	df = (struct vfio_device_file *)file->private_data;
+	vfio_dev = (struct vfio_device *)df->device;
 	if (!vfio_dev) {
 		pr_err("%s:vfio_dev is NULL\n", __func__);
 		fput(file);
@@ -436,6 +439,7 @@ int kiumd_global_pgtble_set(char __user *arg)
 	struct kiumd_smmu_user kismmu_pproc;
 	struct file *file;
 	struct vfio_device *vfio_dev;
+	struct vfio_device_file *df;
 	struct iommu_domain *iommu_dom;
 	struct arm_smmu_domain *smmu_dom;
 	struct io_pgtable_ops *ki_pgtbl_ops;
@@ -454,7 +458,8 @@ int kiumd_global_pgtble_set(char __user *arg)
 		return -EBADF;
 	}
 
-	vfio_dev = (struct vfio_device *)file->private_data;
+	df = (struct vfio_device_file *)file->private_data;
+	vfio_dev = (struct vfio_device *)df->device;
 	if (!vfio_dev) {
 		pr_err("%s:vfio_dev is NULL\n", __func__);
 		fput(file);
@@ -502,6 +507,7 @@ int kiumd_perprocess_pgtble_set(char __user *arg)
 	struct kiumd_smmu_user kismmu_pproc;
 	struct file *file;
 	struct vfio_device *vfio_dev;
+	struct vfio_device_file *df;
 	struct iommu_domain *iommu_dom;
 	struct arm_smmu_domain *smmu_dom;
 	struct io_pgtable_ops *ki_pgtbl_ops;
@@ -520,7 +526,8 @@ int kiumd_perprocess_pgtble_set(char __user *arg)
 		return -EBADF;
 	}
 
-	vfio_dev = (struct vfio_device *)file->private_data;
+	df = (struct vfio_device_file *)file->private_data;
+	vfio_dev = (struct vfio_device *)df->device;
 	if (!vfio_dev) {
 		pr_err("%s:vfio_dev is NULL\n", __func__);
 		fput(file);
@@ -553,6 +560,7 @@ int kiumd_perprocess_pgtble_free(char __user *arg)
 	struct kiumd_smmu_user kismmu_pproc;
 	struct file *file;
 	struct vfio_device *vfio_dev;
+	struct vfio_device_file *df;
 	struct io_pgtable_ops *ki_pgtbl_ops;
 
 	if (copy_from_user(&kismmu_pproc, arg, sizeof(struct kiumd_smmu_user)))
@@ -569,7 +577,8 @@ int kiumd_perprocess_pgtble_free(char __user *arg)
 		return -EBADF;
 	}
 
-	vfio_dev = (struct vfio_device *)file->private_data;
+	df = (struct vfio_device_file *)file->private_data;
+	vfio_dev = (struct vfio_device *)df->device;
 	if (!vfio_dev) {
 		pr_err("%s:vfio_dev is NULL\n", __func__);
 		fput(file);
@@ -593,6 +602,7 @@ int kiumd_dmabuf_custom_iova_init(char __user *arg)
 {
 	struct kiumd_user kiusr;
 	struct vfio_device *vfio_dev;
+	struct vfio_device_file *df;
 	struct file *file;
 	struct kiumd_iommu_dma_cookie *cookie = NULL;
 	struct iommu_domain *domain = NULL;
@@ -615,7 +625,8 @@ int kiumd_dmabuf_custom_iova_init(char __user *arg)
 		return -EBADF;
 	}
 
-	vfio_dev = (struct vfio_device *)file->private_data;
+	df = (struct vfio_device_file *)file->private_data;
+	vfio_dev = (struct vfio_device *)df->device;
 	if (!vfio_dev)  {
 		pr_err("%s:vfio_dev is NULL\n", __func__);
 		fput(file);
@@ -624,7 +635,7 @@ int kiumd_dmabuf_custom_iova_init(char __user *arg)
 
 	domain = kiumd_iommu_get_dma_domain(vfio_dev->dev);
 	if (!domain) {
-		pr_err("%s:vfio_dev is NULL\n", __func__);
+		pr_err("%s:dma_domain is invalid \n", __func__);
 		fput(file);
 		return -EINVAL;
 	}
@@ -739,6 +750,7 @@ int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 {
 	struct kiumd_user kiusr;
 	struct vfio_device *vfio_dev;
+	struct vfio_device_file *df;
 	struct file *file;
 	struct dma_buf *kiumd_dmabuf = NULL;
 	struct dma_buf_attachment *dmabufattach = NULL;
@@ -766,8 +778,8 @@ int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 		pr_err("%s:failed to get file from vfio fd\n", __func__);
 		return -EBADF;
 	}
-
-	vfio_dev = (struct vfio_device *)file->private_data;
+	df = (struct vfio_device_file *)file->private_data;
+	vfio_dev = (struct vfio_device *)df->device;
 	if (vfio_dev == NULL) {
 		pr_err("%s:vfio_dev is NULL\n", __func__);
 		ret = -EINVAL;
@@ -848,6 +860,12 @@ int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 			goto fail_detach;
 		}
 	} else {
+
+		if (IS_ERR_OR_NULL(dmabufattach->dmabuf)) {
+			pr_err("%s:dmabuf is NULL\n", __func__);
+			return -EINVAL;
+		}
+
 		sgt = dma_buf_map_attachment(dmabufattach, kiumd_dma_direction);
 		if (IS_ERR_OR_NULL(sgt)) {
 			pr_err("%s: mapping failed with error: %ld, for device: %s\n", __func__, PTR_ERR(sgt), vfio_dev->dev->kobj.name);
@@ -941,6 +959,7 @@ struct iommu_domain *kiumd_get_iommu_domain(int vfio_fd)
 {
 	struct file *file;
 	struct vfio_device *vfio_dev;
+	struct vfio_device_file *df;
 	struct iommu_domain *iommu_dom;
 
 	file = fget(vfio_fd);
@@ -949,7 +968,8 @@ struct iommu_domain *kiumd_get_iommu_domain(int vfio_fd)
 		return NULL;
 	}
 
-	vfio_dev = (struct vfio_device *)file->private_data;
+	df = (struct vfio_device_file *)file->private_data;
+	vfio_dev = (struct vfio_device *)df->device;
 	if (!vfio_dev) {
 		pr_err("%s:vfio dev returns NULL\n", __func__);
 		fput(file);
@@ -989,6 +1009,7 @@ int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 	struct dma_buf_attachment *dmabufattach = NULL;
 	struct dma_buf *kiumd_dmabuf = NULL;
 	struct vfio_device *vfio_dev;
+	struct vfio_device_file *df;
 	struct iommu_domain *iommu_dom;
 	struct file *file;
 	int kiumd_dma_direction, ret = 0;
@@ -1059,7 +1080,8 @@ int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 			return -EINVAL;
 		}
 
-		vfio_dev = (struct vfio_device *)file->private_data;
+		df = (struct vfio_device_file *)file->private_data;
+		vfio_dev = (struct vfio_device *)df->device;
 		if (!vfio_dev) {
 			pr_err("%s:vfio dev returns NULL\n", __func__);
 			fput(file);
@@ -1133,6 +1155,7 @@ int kiumd_iova_ctrl(char __user *arg)
 	struct kiumd_iova iovausr;
 	struct file *file;
 	struct vfio_device *vfio_dev;
+	struct vfio_device_file *df;
 	struct iommu_domain *domain = NULL;
 	struct kiumd_iommu_dma_cookie *cookie = NULL;
 	int cookie_type;
@@ -1157,7 +1180,8 @@ int kiumd_iova_ctrl(char __user *arg)
 		return -EBADF;
 	}
 
-	vfio_dev = (struct vfio_device *)file->private_data;
+	df = (struct vfio_device_file *)file->private_data;
+	vfio_dev = (struct vfio_device *)df->device;
 	domain = kiumd_iommu_get_dma_domain(vfio_dev->dev);
 	if (!domain) {
 		pr_err("%s:iommu domain is NULL\n", __func__);
@@ -1555,6 +1579,7 @@ int kiumd_dmabuf_vfio_secure_map(char __user *arg, struct file *fp)
 {
 	struct kiumd_user kiusr;
 	struct vfio_device *vfio_dev = NULL;
+	struct vfio_device_file *df;
 	struct file *file = NULL;
 	struct dma_buf *kiumd_dmabuf = NULL;
 	struct dma_buf_attachment *dmabufattach = NULL;
@@ -1583,7 +1608,8 @@ int kiumd_dmabuf_vfio_secure_map(char __user *arg, struct file *fp)
 		return -EBADF;
 	}
 
-	vfio_dev = (struct vfio_device *)file->private_data;
+	df = (struct vfio_device_file *)file->private_data;
+	vfio_dev = (struct vfio_device *)df->device;
 	if (!vfio_dev) {
 		pr_err("%s:%d vfio_dev is NULL\n", __func__, __LINE__);
 		ret = -EINVAL;
@@ -1733,6 +1759,7 @@ close_file:
 int kiumd_dmabuf_vfio_secure_unmap(char __user *arg, struct file *fp)
 {
 	struct vfio_device *vfio_dev = NULL;
+	struct vfio_device_file *df;
 	struct file *file = NULL;
 	u64 pgd;
 	int ret = 0;
@@ -1790,7 +1817,8 @@ int kiumd_dmabuf_vfio_secure_unmap(char __user *arg, struct file *fp)
 		return -EBADF;
 	}
 
-	vfio_dev = (struct vfio_device *)file->private_data;
+	df = (struct vfio_device_file *)file->private_data;
+	vfio_dev = (struct vfio_device *)df->device;
 	if (!vfio_dev) {
 		pr_err("%s:%d vfio_dev is NULL\n", __func__, __LINE__);
 		ret = -EINVAL;
