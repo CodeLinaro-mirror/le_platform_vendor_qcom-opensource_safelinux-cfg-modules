@@ -15,19 +15,28 @@
 #include <uapi/misc/scm_user_intf.h>
 #include <linux/dma-buf.h>
 
-#define CMD_LIST(type, ...) ((type[]) {__VA_ARGS__})
+#define ARG_TO_ARRAY(type, ...) ((type[]) {__VA_ARGS__})
+
+#define DMA_FD_ARGS(...) ARG_TO_ARRAY(__u32, __VA_ARGS__)
 
 #define SVC_CMD_GRP(svc, num_of_cmds, ...)                      \
 	{                                                       \
 		.svc_id = (__u32)svc,                           \
 		.num_cmd = (__u32)num_of_cmds,                  \
-		.cmd_ids = CMD_LIST(__u32, __VA_ARGS__),        \
+		.cmd_ids = ARG_TO_ARRAY(__u32, __VA_ARGS__),        \
 	}
 
 struct svc_cmd_list {
 	__u32 svc_id;
 	__u32 num_cmd;
 	__u32 *cmd_ids;
+};
+
+struct svc_cmd_dma_list {
+	__u32 svc_id;
+	__u32 cmd_id;
+	__u32 num_dma_fds;
+	__u32 *dma_fds;
 };
 
 struct scm_dev_data {
@@ -38,12 +47,79 @@ struct scm_dev_data {
 
 static struct scm_dev_data *__scm_dev;
 
-static int get_pa_from_dmabuf_fd(struct dma_buf* dma_buf, __u64 *p_addr)
+/*
+ * SVC IC and CM ID pairs allowed to be called using SCM from userspace
+ */
+static const struct svc_cmd_list sip_tbl[] = {
+	[QCOM_SCM_SVC_BOOT] = SVC_CMD_GRP(QCOM_SCM_SVC_BOOT,
+					  1,
+					  QCOM_SCM_BOOT_SET_REMOTE_STATE),
+
+	[QCOM_SCM_SVC_PIL] = SVC_CMD_GRP(QCOM_SCM_SVC_PIL,
+					 4,
+					 QCOM_SCM_PIL_PAS_INIT_IMAGE,
+					 QCOM_SCM_PIL_PAS_MEM_SETUP,
+					 QCOM_SCM_PIL_PAS_AUTH_AND_RESET,
+					 QCOM_SCM_PIL_PAS_SHUTDOWN),
+
+	[QCOM_SCM_SVC_INFO] = SVC_CMD_GRP(QCOM_SCM_SVC_INFO,
+					  3,
+					  QCOM_SCM_INFO_IS_CALL_AVAIL,
+					  QCOM_SCM_INFO_GET_FEAT_VERSION_CMD,
+					  QCOM_SCM_INFO_BW_PROF_ID),
+
+	[QCOM_SCM_SVC_MP] = SVC_CMD_GRP(QCOM_SCM_SVC_MP,
+					4,
+					QCOM_SCM_MP_VIDEO_VAR,
+					QCOM_SCM_MP_SHM_BRIDGE_ENABLE,
+					QCOM_SCM_MP_SHM_BRIDGE_DELETE,
+					QCOM_SCM_MP_SHM_BRIDGE_CREATE),
+
+	[QCOM_SCM_SVC_SHE] = SVC_CMD_GRP(QCOM_SCM_SVC_SHE,
+					 1,
+					 QCOM_SCM_SHE_ID),
+
+	[QCOM_SCM_SVC_SAFETY] = SVC_CMD_GRP(QCOM_SCM_SVC_SAFETY,
+					    1,
+					    QCOM_SCM_SAFETY_ENABLE_FFI_ID),
+};
+
+/*
+ * SVC/ Cmd ID pair that needs DMA buf fd to PA translation
+ */
+static const struct svc_cmd_dma_list dma_fd_tbl[] = {
+
+	{QCOM_SCM_SVC_SHE, QCOM_SCM_SHE_ID, 1, DMA_FD_ARGS(2)},
+
+};
+
+int qcom_scm_kgsl_set_smmu_aperture(unsigned int num_context_bank);
+
+int qcom_scm_kgsl_set_smmu_aperture(unsigned int num_context_bank)
 {
-	int ret = 0;
+	struct qcom_scm_desc desc = {
+		.svc = QCOM_SCM_SVC_MP,
+		.cmd = QCOM_SCM_MP_CP_SMMU_APERTURE_ID,
+		.owner = ARM_SMCCC_OWNER_SIP,
+		.args[0] = 0xffff0000
+                           | ((QCOM_SCM_CP_APERTURE_REG & 0xff) << 8)
+                           | (num_context_bank & 0xff),
+		.args[1] = 0xffffffff,
+		.args[2] = 0xffffffff,
+		.args[3] = 0xffffffff,
+		.arginfo = QCOM_SCM_ARGS(4),
+	};
+
+	return qcom_scm_call(__scm_dev->dev, &desc, NULL);
+}
+EXPORT_SYMBOL(qcom_scm_kgsl_set_smmu_aperture);
+
+static int get_pa_from_dmabuf_fd(struct dma_buf* dma_buf, u64 *p_addr)
+{
 	struct dma_buf_attachment *buf_attach = NULL;
 	struct sg_table *sgt = NULL;
 	u64 dmabuf_p_addr;
+	int ret = 0;
 
 	buf_attach = dma_buf_attach(dma_buf, __scm_dev->dev);
 	if (IS_ERR(buf_attach)) {
@@ -84,65 +160,55 @@ out:
 	return ret;
 }
 
-
-int qcom_scm_kgsl_set_smmu_aperture(unsigned int num_context_bank)
+static int get_dmafd_args(unsigned int svc_id, unsigned int cmd_id, unsigned int *dma_fds)
 {
+	u32 len = sizeof(dma_fd_tbl) / sizeof(dma_fd_tbl[0]);
+	int i;
 
-	struct qcom_scm_desc desc = {
-		.svc = QCOM_SCM_SVC_MP,
-		.cmd = QCOM_SCM_MP_CP_SMMU_APERTURE_ID,
-		.owner = ARM_SMCCC_OWNER_SIP,
-		.args[0] = 0xffff0000
-                           | ((QCOM_SCM_CP_APERTURE_REG & 0xff) << 8)
-                           | (num_context_bank & 0xff),
-		.args[1] = 0xffffffff,
-		.args[2] = 0xffffffff,
-		.args[3] = 0xffffffff,
-		.arginfo = QCOM_SCM_ARGS(4),
-	};
+	struct svc_cmd_dma_list dma_args;
+	for(i = 0; i < len; i++) {
+		dma_args = dma_fd_tbl[i];
+		if (dma_args.svc_id == svc_id && dma_args.cmd_id == cmd_id) {
+			memcpy(dma_fds, dma_args.dma_fds, sizeof(u32) * dma_args.num_dma_fds);
 
-	return qcom_scm_call(__scm_dev->dev, &desc, NULL);
+			return dma_args.num_dma_fds;
+		}
+	}
+
+	return -EINVAL;
 }
 
-EXPORT_SYMBOL(qcom_scm_kgsl_set_smmu_aperture);
+static int translate_fd_to_pa(unsigned  int *dmabuf_fd,
+			      unsigned int no_dma_fds,
+			      long long unsigned int *scm_args)
+{
+	struct dma_buf *dma_buf = NULL;
+	u64 pa = 0;
+	int i;
 
-static const struct svc_cmd_list sip_tbl[] = {
-	[QCOM_SCM_SVC_BOOT] = SVC_CMD_GRP(QCOM_SCM_SVC_BOOT,
-					  1,
-					  QCOM_SCM_BOOT_SET_REMOTE_STATE),
+        for (i = 0; i < no_dma_fds; i++) {
+                dma_buf = dma_buf_get(scm_args[dmabuf_fd[i]]);
+                if (IS_ERR_OR_NULL(dma_buf)) {
+                        dev_err(__scm_dev->dev, "dma buf get failed\n");
+                        return -EFAULT;
+                }
 
-	[QCOM_SCM_SVC_PIL] = SVC_CMD_GRP(QCOM_SCM_SVC_PIL,
-					 4,
-					 QCOM_SCM_PIL_PAS_INIT_IMAGE,
-					 QCOM_SCM_PIL_PAS_MEM_SETUP,
-					 QCOM_SCM_PIL_PAS_AUTH_AND_RESET,
-					 QCOM_SCM_PIL_PAS_SHUTDOWN),
+                if (get_pa_from_dmabuf_fd(dma_buf, &pa) < 0)
+                        return -EINVAL;
 
-	[QCOM_SCM_SVC_INFO] = SVC_CMD_GRP(QCOM_SCM_SVC_INFO,
-					  3,
-					  QCOM_SCM_INFO_IS_CALL_AVAIL,
-					  QCOM_SCM_INFO_GET_FEAT_VERSION_CMD,
-					  QCOM_SCM_INFO_BW_PROF_ID),
+                scm_args[dmabuf_fd[i]] = pa;
+        }
 
-	[QCOM_SCM_SVC_MP] = SVC_CMD_GRP(QCOM_SCM_SVC_MP,
-					4,
-					QCOM_SCM_MP_VIDEO_VAR,
-					QCOM_SCM_MP_SHM_BRIDGE_ENABLE,
-					QCOM_SCM_MP_SHM_BRIDGE_DELETE,
-					QCOM_SCM_MP_SHM_BRIDGE_CREATE),
+	if (!IS_ERR_OR_NULL(dma_buf))
+		dma_buf_put(dma_buf);
 
-	[QCOM_SCM_SVC_SHE] = SVC_CMD_GRP(QCOM_SCM_SVC_SHE,
-					 1,
-					 QCOM_SCM_SHE_ID),
-
-	[QCOM_SCM_SVC_SAFETY] = SVC_CMD_GRP(QCOM_SCM_SVC_SAFETY,
-					    1,
-					    QCOM_SCM_SAFETY_ENABLE_FFI_ID),
-};
+        return 0;
+}
 
 static bool validate_svc_cmd(unsigned int svc_id, unsigned int cmd_id)
 {
 	struct svc_cmd_list svc_cmd_tmp;
+	int i;
 
 	switch (svc_id) {
 	case QCOM_SCM_SVC_BOOT:
@@ -159,7 +225,7 @@ static bool validate_svc_cmd(unsigned int svc_id, unsigned int cmd_id)
 		return false;
 	}
 
-	for (int i = 0; i < svc_cmd_tmp.num_cmd; i++) {
+	for (i = 0; i < svc_cmd_tmp.num_cmd; i++) {
 		if (cmd_id == svc_cmd_tmp.cmd_ids[i])
 			return true;
 	}
@@ -185,81 +251,56 @@ static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	struct scm_hand_shake scm_data;
 	struct qcom_scm_desc desc;
 	struct qcom_scm_res res;
-	int id, i, no_of_args, ret;
-	struct dma_buf *dma_buf = NULL;
-	ret = -EFAULT;
+	int id, i, no_of_args, no_dma_fds, ret = 0;
+	u32 dma_fd_args[MAX_QCOM_SCM_ARGS];
 
-	do {
-		if (cmd != SCM_HAND_SHAKE_IOCTL){
-			ret = -EFAULT;
-			break;
-		}
+	if (cmd != SCM_HAND_SHAKE_IOCTL)
+		return -EFAULT;
 
-		if (copy_from_user(&scm_data, ip, sizeof(struct scm_hand_shake))) {
-			ret = -EFAULT;
-			break;
-		}
+	if (copy_from_user(&scm_data, ip, sizeof(struct scm_hand_shake)))
+		return -EFAULT;
 
-		// Validate allowed SVC ID and CMD pairs
-		if (!validate_svc_cmd(scm_data.svc, scm_data.cmd)) {
-			dev_err(dev_data->dev, "Unsupported svc: %d and command:%d\n",
-				scm_data.svc, scm_data.cmd);
-			ret = -EINVAL;
-			break;
-		}
-
-		desc.svc = scm_data.svc;
-		desc.cmd = scm_data.cmd;
-		desc.owner = ARM_SMCCC_OWNER_SIP;
-
-		// Validate number of args
-		no_of_args = scm_data.arginfo & 0x0F;
-		if (no_of_args > MAX_QCOM_SCM_ARGS) {
-			ret = -EINVAL;
-			break;
-		}
-
-		desc.arginfo = scm_data.arginfo;
-
-		for (id = 0; id < no_of_args; id++)
-			desc.args[id] = scm_data.args_buffer[id];
-
-		if (scm_data.svc == QCOM_SCM_SVC_SHE && desc.cmd == 0x01) {
-			//translate fd to pa
-			__u64 pa = 0;
-
-			dma_buf = dma_buf_get(desc.args[2]);
-			if (IS_ERR_OR_NULL(dma_buf)) {
-				dev_err(__scm_dev->dev, "dma buf get failed\n");
-				ret = -EFAULT;
-				break;
-			}
-			if (get_pa_from_dmabuf_fd(dma_buf, &pa) < 0) {
-				dev_err(__scm_dev->dev, "%s. get_pa_from_dmabuf_fd failed.\n", __func__);
-				ret = -EINVAL;
-				break;
-			}
-			desc.args[2] = pa;
-		}
-
-		scm_data.ret = qcom_scm_call(&scm_pdev->dev, &desc, &res);
-		dev_info(dev_data->dev, "scm ioctl - ret: %d\n", scm_data.ret);
-
-		for (i = 0; i < MAX_QCOM_SCM_RETS; i++)
-			scm_data.qcom_scm_res[i] = res.result[i];
-
-		if (copy_to_user(ip, &scm_data, sizeof(struct scm_hand_shake))){
-			ret = -EFAULT;
-			break;
-		}
-
-		ret = 0;
-	} while (0);
-
-	if (!IS_ERR_OR_NULL(dma_buf)) {
-		dma_buf_put(dma_buf);
+	// Validate allowed SVC ID and CMD pairs
+	if (!validate_svc_cmd(scm_data.svc, scm_data.cmd)) {
+		dev_err(dev_data->dev, "Unsupported svc: %d and command:%d\n",
+			scm_data.svc, scm_data.cmd);
+		return -EINVAL;
 	}
-	return ret;
+
+	desc.svc = scm_data.svc;
+	desc.cmd = scm_data.cmd;
+	desc.owner = ARM_SMCCC_OWNER_SIP;
+
+	// Validate number of args
+	no_of_args = scm_data.arginfo & 0x0F;
+	if (no_of_args > MAX_QCOM_SCM_ARGS)
+		ret = -EINVAL;
+
+	desc.arginfo = scm_data.arginfo;
+
+	for (id = 0; id < no_of_args; id++)
+		desc.args[id] = scm_data.args_buffer[id];
+
+        no_dma_fds = get_dmafd_args(desc.svc, desc.cmd, dma_fd_args);
+        if (no_dma_fds > 0) {
+                //translate fd to pa
+                ret = translate_fd_to_pa(dma_fd_args, no_dma_fds, desc.args);
+                if (ret)
+                        return ret;
+        }
+
+	scm_data.ret = qcom_scm_call(&scm_pdev->dev, &desc, &res);
+	if (scm_data.ret)
+		dev_err(dev_data->dev, "scm ioctl failed - ret : %d\n", scm_data.ret);
+
+	for (i = 0; i < MAX_QCOM_SCM_RETS; i++)
+		scm_data.qcom_scm_res[i] = res.result[i];
+
+	if (copy_to_user(ip, &scm_data, sizeof(struct scm_hand_shake)))
+		ret = -EFAULT;
+
+
+        return ret;
 }
 
 static const struct file_operations qcom_scm_fops = {
