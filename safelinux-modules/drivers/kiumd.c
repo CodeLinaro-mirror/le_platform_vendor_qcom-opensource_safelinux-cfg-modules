@@ -1477,7 +1477,7 @@ static int kiumd_io_pgtable_hyp_unassign_page(u32 *vmid, u64 page, u32 nr_acl_en
 static int kiumd_hyp_unassign_sg(struct sg_table *sgt, int *source_vm_list,
 				 int source_nelems, bool clear_page_private)
 {
-	u64 src_vmid_list = 0;
+	u64 src_vmid_list = 0, src_vmid_list_copy = 0;
 	struct qcom_scm_vmperm dst_vmids[] = { {QCOM_SCM_VMID_HLOS,
 						QCOM_SCM_PERM_RWX } };
 	struct scatterlist *sg;
@@ -1499,9 +1499,10 @@ static int kiumd_hyp_unassign_sg(struct sg_table *sgt, int *source_vm_list,
 		pr_debug("Hyp unassign sg for dst:%d vmid:%d\n",
 			 j, source_vm_list[j]);
 	}
-
+	src_vmid_list_copy = src_vmid_list;
 	do {
-		pr_debug("%s: memory ownership transfer start\n", __func__);
+		src_vmid_list = src_vmid_list_copy;
+		pr_debug("%s: memory ownership transfer start src vmid:%llx\n", __func__, src_vmid_list);
 		ret = qcom_scm_assign_mem(page_to_phys(sg_page(sg)), sg->length, &src_vmid_list,
 					  dst_vmids, ARRAY_SIZE(dst_vmids));
 		if (ret) {
@@ -1552,11 +1553,12 @@ static int kiumd_hyp_assign_sg(struct sg_table *sgt, int *dest_vm_list,
 	}
 
 	do {
-		pr_debug("Assign call initiated\n");
+		src_vmid_list = BIT(QCOM_SCM_VMID_HLOS);
+		pr_debug("Assign call initiated :%llx\n", src_vmid_list);
 		ret = qcom_scm_assign_mem(page_to_phys(sg_page(sg)), sg->length, &src_vmid_list,
 					  dst_vmids, dest_nelems);
 		if (ret) {
-			pr_err("failed qcom_assign for assigning %llu address of size %x rc:%d\n",
+			pr_err("failed qcom_assign for assigning %llx address of size %x rc:%d\n",
 			       page_to_phys(sg_page(sg)), sg->length, ret);
 			goto err;
 		}
