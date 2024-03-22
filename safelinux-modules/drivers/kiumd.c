@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022,2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 #include <linux/device.h>
 #include <linux/dma-buf.h>
@@ -210,6 +210,18 @@ struct smmu_map_data {
 
 static struct io_pgtable *pgtable;
 
+/**
+* @Brief: This function find the
+* iommu group for given vfio device
+* and then return default iommu
+* domain for that group.
+*
+* Parameters:
+* @dev: vfio device
+*
+* Returns struct iommu_domain * upon success
+* and NULL on failure
+*/
 struct iommu_domain *kiumd_iommu_get_dma_domain(struct device *dev)
 {
 	struct kiumd_iommu_group *iommu_group;
@@ -223,6 +235,16 @@ struct iommu_domain *kiumd_iommu_get_dma_domain(struct device *dev)
 	return iommu_group->default_domain;
 }
 
+/**
+* @Brief: This function find the
+* iommu domain for given group
+*
+* Parameters:
+* @group: iommu group pointer
+*
+* Returns void *(iommu domain) upon success
+* and NULL on failure
+*/
 void *kiumd_iommu_group_default_domain(void *group)
 {
 	struct kiumd_iommu_group *iommu_group = (struct kiumd_iommu_group *) group;
@@ -234,6 +256,16 @@ void *kiumd_iommu_group_default_domain(void *group)
 }
 EXPORT_SYMBOL_GPL(kiumd_iommu_group_default_domain);
 
+/**
+* @Brief: This function provide the vfio device
+* pointer for the given file descriptor
+*
+* Parameters:
+* @fd: file descriptor
+*
+* Returns vfio device * upon success and NULL
+* on failure
+*/
 static struct vfio_device *kiumd_get_vfio_device(int fd)
 {
 	struct vfio_device *vfio_dev = NULL;
@@ -261,6 +293,16 @@ close_file:
 	return vfio_dev;
 }
 
+/**
+* @Brief: This function provide the dma cookie
+* for given vfio device
+*
+* Parameters:
+* @vfio_dev: vfio device
+*
+* Returns  struct kiumd_iommu_dma_cookie
+* *(cookie) upon success and NULL on failure
+*/
 static struct kiumd_iommu_dma_cookie *kiumd_get_dma_cookie(struct vfio_device *vfio_dev)
 {
 	struct iommu_domain *domain;
@@ -291,6 +333,17 @@ static struct kiumd_iommu_dma_cookie *kiumd_get_dma_cookie(struct vfio_device *v
 	return cookie;
 }
 
+/**
+* @Brief: This function set dma cookie type and iova to given
+* cookie type and iova.
+*
+* Parameters:
+* @*cookie: iommu dma cookie
+* @type: iommu_dma_cookie_type
+* @iova: iova address
+*
+* Returns  0 upon success and -EINVAL on failure
+*/
 static int kiumd_set_dma_cookie(struct kiumd_iommu_dma_cookie *cookie,
 				enum iommu_dma_cookie_type type, dma_addr_t iova)
 {
@@ -305,6 +358,16 @@ static int kiumd_set_dma_cookie(struct kiumd_iommu_dma_cookie *cookie,
 	return 0;
 }
 
+/**
+* @Brief: This function call the api to set dma cookie
+*
+* Parameters:
+* @*cookie: iommu dma cookie
+* @type: iommu_dma_cookie_type
+* @iova: iova address
+*
+* Returns  0 upon success and -EINVAL on failure
+*/
 static int kiumd_set_dma_cookie_unlocked(struct kiumd_iommu_dma_cookie *cookie,
 					 enum iommu_dma_cookie_type type, dma_addr_t iova)
 {
@@ -321,6 +384,16 @@ static int kiumd_set_dma_cookie_unlocked(struct kiumd_iommu_dma_cookie *cookie,
 	return ret;
 }
 
+/**
+* @Brief: This function facilitates to
+* get the iommu domain for given vfio device
+*
+* Parameters:
+* @vfio_fd: file descriptor for vfio device
+*
+* Returns  iommu_dom upon success and NULL
+* on failure
+*/
 struct iommu_domain *kiumd_get_iommu_domain(int vfio_fd)
 {
 	struct vfio_device *vfio_dev = NULL;
@@ -344,6 +417,16 @@ struct iommu_domain *kiumd_get_iommu_domain(int vfio_fd)
 	return domain;
 }
 
+/**
+* @Brief: This function facilitates to
+* set the iommu domain
+*
+* Parameters:
+* @vfio_fd: file descriptor for vfio device
+*
+* Returns  iommu_dom upon success and NULL
+* on failure
+*/
 struct arm_smmu_domain *kiumd_get_smmu_domain(int vfio_fd)
 {
 	struct iommu_domain *iommu_dom = NULL;
@@ -367,6 +450,16 @@ struct arm_smmu_domain *kiumd_get_smmu_domain(int vfio_fd)
 	return smmu_domain;
 }
 
+/**
+* Brief: This function write smmu context bank for given
+* index bank register for given context bank.
+*
+* Parameters:
+* @*smmu: pointer for arm smmu device information
+* @idx: index for context bank
+*
+* Returns void
+*/
 void kiumd_smmuv2_write_context_bank(struct arm_smmu_device *smmu, int idx)
 {
 	u32 reg;
@@ -417,6 +510,16 @@ void kiumd_smmuv2_write_context_bank(struct arm_smmu_device *smmu, int idx)
 	smmu->impl->write_sctlr(smmu, idx, reg);
 }
 
+/**
+* @Brief: This function call the api to
+* set page table base register configuration
+*
+* Parameters:
+* @*cookie: iommu dma cookie
+* @pgtbl_cfg: pointer for io_pgtable_cfg
+*
+* Returns  0 upon success and -EINVAL on failure
+*/
 int kiumd_smmuv2_set_ttbr0_cfg(const void *cookie,
 		const struct io_pgtable_cfg *pgtbl_cfg)
 {
@@ -443,6 +546,16 @@ int kiumd_smmuv2_set_ttbr0_cfg(const void *cookie,
 	return 0;
 }
 
+/**
+* @Brief: This function call the api to
+* set the per process user context
+*
+* Parameters:
+* @arg: user space argument pointer
+* @pgtbl_cfg: pointer for io_pgtable_cfg
+*
+* Returns  0 upon success and -EINVAL on failure
+*/
 int kiumd_perprocess_set_user_context(char __user *arg)
 {
 	struct kiumd_smmu_user kismmu_pproc;
@@ -527,6 +640,15 @@ int kiumd_perprocess_set_user_context(char __user *arg)
 	return 0;
 }
 
+/**
+* @Brief: This function call the api to provides
+* per process page table allocation
+*
+* Parameters:
+* @arg: user space argument pointer
+*
+* Returns  0 upon success and -EINVAL on failure
+*/
 int kiumd_perprocess_pt_alloc(char __user *arg)
 {
 	struct kiumd_smmu_user kismmu_pproc;
@@ -595,6 +717,16 @@ int kiumd_perprocess_pt_alloc(char __user *arg)
 	return 0;
 }
 
+/**
+* @Brief: This function call the api to
+* provides global page table allocation
+*
+* Parameters:
+* @arg: user space argument pointer
+*
+* Returns  0 upon success and error codes
+* on failure
+*/
 int kiumd_global_pgtble_set(char __user *arg)
 {
 
@@ -664,6 +796,16 @@ int kiumd_global_pgtble_set(char __user *arg)
 	return 0;
 }
 
+/**
+* @Brief: This function call the api to set
+* the per process page table ops
+*
+* Parameters:
+* @arg: user space argument pointer
+*
+* Returns  0 upon success and error codes
+* on failure
+*/
 int kiumd_perprocess_pgtble_set(char __user *arg)
 {
 	struct kiumd_smmu_user kismmu_pproc;
@@ -717,6 +859,16 @@ int kiumd_perprocess_pgtble_set(char __user *arg)
 	return 0;
 }
 
+/**
+* @Brief: This function call the api to free
+* the per process page table ops
+*
+* Parameters:
+* @arg: user space argument pointer
+*
+* Returns  0 upon success and error codes
+* on failure
+*/
 int kiumd_perprocess_pgtble_free(char __user *arg)
 {
 	struct kiumd_smmu_user kismmu_pproc;
@@ -760,6 +912,17 @@ int kiumd_perprocess_pgtble_free(char __user *arg)
 	return 0;
 }
 
+/**
+* @Brief: This function is to map the IOVAs in a predefined address range. The
+* IOVA address range should be specified in the device tree using the attribute
+* qcom,iommu-dma-addr-pool The function is called via IOCTL
+* interface and input is provided via struct kiumd_user from the user space.
+*
+* Parameters:
+* @arg: user space argument pointer
+*
+* Returns  0 upon success and error codes on failure
+*/
 int kiumd_dmabuf_custom_iova_init(char __user *arg)
 {
 	struct kiumd_user kiusr;
@@ -822,6 +985,19 @@ int kiumd_dmabuf_custom_iova_init(char __user *arg)
 	return 0;
 }
 
+/**
+* @Brief: This function facilitates to
+* clear the global map based of
+* given iova and ptselect
+*
+* Parameters:
+* @iova: u64 virtual address for page table
+* @size: u64 size
+* @ptselect: type of pagetable per
+* process or global
+*
+* Returns nothing
+*/
 void clear_map_iova(u64 iova, u64 size, int ptselect)
 {
 	u64 bit;
@@ -835,6 +1011,18 @@ void clear_map_iova(u64 iova, u64 size, int ptselect)
 	}
 }
 
+/**
+* @Brief: This function facilitates to
+* get the offset of the global map
+* based of given size and  ptselect
+*
+* Parameters:
+* @size: u64 size
+* @ptselect: type of pagetable per
+* process or global
+*
+* Returns map offset
+*/
 s64 get_map_offset(u64 size, int ptselect)
 {
 	static u64 last_offset_global = 0;
@@ -876,6 +1064,20 @@ s64 get_map_offset(u64 size, int ptselect)
 	return (s64) offset;
 }
 
+/**
+* @Brief: This function facilitates to
+* set the offset of the global map
+* based of given size and  ptselect
+*
+* Parameters:
+* @offset: offset for global map
+* @vfio_dev: vfio device *
+* @ptselect: type of pagetable per
+* process or global
+*
+* Returns errno in failure or 0 in case
+* of success
+*/
 int set_map_iova(u64 offset, struct vfio_device *vfio_dev, int ptselect)
 {
 	dma_addr_t iova;
@@ -902,6 +1104,16 @@ int set_map_iova(u64 offset, struct vfio_device *vfio_dev, int ptselect)
 	return ret;
 }
 
+/**
+* @Brief: This function facilitates to
+* modify the page links for each of
+* scatter gather table
+*
+* Parameters:
+* @sg_table: pointer for scatter gather table
+*
+* Returns void
+*/
 static void kiumd_mangle_sg_table(struct sg_table *sg_table)
 {
 	int i;
@@ -919,7 +1131,7 @@ static void kiumd_mangle_sg_table(struct sg_table *sg_table)
  * backed device represented via a vfio_device.
  *
  * The function is called via IOCTL interface and input is provided via struct
- * kiumd_user from the userspace.
+ * kiumd_user from the user space.
  *
  * return value is errno or 0 in case of successful mapping
  */
@@ -1143,14 +1355,15 @@ fail_fput:
 }
 
 /**
- * kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
- *
- * This function facilitates the unmap the buffer mapped to SMMU backed device
+ * Brief: This function facilitates the unmap the buffer mapped to SMMU backed device
  * also decrements the dma_buf kref count.
+ *
+ * Parameters:
+ * @arg: user space argument pointer
+ * @fp: file pointer for kiumd_ctx
  *
  * return errno or 0 in case of success
  */
-
 int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 {
 
@@ -1300,6 +1513,20 @@ int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 	return ret;
 }
 
+/**
+* @Brief: This function facilitates to
+* set the cookie type based on flag
+* passed from user space and then set
+* cookie in dma.The function is called
+* via IOCTL interface and input is
+* provided via struct kiumd_user
+* from the user space.
+*
+* Parameters:
+* @arg: user space argument pointer
+*
+* Returns  0 upon success and error codes on failure
+*/
 int kiumd_iova_ctrl(char __user *arg)
 {
 	struct kiumd_iova iovausr;
@@ -1340,6 +1567,21 @@ int kiumd_iova_ctrl(char __user *arg)
 	return ret;
 }
 
+/**
+* @Brief: This function facilitates to
+* get the handle to a fd,fd to a handle
+* or closing the handle based on user space
+* arguments. API uses xarray to store
+* and retrieve handles.The function
+* is called via IOCTL interface
+* and input is provided via struct
+* kiumd_user from the user space.
+*
+* Parameters:
+* @arg: user space argument pointer
+*
+* Returns  handle/fd upon success and error codes on failure
+*/
 int kiumd_fd_dmabuf_handler(char __user *arg)
 {
 	struct kiumd_user kiusr;
@@ -1474,6 +1716,16 @@ int kiumd_fd_dmabuf_handler(char __user *arg)
 	return 0;
 }
 
+/**
+* @Brief: This function facilitates to hyp-assign the page for given vmid
+*
+* Parameters:
+* @vmid: user space argument pointer
+* @page: Page
+* @nr_acl_entries: Number of acl entries for scm assign
+*
+* Returns  0 upon success and error codes on failure
+*/
 static int kiumd_io_pgtable_hyp_assign_page(u32 *vmid, u64 page, u32 nr_acl_entries)
 {
 	int ret;
@@ -1506,6 +1758,17 @@ static int kiumd_io_pgtable_hyp_assign_page(u32 *vmid, u64 page, u32 nr_acl_entr
 	return ret;
 }
 
+/**
+* @Brief: This function facilitates to hyp-unassign
+* the page for given vmid
+*
+* Parameters:
+* @vmid: user space argument pointer
+* @page: Page
+* @nr_acl_entries: Number of acl entries for scm assign
+*
+* Returns  0 upon success and error codes on failure
+*/
 static int kiumd_io_pgtable_hyp_unassign_page(u32 *vmid, u64 page, u32 nr_acl_entries)
 {
 	int ret;
@@ -1527,6 +1790,20 @@ static int kiumd_io_pgtable_hyp_unassign_page(u32 *vmid, u64 page, u32 nr_acl_en
 	return ret;
 }
 
+/**
+* @Brief: This function facilitates to
+* transfer memory ownership for
+* given sg for source vm list
+*
+* Parameters:
+* @sgt: user space argument pointer
+* @source_vm_list: Page
+* @source_nelems: Number of acl entries for scm assign
+* @clear_page_private: boolean flag to check sg private
+* page clearance
+*
+* Returns  0 upon success and error codes on failure
+*/
 static int kiumd_hyp_unassign_sg(struct sg_table *sgt, int *source_vm_list,
 				 int source_nelems, bool clear_page_private)
 {
@@ -1574,6 +1851,19 @@ out:
 	return ret;
 }
 
+/**
+* @Brief: This function facilitates to hyp-assign
+* given sg for destination vm list
+*
+* Parameters:
+* @sgt: scatter gather table ptr
+* @dest_vm_list: destination vm list
+* @dest_nelems: Number of entries for destination
+* @set_page_private: page flag
+* @dest_perms: Destination permission
+*
+* Returns  0 upon success and error codes on failure
+*/
 static int kiumd_hyp_assign_sg(struct sg_table *sgt, int *dest_vm_list,
 			       int dest_nelems, bool set_page_private, int *dest_perms)
 {
@@ -1624,6 +1914,19 @@ err:
 	return ret;
 }
 
+/**
+* @Brief: This function facilitates to set the
+* destination vmids and permissions to given
+* vmids and permissions.
+*
+* Parameters:
+* @nr_acl_entries: Number of acl entries for scm assign
+* @acl_entries: acl entries for scm assign
+* @dst_vmids: pointer to destination vmid
+* @dest_perms: Destination permission
+*
+* Returns  0 upon success and error codes on failure
+*/
 int kiumd_acl_to_vmid_perms_list(unsigned int nr_acl_entries, const void __user *acl_entries,
 				 int **dst_vmids, int **dst_perms)
 {
@@ -1680,6 +1983,17 @@ out:
 	return ret;
 }
 
+/**
+* @Brief: This function facilitates to get the page
+* table global directory by getting iommu_domain,
+* smmu_domain and pagetable
+*
+* Parameters:
+* @vfio_fd: file descriptor for vfio device
+* @pgd: page global directory pointer
+*
+* Returns  0 upon success and error codes on failure
+*/
 int kiumd_get_pgd(struct vfio_device *vfio_dev, u64 *pgd)
 {
 	struct iommu_domain *iommu_dom;
@@ -1714,6 +2028,22 @@ int kiumd_get_pgd(struct vfio_device *vfio_dev, u64 *pgd)
 	return 0;
 }
 
+/**
+* @Brief: This function facilitates the
+* secure mapping of a DMA-BUF based
+* buffer to a SMMU backed device
+* represented via a vfio_device. The
+* function is called via IOCTL interface
+* and input is provided via struct
+* kiumd_user from the user space.
+*
+* Parameters:
+* @arg: User space argument ptr
+* @fp: file ptr for device context
+*
+* return value is errno in failure cases
+* or 0 in case of successful mapping
+*/
 int kiumd_dmabuf_vfio_secure_map(char __user *arg, struct file *fp)
 {
 	struct kiumd_user kiusr;
@@ -1895,6 +2225,22 @@ close_file:
 	return ret;
 }
 
+/**
+* @Brief: This function facilitates the
+* secure unmapping of a DMA-BUF based
+* buffer to a SMMU backed device
+* represented via a vfio_device.
+* The function is called via IOCTL
+* interface and input is provided via
+* struct kiumd_user from the user space.
+*
+* Parameters:
+* @arg: User space argument ptr
+* @fp: file ptr for device context
+*
+* return value is errno in failure cases
+* or 0 in case of successful mapping
+*/
 int kiumd_dmabuf_vfio_secure_unmap(char __user *arg, struct file *fp)
 {
 	struct vfio_device *vfio_dev = NULL;
@@ -2037,6 +2383,19 @@ close_file:
 
 	return ret;
 }
+
+/**
+* @Brief: This function facilitates to get the faulty iova FSR value
+* when user reads the sysfs node as a result of smmu faults.
+*
+* Parameters:
+* @kobj: kernel object pointer of device
+* @attr: kernel object attribute
+* @buf: user space buffer
+*
+* return value is number of bytes successfully written
+*/
+
 static ssize_t fsr_iova_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
 	int local_fsr = 0;
@@ -2067,6 +2426,20 @@ static struct kobj_attribute fsr_iova_attribute = {
 	.show = fsr_iova_show,
 };
 
+/**
+ * @Brief: This function should be used by IOMMU users which want to be notified
+ * whenever an IOMMU fault happens.
+ *
+ * Parameters:
+ * @iommu_domain: iommu domain
+ * @dev: device structure
+ * @iova: fault address
+ * @flags: flags 
+ * @token: user data
+ *
+ * The fault handler itself should return 0 on success, and an appropriate
+ * error code otherwise.
+ */
 static int kiumd_smmu_fault_handler(struct iommu_domain *iomm_domain,
 		struct device *dev, unsigned long iova, int flags, void *token)
 {
@@ -2102,6 +2475,16 @@ static int kiumd_smmu_fault_handler(struct iommu_domain *iomm_domain,
 	return retval;
 }
 
+/**
+ * @Brief: This function should be used by IOMMU users which want to deregister
+ * an IOMMU fault handler.
+ *
+ * Parameters:
+ * @arg: user data
+ *
+ * return 0 on success, or an appropriate
+ * error code otherwise.
+ */
 static int kiumd_smmu_fault_handler_deregister(char __user *arg)
 {
 	struct vfio_device *vfio_dev = NULL;
@@ -2153,6 +2536,16 @@ static int kiumd_smmu_fault_handler_deregister(char __user *arg)
 	return retval;
 }
 
+/**
+ * @Brief: This function should be used by IOMMU users which want to register
+ * an IOMMU fault handler.
+ *
+ * Parameters:
+ * @arg: user data
+ *
+ * return 0 on success, or an appropriate
+ * error code otherwise.
+ */
 static int kiumd_smmu_fault_handler_register(char __user *arg)
 {
 	struct iommu_domain *domain = NULL;
@@ -2226,6 +2619,20 @@ static int kiumd_smmu_fault_handler_register(char __user *arg)
 }
 
 
+/**
+* @Brief: This function facilitates to
+* map mmio region into smmu at fixed
+* IOVA.The function is called via IOCTL
+* interface and input is provided via struct
+* kiumd_user from the user space.
+*
+* Parameters:
+* @arg: User space argument ptr
+* @fp: file ptr for device context
+*
+* return value is errno in failure cases
+* or 0 in case of successful mapping
+*/
 static int kiumd_mmio_smmu_map(char __user *arg, struct file *fp)
 {
 	struct kiumd_smmu_mmio_map kiusr;
@@ -2375,6 +2782,20 @@ smap_free:
 	return ret;
 }
 
+/**
+* @Brief: This function facilitates to
+* unmap mmio region into smmu at fixed
+* IOVA.The function is called via IOCTL
+* interface and input is provided via
+* struct kiumd_user from the user space.
+*
+* Parameters:
+* @arg: User space argument ptr
+* @fp: file ptr for device context
+*
+* return value is errno in failure cases
+* or 0 in case of successful mapping
+*/
 static int kiumd_mmio_smmu_unmap(char __user *arg, struct file *fp)
 {
 	struct kiumd_smmu_mmio_map kiusr;
@@ -2439,6 +2860,18 @@ static int kiumd_mmio_smmu_unmap(char __user *arg, struct file *fp)
 	return ret;
 }
 
+/**
+* @Brief: This function facilitates to
+* initialize the locks, hash tables and
+* allocate the memory for device ctx.
+*
+* Parameters:
+* @inode: inode ptr for device file
+* @filp: file ptr for device context
+*
+* return value is errno in failure cases
+* or 0 in case of successful mapping
+*/
 static int kiumd_open(struct inode *inode, struct file *filp)
 {
 	struct kiumd_ctx *kictx = NULL;
@@ -2454,6 +2887,18 @@ static int kiumd_open(struct inode *inode, struct file *filp)
 	return 0;
 }
 
+/**
+* @Brief: This function facilitates to
+* free the locks, hash tables and
+* free the memory for device ctx.
+*
+* Parameters:
+* @inode: inode ptr for device file
+* @filp: file ptr for device context
+*
+* return value is errno in failure cases
+* or 0 in case of success
+*/
 static int kiumd_close(struct inode *inode, struct file *filp)
 {
 	struct kiumd_ctx *ki_ctx = (struct kiumd_ctx *)filp->private_data;
@@ -2485,6 +2930,19 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 	return 0;
 }
 
+/**
+* @Brief: This function facilitates to call
+* the different ioctls based on
+* commands received from user space.
+*
+* Parameters:
+* @file: file ptr for device file
+* @cmd: ioctl cmd
+* @arg: argument
+*
+* return value is errno in failure cases
+* or 0 in case of success
+*/
 static long kiumd_ioctl(struct file *file, unsigned int cmd,
 				 unsigned long arg)
 {
@@ -2555,6 +3013,18 @@ static const struct file_operations kiumd_fops = {
 	.release = kiumd_close,
 };
 
+/**
+* @Brief: This function facilitates to
+* register the kiumd driver as a
+* miscellaneous device to kernel driver
+* framework
+*
+* Parameters:
+* @pdev: platform device ptr
+*
+* return value is errno in failure cases
+* or 0 in case of success
+*/
 static int kiumd_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
