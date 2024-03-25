@@ -19,7 +19,6 @@ struct qcom_uscmi_dev {
 	struct device *dev;
 	const char *name;
 	struct dev_pm_domain_list *pd_list;
-	int *is_on;
 };
 
 #define miscdev_to_data(d) container_of(d, struct qcom_uscmi_dev, miscdev)
@@ -58,13 +57,19 @@ static struct device * get_pd_dev(struct qcom_uscmi_dev *uscmi, const char *name
 	return uscmi->pd_list->pd_devs[index];
 }
 
+static int is_genpd_on(struct device *dev)
+{
+	struct generic_pm_domain *genpd = pd_to_genpd(dev->pm_domain);
+
+	return (genpd->status == GENPD_STATE_ON);
+}
+
 static int do_power_operation(scmi_oper_ioctl_t *req,
 			      struct qcom_uscmi_dev *uscmi)
 {
 	struct device *dev;
 	int ret = 0;
 	int index;
-	int is_on;
 
 	dev = get_pd_dev(uscmi, req->name, &index);
 	if (!dev)
@@ -73,21 +78,15 @@ static int do_power_operation(scmi_oper_ioctl_t *req,
 	if (req->proto != SCMI_PROTO_POWER)
 		return -EINVAL;
 
-	is_on = uscmi->is_on[index];
-
 	switch(req->oper) {
 	  case SCMI_PWR_OFF:
-		  if (is_on) {
+		  if (is_genpd_on(dev)) {
 			ret = pm_runtime_put_sync(dev);
-			if (!ret)
-				uscmi->is_on[index] = 0;
 		  }
 		  break;
 	  case SCMI_PWR_ON:
-		  if (!is_on) {
+		  if (!is_genpd_on(dev)) {
 			ret = pm_runtime_resume_and_get(dev);
-			if (ret >= 0)
-				uscmi->is_on[index] = 1;
 		  }
 		  break;
 
@@ -231,7 +230,6 @@ static int qcom_uscmi_probe(struct platform_device *pdev)
 	struct qcom_uscmi_dev *uscmi;
 	const char *name;
 	int err;
-	u32 count = 1;
 
 	uscmi = devm_kzalloc(dev, sizeof(*uscmi), GFP_KERNEL);
 	if (!uscmi)
@@ -246,13 +244,6 @@ static int qcom_uscmi_probe(struct platform_device *pdev)
 			dev_err(dev, "multi domain attach failed(ret=%d)\n", err);
 			return err;
 		}
-		count = uscmi->pd_list->num_pds;
-	}
-
-	uscmi->is_on = devm_kzalloc(dev, sizeof(int) * count, GFP_KERNEL);
-	if (!uscmi->is_on) {
-		dev_pm_domain_detach_list(uscmi->pd_list);
-		return -ENOMEM;
 	}
 
 	if (!of_property_read_string(np, "qcom,dev-name", &name))
@@ -271,10 +262,9 @@ static int qcom_uscmi_probe(struct platform_device *pdev)
 		return err;
 	}
 
-	if (count == 1) {
+	if (!uscmi->pd_list) {
 		pm_runtime_set_active(dev);
 		pm_runtime_enable(dev);
-		uscmi->is_on[0] = 1;
 	}
 
 	pm_runtime_forbid(dev);

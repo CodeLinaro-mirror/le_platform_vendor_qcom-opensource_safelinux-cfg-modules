@@ -19,6 +19,8 @@
 #define KIUMD_GLOBAL_PT_SET            _IOWR('R', 21, struct kiumd_smmu_user)
 #define KIUMD_SMMU_SECURE_MAP           _IOWR('R', 22, struct kiumd_user)
 #define KIUMD_SMMU_SECURE_UNMAP         _IOWR('R', 23, struct kiumd_user)
+#define KIUMD_SMMU_MMIO_MAP		_IOWR('R', 24, struct kiumd_smmu_mmio_map)
+#define KIUMD_SMMU_MMIO_UNMAP		_IOWR('R', 25, struct kiumd_smmu_mmio_map)
 
 #define IOMMU_NOEXEC    (1 << 3)
 #define IOMMU_MMIO      (1 << 4)
@@ -82,6 +84,15 @@ struct kiumd_user {
 	int is_iova_zero;
 	struct kiumd_mem_parcel mem_parcel;
 	int id;
+};
+
+struct kiumd_smmu_mmio_map {
+	__u8 fixed_iova;
+	int vfio_fd;
+	int id;
+	__u64 iova;
+	__u64 reg_len;
+	char *reg_name;
 };
 
 #endif /* __KIUMD_H__ */

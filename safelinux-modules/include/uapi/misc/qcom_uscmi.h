@@ -7,7 +7,6 @@
 #include <linux/types.h>
 
 #define NAME_LEN 32
-#define RESET_ID_LEN 32
 
 typedef struct scmi_oper_ioctl {
 	/* protocol used */
@@ -19,9 +18,6 @@ typedef struct scmi_oper_ioctl {
 	__u32 reserved;
 	/* name can be the reset name or power domain name as mentioned in DT */
 	char name[NAME_LEN];
-	/* keeping reset-id for now since some folks are using it, will
-	 * remove it after fixing the consumers */
-	char reset_id[RESET_ID_LEN];
 } scmi_oper_ioctl_t;
 
 
