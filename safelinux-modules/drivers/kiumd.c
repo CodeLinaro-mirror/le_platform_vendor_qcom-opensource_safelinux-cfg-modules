@@ -706,6 +706,7 @@ int kiumd_dmabuf_custom_iova_init(char __user *arg)
 	struct iommu_resv_region *region;
 	unsigned long lo, hi;
 	LIST_HEAD(resrvd);
+	int ret;
 
 	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user)))
 		return -EFAULT;
@@ -728,6 +729,11 @@ int kiumd_dmabuf_custom_iova_init(char __user *arg)
 		fput(file);
 		return -EINVAL;
 	}
+
+	ret = dma_set_max_seg_size(vfio_dev->dev, (unsigned int) DMA_BIT_MASK(32));
+	//Print a warning and continue.
+	if (ret)
+		pr_err("%s:WARNING: max_segment size not set.\n", __func__);
 
 	domain = kiumd_iommu_get_dma_domain(vfio_dev->dev);
 	if (!domain) {
@@ -829,6 +835,16 @@ int set_map_iova(u64 offset, struct vfio_device *vfio_dev, int ptselect)
 
 	return ret;
 }
+
+static void kiumd_mangle_sg_table(struct sg_table *sg_table)
+{
+	int i;
+	struct scatterlist *sg;
+
+	for_each_sgtable_sg(sg_table, sg, i)
+		sg->page_link ^= ~0xffUL;
+}
+
 
 /**
  * kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
@@ -950,7 +966,7 @@ int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 			goto fail_detach;
 		}
 
-		ret = dma_map_sgtable(vfio_dev->dev, sgt, kiumd_dma_direction, DMA_ATTR_PRIVILEGED);
+		ret = dma_map_sgtable(vfio_dev->dev, sgt, kiumd_dma_direction, DMA_ATTR_PRIVILEGED | DMA_ATTR_SKIP_CPU_SYNC);
 		if (ret) {
 			pr_err("%s:dma_map_sgtable failed with err: %d, for device: %s\n", __func__, ret, vfio_dev->dev->kobj.name);
 			goto fail_detach;
@@ -962,7 +978,7 @@ int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 			return -EINVAL;
 		}
 
-		sgt = dma_buf_map_attachment(dmabufattach, kiumd_dma_direction);
+		sgt = dma_buf_map_attachment_unlocked(dmabufattach, kiumd_dma_direction);
 		if (IS_ERR_OR_NULL(sgt)) {
 			pr_err("%s: mapping failed with error: %ld, for device: %s\n", __func__, PTR_ERR(sgt), vfio_dev->dev->kobj.name);
 			ret = (sgt == NULL ? -EINVAL : PTR_ERR(sgt));
@@ -982,15 +998,25 @@ int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 				goto fail_fput;
 			}
 
+#ifdef CONFIG_DMABUF_DEBUG
+			/*
+			 * For debug builds there is a mangling done in the regular buffer map path,
+			 * so iommu_map_sg is expecting a mangled physical address of the buffer
+			 */
+
+			kiumd_mangle_sg_table(sgt);
+#endif
+
 			/*
 			 * For mapping at 0x0 we create a mapping using
-			 * dma_buf_map_attachment and then take the sg list
+			 * dma_buf_map_attachment_unlocked and then take the sg list
 			 * and map it at iova - 0x0
-			 * */
+			 */
+
 			size = iommu_map_sg(iommu_dom, iova_zero, sgt->sgl, sgt->orig_nents, prot, GFP_ATOMIC);
 			if (size < 0) {
 				pr_err("%s:iommu_map_sg failed\n", __func__);
-				dma_buf_unmap_attachment(dmabufattach, sgt, kiumd_dma_direction);
+				dma_buf_unmap_attachment_unlocked(dmabufattach, sgt, kiumd_dma_direction);
 				ret = -EFAULT;
 				goto fail_detach;
 			}
@@ -1031,7 +1057,7 @@ int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 
 	if (copy_to_user(arg, &kiusr, sizeof(kiusr))) {
 		pr_err("%s: copy_to_user failed...\n", __func__);
-		dma_buf_unmap_attachment(dmabufattach, sgt, kiumd_dma_direction);
+		dma_buf_unmap_attachment_unlocked(dmabufattach, sgt, kiumd_dma_direction);
 		ret = -EFAULT;
 		goto fail_detach;
 	}
@@ -1207,7 +1233,7 @@ int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 		dma_unmap_sgtable(vfio_dev->dev, sgtable, kiumd_dma_direction, DMA_ATTR_PRIVILEGED);
 		fput(file);
 	} else {
-		dma_buf_unmap_attachment(dmabufattach, (struct sg_table *)smap->sgt_ptr,
+		dma_buf_unmap_attachment_unlocked(dmabufattach, (struct sg_table *)smap->sgt_ptr,
 									kiumd_dma_direction);
 
 		if (kiusr.is_iova_zero == FIXED_IOVA_AT_ZERO) {
@@ -1775,7 +1801,7 @@ int kiumd_dmabuf_vfio_secure_map(char __user *arg, struct file *fp)
 	else
 		kiumd_dma_direction = 0;
 
-	sgt = dma_buf_map_attachment(dmabufattach, kiumd_dma_direction);
+	sgt = dma_buf_map_attachment_unlocked(dmabufattach, kiumd_dma_direction);
 	if (IS_ERR(sgt)) {
 		ret = PTR_ERR(sgt);
 		pr_err("%s:%d sgt is invalid\n", __func__, __LINE__);
@@ -1822,7 +1848,7 @@ int kiumd_dmabuf_vfio_secure_map(char __user *arg, struct file *fp)
 	pr_debug("returning from ioctl ret:%d\n", ret);
 	return ret;
 unmap:
-	dma_buf_unmap_attachment(dmabufattach, (struct sg_table *)sgt,
+	dma_buf_unmap_attachment_unlocked(dmabufattach, (struct sg_table *)sgt,
 				 DMA_BIDIRECTIONAL);
 hyp_unassign_sg:
 	kiumd_hyp_unassign_sg((struct sg_table *)sgt, vmids,
@@ -1942,7 +1968,7 @@ int kiumd_dmabuf_vfio_secure_unmap(char __user *arg, struct file *fp)
 		goto free_mem;
 	}
 
-	dma_buf_unmap_attachment(dmabufattach, (struct sg_table *)smap->sgt_ptr,
+	dma_buf_unmap_attachment_unlocked(dmabufattach, (struct sg_table *)smap->sgt_ptr,
 				 DMA_BIDIRECTIONAL);
 
 	ret = kiumd_hyp_unassign_sg((struct sg_table *)smap->sgt_ptr, vmids,
