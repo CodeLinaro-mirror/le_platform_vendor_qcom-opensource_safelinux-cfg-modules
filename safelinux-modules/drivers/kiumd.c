@@ -183,6 +183,21 @@ static const struct iommu_flush_ops kgsl_iopgtbl_tlb_ops = {
 	.tlb_add_page = _tlb_add_page,
 };
 
+
+/**
+ * struct kiumd_secure_map_context: Structure for secure
+ * map context.
+ * @vmids: vmids for subsystem which need to do hyp assign
+ * @perms: permissions
+ *
+ */
+struct kiumd_secure_map_context {
+	u64 nr_acl_entries;
+	int *vmids;
+	int *perms;
+};
+
+
 /**
  * struct kiumd_reserved_mem_area: Structure for reserved
  * memory area.
@@ -200,8 +215,10 @@ struct kiumd_reserved_mem_area {
  * @id: id to map/unmap entries in hashtable
  * @smmu_map_data: structurefor hashtable data
  * @smmu_lock: Lock for map/unmap operations
+ * @hyp_lock: Lock for hyp assign operations
  * @smmu_table: Hashtable to hold entries based on id
  * @reserved_mem_area: pointer to hold reserved memory area
+ * @hyp_idx: id for hyp_map_data node entries in hashtable
  * @num_reserved_regions : number of reserved memory areas
  *
  */
@@ -212,13 +229,17 @@ struct kiumd_ctx {
 	bool is_initialized;
 	struct hlist_node smmu_map_data;
 	struct hlist_node pgtable_map;
+	unsigned int hyp_idx;
+	struct hlist_node hyp_map_data;
 	spinlock_t smmu_lock;
 	spinlock_t pt_lock;
 	DECLARE_HASHTABLE(smmu_table, SMMU_MAPTABLE_SIZE);
+	DECLARE_HASHTABLE(hyp_table, SMMU_MAPTABLE_SIZE);
 	struct kiumd_reserved_mem_area *res_mem_area;
 	int num_reserved_regions;
 	struct xarray kiumd_xa;
 	struct mutex kiumd_xa_mutex;
+	struct mutex hyp_lock;
 	unsigned long pt_start_iova;
 	unsigned long pt_end_iova;
 	DECLARE_HASHTABLE(page_table, SMMU_MAPTABLE_SIZE);
@@ -263,6 +284,24 @@ struct smmu_map_data {
 	bool is_fixed_map;
 	struct vfio_device *vfio_dev;
 	void *context;
+	struct hlist_node node;
+};
+
+/**
+ * struct  hyp_map_data: Structure for hashtable data for hyp assign/unassign
+ * @id: id to hyp assign/unassign entries in hashtable
+ * @sgt_ptr: sgt pointer value
+ * @dmabuf_ptr: dma buf pointer for map operations
+ * @dmabufattach: dmabufattach value
+ * @node: hlist_node
+ * @secure_ctx: secure ctx pointer for strore/retrieve hyp data
+ */
+struct hyp_map_data {
+	unsigned int id;
+	long sgt_ptr;
+	long dmabuf_ptr;
+	long dmabufattach;
+	struct kiumd_secure_map_context *secure_ctx;
 	struct hlist_node node;
 };
 
@@ -2106,13 +2145,6 @@ int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 		}
 	}
 
-	smap = kzalloc(sizeof(struct smmu_map_data), GFP_KERNEL);
-	if (!smap) {
-		pr_err("%s:No memory for smap \n", __func__);
-		ret = -ENOMEM;
-		goto fail_fput;
-	}
-
 	if (is_fixed_mapping(vfio_dev))
 		smap->is_fixed_map = true;
 	else
@@ -2898,21 +2930,265 @@ int kiumd_get_pgd(struct vfio_device *vfio_dev, u64 *pgd)
 }
 
 /**
-* @Brief: This function facilitates the
-* secure mapping of a DMA-BUF based
-* buffer to a SMMU backed device
-* represented via a vfio_device. The
-* function is called via IOCTL interface
-* and input is provided via struct
-* kiumd_user from the user space.
-*
-* Parameters:
-* @arg: User space argument ptr
-* @fp: file ptr for device context
-*
-* return value is errno in failure cases
-* or 0 in case of successful mapping
-*/
+ * @Brief: This function facilitates the hyp assigning  of a system heap
+ * allocated dmabuffer to a SMMU backed device represented via a vfio_device.
+ * The function is called via IOCTL interface and input is provided via struct
+ * kiumd_user from the user space.
+ *
+ * Parameters:
+ * @arg: User space argument ptr
+ * @fp: file ptr for device context
+ *
+ * * return value is errno in failure cases or 0 in case of successful mapping
+ * */
+int kiumd_dmabuf_assign_buf(char __user *arg, struct file *fp)
+{
+	struct kiumd_user kiusr;
+	struct vfio_device *vfio_dev;
+	struct kiumd_ctx *kiumd_ctx = NULL;
+	struct kiumd_secure_map_context *map_ctx;
+	struct dma_buf *kiumd_dmabuf = NULL;
+	struct dma_buf_attachment *dmabufattach = NULL;
+	struct sg_table *sgt = NULL;
+	struct hyp_map_data *smap = NULL;
+	int *vmids, *perms;
+	int ret = 0;
+
+	if (!fp) {
+		pr_err("%s:file ptr returns NULL\n", __func__);
+		return -EINVAL;
+	}
+
+	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
+	if (!kiumd_ctx) {
+		pr_err("%s:kiumd ctx is NULL\n", __func__);
+		return -EINVAL;
+	}
+
+	if (copy_from_user(&kiusr, arg, sizeof(kiusr))) {
+		pr_err("%s:%d invalid args from user\n", __func__, __LINE__);
+		return -EFAULT;
+	}
+
+	vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
+	if (!vfio_dev) {
+		pr_err("%s:%d invalid vfio device fd\n", __func__, __LINE__);
+		return -EINVAL;
+	}
+
+	kiumd_dmabuf = dma_buf_get(kiusr.dma_buf_fd);
+	if (IS_ERR_OR_NULL(kiumd_dmabuf)) {
+		pr_err("%s:%d invalid params\n", __func__, __LINE__);
+		ret = !kiumd_dmabuf ? -EINVAL : PTR_ERR(kiumd_dmabuf);
+		return ret;
+	}
+
+	ret = kiumd_acl_to_vmid_perms_list(kiusr.mem_parcel.nr_acl_entries,
+					   (void *)kiusr.mem_parcel.acl_list, &vmids, &perms);
+	if (ret) {
+		pr_err("%s:%d Invalid params\n", __func__, __LINE__);
+		return ret;
+	}
+
+	dmabufattach = dma_buf_attach(kiumd_dmabuf, vfio_dev->dev);
+	if (IS_ERR(dmabufattach)) {
+		pr_err("%s:%d dmabufattach is invalid\n", __func__, __LINE__);
+		ret = PTR_ERR(dmabufattach);
+		goto free_mem;
+	}
+
+	if (!dmabufattach->priv) {
+		ret = -EINVAL;
+		pr_err("%s:%d dma heap attachment is NULL\n", __func__, __LINE__);
+		goto detach;
+	}
+
+	sgt = ((struct kiumd_dma_heap_attachment *)(dmabufattach->priv))->table;
+	if (!sgt) {
+		pr_err("%s:%d sgt is NULL\n", __func__, __LINE__);
+		ret = -EINVAL;
+		goto detach;
+	}
+
+	if (!sgt->sgl) {
+		ret = -EINVAL;
+		pr_err("%s:%d sgl is NULL\n", __func__, __LINE__);
+		goto detach;
+	}
+
+	pr_debug("%s:sgt from attachment:%p %llx\n", __func__, sgt, sg_phys(sgt->sgl));
+
+	ret = kiumd_hyp_assign_sg(sgt, vmids, kiusr.mem_parcel.nr_acl_entries, true, perms);
+	if (ret < 0) {
+		pr_err("%s:%d ownership transfer error\n", __func__, __LINE__);
+		goto detach;
+	}
+
+	smap = kzalloc(sizeof(struct smmu_map_data), GFP_KERNEL);
+	if (!smap) {
+		pr_err("%s:No memory for smap \n", __func__);
+		ret = -ENOMEM;
+		goto hyp_unassign_sg;
+	}
+	smap->dmabufattach = (long)dmabufattach;
+	smap->sgt_ptr = (long)sgt;
+	smap->dmabuf_ptr = (long)kiumd_dmabuf;
+
+	mutex_lock(&kiumd_ctx->hyp_lock);
+	smap->id = kiumd_ctx->hyp_idx++;
+	hash_add(kiumd_ctx->hyp_table, &smap->node, smap->id);
+
+	map_ctx = kzalloc(sizeof(struct kiumd_secure_map_context), GFP_KERNEL);
+	if (!map_ctx) {
+		pr_err("%s:No memory for smap \n", __func__);
+		ret = -ENOMEM;
+		mutex_unlock(&kiumd_ctx->hyp_lock);
+		goto hyp_unassign_sg;
+	}
+	map_ctx->nr_acl_entries = kiusr.mem_parcel.nr_acl_entries;
+	map_ctx->vmids = vmids;
+	map_ctx->perms = perms;
+
+	smap->secure_ctx = map_ctx;
+
+	mutex_unlock(&kiumd_ctx->hyp_lock);
+
+	pr_debug("maping attachment sgt:%lx attachmemt:%lx dmabuf:%lx, id: %d\n",
+		smap->sgt_ptr, smap->dmabufattach, smap->dmabuf_ptr, smap->id);
+	kiusr.hyp_id = smap->id;
+	kiusr.dma_addr = sg_dma_address(sgt->sgl);
+	if (copy_to_user(arg, &kiusr, sizeof(kiusr))) {
+		pr_err("%s:%d copy_to_user failed...\n", __func__, __LINE__);
+		ret = -EFAULT;
+		goto hyp_unassign_sg;
+	}
+
+	pr_debug("returning from ioctl ret:%d dma add:%x\n", ret, kiusr.dma_addr);
+	return ret;
+hyp_unassign_sg:
+	kiumd_hyp_unassign_sg((struct sg_table *)sgt, vmids,
+			      kiusr.mem_parcel.nr_acl_entries, true);
+detach:
+	dma_buf_detach(kiumd_dmabuf, dmabufattach);
+	dma_buf_put(kiumd_dmabuf);
+free_mem:
+	kfree(vmids);
+	kfree(perms);
+	return ret;
+}
+
+/**
+ * @Brief: This function facilitates the hyp unassigning  of a system heap
+ * allocated dmabuffer to a SMMU backed device represented via a vfio_device.
+ * The function is called via IOCTL interface and input is provided via struct
+ * kiumd_user from the user space.
+ *
+ * Parameters:
+ * @arg: User space argument ptr
+ * @fp: file ptr for device context
+ *
+ * * return value is errno in failure cases or 0 in case of successful mapping
+ * */
+int kiumd_dmabuf_unassign_buf(char __user *arg, struct file *fp)
+{
+	struct kiumd_user kiusr;
+	struct kiumd_ctx *kiumd_ctx = NULL;
+	struct kiumd_secure_map_context *map_ctx;
+	struct dma_buf_attachment *dmabufattach = NULL;
+	struct dma_buf *kiumd_dmabuf = NULL;
+	struct hyp_map_data *smap;
+	int *vmids, *perms;
+	bool found = false;
+	int ret;
+
+	if (!fp) {
+		pr_err("%s:file ptr returns NULL\n", __func__);
+		return -EINVAL;
+	}
+
+	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
+	if (!kiumd_ctx) {
+		pr_err("%s:kiumd ctx is NULL\n", __func__);
+		return -EINVAL;
+	}
+
+	if (copy_from_user(&kiusr, arg, sizeof(kiusr))) {
+		pr_err("%s:%d invalid args from user\n", __func__, __LINE__);
+		return -EFAULT;
+	}
+
+	if (kiusr.hyp_id < 0) {
+		pr_err("%s:id passed from user should be positive value\n", __func__);
+		return -EFAULT;
+	}
+
+	mutex_lock(&kiumd_ctx->hyp_lock);
+	hash_for_each_possible(kiumd_ctx->hyp_table, smap, node, kiusr.hyp_id) {
+		if (smap->id == kiusr.hyp_id) {
+			found = true;
+			break;
+		}
+	}
+
+	hash_del(&smap->node);
+	mutex_unlock(&kiumd_ctx->hyp_lock);
+	if (!found) {
+		pr_err("%s:Id not found id: %d\n", __func__, kiusr.hyp_id);
+		return -ENOENT;
+	}
+
+	map_ctx = smap->secure_ctx;
+	if (!map_ctx) {
+		pr_err("%s:Invalid ctx\n", __func__);
+		return -EINVAL;
+	}
+
+	vmids = map_ctx->vmids;
+	perms = map_ctx->perms;
+
+	if (!smap->sgt_ptr) {
+		ret = -EINVAL;
+		pr_err("%s:%d invalid params:%d\n", __func__, __LINE__, ret);
+		goto err;
+	}
+
+	ret = kiumd_hyp_unassign_sg((struct sg_table *)smap->sgt_ptr, vmids,
+				    map_ctx->nr_acl_entries, true);
+	if (ret < 0) {
+		pr_err("%s:%d memory ownership transfer error:%d\n", __func__, __LINE__, ret);
+		goto err;
+	}
+
+
+	kfree(vmids);
+	kfree(perms);
+
+	dmabufattach = (struct dma_buf_attachment *)smap->dmabufattach;
+	if (!dmabufattach) {
+		pr_err("%s:%d invalid params:%d\n", __func__, __LINE__, ret);
+		ret = -EINVAL;
+		goto err;
+	}
+	pr_debug("kiumd secure unmap:sgt from attachment:%p\n", ((struct kiumd_dma_heap_attachment *)(dmabufattach->priv))->table);
+
+	kiumd_dmabuf = (struct dma_buf *)smap->dmabuf_ptr;
+	if (!kiumd_dmabuf) {
+		pr_err("%s:%d invalid params:%d\n", __func__, __LINE__, ret);
+		ret = -EINVAL;
+		goto err;
+	}
+	dma_buf_detach(kiumd_dmabuf, dmabufattach);
+	dma_buf_put(kiumd_dmabuf);
+
+	mutex_lock(&kiumd_ctx->hyp_lock);
+	kfree(smap->secure_ctx);
+	kfree(smap);
+	mutex_unlock(&kiumd_ctx->hyp_lock);
+	pr_debug("%s: Hyp unassign done\n", __func__);
+err:
+	return ret;
+}
+
 int kiumd_dmabuf_vfio_secure_map(char __user *arg, struct file *fp)
 {
 	struct kiumd_user kiusr;
@@ -3763,10 +4039,13 @@ static int kiumd_open(struct inode *inode, struct file *filp)
 	kictx->pt_start_iova = KIUMD_32BIT_START_IOVA;
 	kictx->pt_end_iova = KIUMD_32BIT_END_IOVA;
 	kictx->is_initialized = false;
+	kictx->hyp_idx = 0;
 	hash_init(kictx->smmu_table);
+	hash_init(kictx->hyp_table);
 	spin_lock_init(&kictx->smmu_lock);
 	xa_init(&kictx->kiumd_xa);
 	mutex_init(&kictx->kiumd_xa_mutex);
+	mutex_init(&kictx->hyp_lock);
 	xa_init_flags(&kictx->kiumd_xa, XA_FLAGS_ALLOC);
 	filp->private_data = kictx;
 
@@ -4062,7 +4341,12 @@ static long kiumd_ioctl(struct file *file, unsigned int cmd,
 	case KIUMD_SMMU_MANAGED_IOVA_UNMAP:
 		err = kiumd_dmabuf_managed_iova_unmap(argp, file);
 		break;
-
+	case KIUMD_SMMU_ASSIGN_BUF:
+		err = kiumd_dmabuf_assign_buf(argp, file);
+		break;
+	case KIUMD_SMMU_UNASSIGN_BUF:
+		err = kiumd_dmabuf_unassign_buf(argp, file);
+		break;
 	default:
 		err = -ENOTTY;
 		break;

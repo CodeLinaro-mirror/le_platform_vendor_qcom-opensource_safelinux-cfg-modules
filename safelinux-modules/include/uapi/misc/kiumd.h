@@ -26,7 +26,8 @@
 #define KIUMD_VFIO_CTX_INIT	        _IOWR('R', 28, struct kiumd_dev_mem_info)
 #define KIUMD_SMMU_MANAGED_IOVA_MAP	_IOWR('R', 29, struct kiumd_user)
 #define KIUMD_SMMU_MANAGED_IOVA_UNMAP	_IOWR('R', 30, struct kiumd_user)
-
+#define KIUMD_SMMU_ASSIGN_BUF		_IOWR('R', 31, struct kiumd_user)
+#define KIUMD_SMMU_UNASSIGN_BUF		_IOWR('R', 32, struct kiumd_user)
 
 #define IOMMU_NOEXEC    (1 << 3)
 #define IOMMU_MMIO      (1 << 4)
@@ -98,6 +99,7 @@ struct kiumd_user {
 	int is_iova_zero;
 	struct kiumd_mem_parcel mem_parcel;
 	int id;
+	unsigned int hyp_id;
 };
 
 struct kiumd_smmu_mmio_map {
