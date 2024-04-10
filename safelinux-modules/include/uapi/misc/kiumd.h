@@ -21,6 +21,8 @@
 #define KIUMD_SMMU_SECURE_UNMAP         _IOWR('R', 23, struct kiumd_user)
 #define KIUMD_SMMU_MMIO_MAP		_IOWR('R', 24, struct kiumd_smmu_mmio_map)
 #define KIUMD_SMMU_MMIO_UNMAP		_IOWR('R', 25, struct kiumd_smmu_mmio_map)
+#define KIUMD_SMMU_FAULT_HANDLE_REGISTER _IOWR('R', 26, struct kiumd_user)
+#define KIUMD_SMMU_FAULT_HANDLE_DEREGISTER _IOWR('R', 27, struct kiumd_user)
 
 #define IOMMU_NOEXEC    (1 << 3)
 #define IOMMU_MMIO      (1 << 4)
