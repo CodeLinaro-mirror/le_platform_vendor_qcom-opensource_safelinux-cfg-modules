@@ -8,15 +8,15 @@
 #include <linux/unistd.h>
 
 #define KIUMD_SMMU_MAP_BUF		_IOWR('R', 10, struct kiumd_user)
-#define KIUMD_SMMU_UNMAP_BUF	_IOWR('R', 11, struct kiumd_user)
+#define KIUMD_SMMU_UNMAP_BUF	        _IOWR('R', 11, struct kiumd_user)
 #define KIUMD_IOVA_MAP_CTRL             _IOWR('R', 14, struct kiumd_user)
-#define KIUMD_SET_USER_CONTEXT         _IOWR('R', 15, struct kiumd_smmu_user)
+#define KIUMD_SET_PGTBL_CONTEXT          _IOWR('R', 15, struct kiumd_smmu_user)
 #define KIUMD_PER_PROCESS_ALLOC 	_IOWR('R', 16, struct kiumd_smmu_user)
-#define KIUMD_PER_PROCESS_SET         _IOWR('R', 17, struct kiumd_smmu_user)
-#define KIUMD_PER_PROCESS_FREE        _IOWR('R', 18, struct kiumd_smmu_user)
+#define KIUMD_PER_PROCESS_SET           _IOWR('R', 17, struct kiumd_smmu_user)
+#define KIUMD_PER_PROCESS_FREE          _IOWR('R', 18, struct kiumd_smmu_user)
 #define KIUMD_FD_DMABUF_HANDLE          _IOWR('R', 19, struct kiumd_user)
 #define KIUMD_CUSTOM_IOVA_INIT          _IOWR('R', 20, struct kiumd_user)
-#define KIUMD_GLOBAL_PT_SET            _IOWR('R', 21, struct kiumd_smmu_user)
+#define KIUMD_GLOBAL_PT_SET             _IOWR('R', 21, struct kiumd_smmu_user)
 #define KIUMD_SMMU_SECURE_MAP           _IOWR('R', 22, struct kiumd_user)
 #define KIUMD_SMMU_SECURE_UNMAP         _IOWR('R', 23, struct kiumd_user)
 #define KIUMD_SMMU_MMIO_MAP		_IOWR('R', 24, struct kiumd_smmu_mmio_map)
@@ -44,6 +44,9 @@
  * */
 #define FIXED_IOVA_AT_ZERO 5
 
+#define KIUMD_SMMU_SET_TTBR0_CONFIG    11
+#define KIUMD_SMMU_SET_TTBR1_CONFIG    12
+
 enum kiumd_iova_addr_type {
 	KGSL_SMMU_GLOBALPT_FIXED_ADDR_SET,
 	KGSL_SMMU_GLOBALPT_FIXED_ADDR_CLEAR,
@@ -60,6 +63,7 @@ struct kiumd_smmu_user {
 	long pgtbl_ops_ptr;
 	__u64 ttbr0;
 	__u16 asid;
+	__u32 flags;
 };
 
 struct kiumd_acl_entry {
