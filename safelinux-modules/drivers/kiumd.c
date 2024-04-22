@@ -174,11 +174,25 @@ static const struct iommu_flush_ops kgsl_iopgtbl_tlb_ops = {
 };
 
 /**
+ * struct kiumd_reserved_mem_area: Structure for reserved
+ * memory area.
+ * @size: size of reserved memory area
+ * @base: start address of reserved memory area
+ *
+ */
+struct kiumd_reserved_mem_area {
+	size_t size;
+	u64    base;
+};
+
+/**
  * struct kiumd_ctx: Structure for kiumd_ctx .
  * @id: id to map/unmap entries in hashtable
  * @smmu_map_data: structurefor hashtable data
  * @smmu_lock: Lock for map/unmap operations
  * @smmu_table: Hashtable to hold entries based on id
+ * @reserved_mem_area: pointer to hold reserved memory area
+ * @num_reserved_regions : number of reserved memory areas
  *
  */
 
@@ -187,6 +201,8 @@ struct kiumd_ctx {
 	struct hlist_node smmu_map_data;
 	spinlock_t smmu_lock;
 	DECLARE_HASHTABLE(smmu_table, SMMU_MAPTABLE_SIZE);
+	struct kiumd_reserved_mem_area *res_mem_area;
+	int num_reserved_regions;
 };
 
 /**
@@ -3040,9 +3056,110 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 		}
 	}
 	spin_unlock(&ki_ctx->smmu_lock);
+	if (ki_ctx->res_mem_area)
+		kfree(ki_ctx->res_mem_area);
 	kfree(ki_ctx);
 
 	return 0;
+}
+
+/**
+* @Brief: This function facilitates to
+* initialise the context of the device.
+* Currently it reads the Device tree to check if the
+* device has any reserved regions and stores the information
+* of reserved memory regions internally.
+*
+* Parameters:
+* @arg: User space argument ptr
+* @fp: file ptr for device context
+*
+* return value is errno in failure cases
+* or 0 in case of success
+*/
+static int kiumd_vfio_ctx_init(char __user *arg, struct file *fp)
+{
+	struct kiumd_dev_mem_info kiusr;
+	int ret = 0;
+	struct vfio_device *vfio_dev;
+	struct kiumd_ctx *kiumd_ctx = NULL;
+	struct device_node *np;
+	struct device_node *mem_np;
+	struct resource res;
+	int index = 0;
+
+	if (!fp) {
+		pr_err("%s:file ptr returns NULL\n", __func__);
+		return -EINVAL;
+	}
+
+	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
+	if (!kiumd_ctx) {
+		pr_err("%s:kiumd ctx is NULL\n", __func__);
+		return -EINVAL;
+	}
+
+	if (copy_from_user(&kiusr, arg, sizeof(kiusr))) {
+		pr_err("%s:%d invalid args from user\n", __func__, __LINE__);
+		return -EINVAL;
+	}
+
+	vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
+	if (!vfio_dev) {
+		pr_err("%s:%d invalid vfio device fd\n", __func__, __LINE__);
+		return -EINVAL;
+	}
+
+	if (!vfio_dev->dev)
+		return -EINVAL;
+
+	np = dev_of_node(vfio_dev->dev);
+	if (!np) {
+		pr_debug("No memory-region specified\n");
+		return -EINVAL;
+	}
+
+	kiumd_ctx->num_reserved_regions = of_property_count_elems_of_size(np,
+									  "memory-region",
+									  sizeof(phandle));
+	if (kiumd_ctx->num_reserved_regions <= 0) {
+		pr_err("no reserved mem areas\n");
+		return -EINVAL;
+	}
+
+	kiumd_ctx->res_mem_area = kcalloc((kiumd_ctx->num_reserved_regions + 1),
+					  sizeof(struct kiumd_reserved_mem_area),
+					  GFP_KERNEL);
+	if (!kiumd_ctx->res_mem_area)
+		return -EINVAL;
+
+	kiusr.num_regions = kiumd_ctx->num_reserved_regions;
+	for (int i = 0; i < kiusr.num_regions; i++) {
+		mem_np = of_parse_phandle(vfio_dev->dev->of_node, "memory-region", i);
+		if (!mem_np)
+			continue;
+
+		ret = of_address_to_resource(mem_np, i, &res);
+		if (ret) {
+			of_node_put(mem_np);
+			pr_debug("No memory address assigned to the reserved region\n");
+			kfree(kiumd_ctx->res_mem_area);
+			return -EINVAL;
+		}
+
+		of_node_put(mem_np);
+		kiumd_ctx->res_mem_area[i].size = resource_size(&res);
+		kiumd_ctx->res_mem_area[i].base = res.start;
+		kiusr.mem_info[i].size = resource_size(&res);
+		kiusr.mem_info[i].offset = 0;
+	}
+
+	if (copy_to_user(arg, &kiusr, sizeof(kiusr))) {
+		kfree(kiumd_ctx->res_mem_area);
+		pr_err("%s:error in copying vfio ctx data for reserved memory:%d\n", __func__, ret);
+		ret = -EFAULT;
+	}
+	return ret;
 }
 
 /**
@@ -3113,6 +3230,10 @@ static long kiumd_ioctl(struct file *file, unsigned int cmd,
 	case KIUMD_SMMU_FAULT_HANDLE_DEREGISTER:
 		err = kiumd_smmu_fault_handler_deregister(argp);
 		break;
+	case KIUMD_VFIO_CTX_INIT:
+		pr_debug("kiumd vfio ctx init\n");
+		err = kiumd_vfio_ctx_init(argp, file);
+		break;
 	default:
 		err = -ENOTTY;
 		break;
@@ -3121,11 +3242,68 @@ static long kiumd_ioctl(struct file *file, unsigned int cmd,
 	return err;
 }
 
+/**
+* @Brief: This function facilitates to
+* map a reserved DDR region as normal memory
+* in user space
+*
+* Parameters:
+* @file: file ptr
+* @vma : pointer to struct vma
+*
+* return value is errno in failure cases
+* or 0 in case of success
+*/
+static int kiumd_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	struct kiumd_ctx *ki_ctx;
+	u64 req_len, index, req_start;
+	int ret;
+
+	if (!file) {
+		pr_err("%s:file ptr returns NULL\n", __func__);
+		return -EINVAL;
+	}
+
+	ki_ctx = (struct kiumd_ctx *)file->private_data;
+	if (!ki_ctx) {
+		pr_err("%s:kiumd ctx is NULL\n", __func__);
+		return -EINVAL;
+	}
+
+	if (!ki_ctx->res_mem_area)
+		return -EINVAL;
+
+	if (vma->vm_end < vma->vm_start)
+		return -EINVAL;
+
+	if (ki_ctx->num_reserved_regions <= vma->vm_pgoff)
+		return -EINVAL;
+
+	if (ki_ctx->res_mem_area[index].base & ~PAGE_MASK)
+		return -EINVAL;
+
+	req_len = vma->vm_end - vma->vm_start;
+	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+	index = vma->vm_pgoff;
+
+	pr_debug("%s:res mem start:%llx End:%llx size:%llu vma start:%lx vma end:%lx size:%lu offset:%d\n",
+			__func__, ki_ctx->res_mem_area[index].base,
+			ki_ctx->res_mem_area[index].base + ki_ctx->res_mem_area[index].size,
+			ki_ctx->res_mem_area[index].size, vma->vm_start,
+			vma->vm_end, vma->vm_end - vma->vm_start, vma->vm_pgoff);
+
+	return remap_pfn_range(vma, vma->vm_start,
+				ki_ctx->res_mem_area[index].base >> PAGE_SHIFT,
+				req_len, vma->vm_page_prot);
+}
+
 static const struct file_operations kiumd_fops = {
 	.open = kiumd_open,
 	.unlocked_ioctl = kiumd_ioctl,
 	.compat_ioctl = kiumd_ioctl,
 	.release = kiumd_close,
+	.mmap = kiumd_mmap,
 };
 
 /**
