@@ -78,8 +78,11 @@ rm -rf $RPM_BUILD_ROOT
 %{kernel_module_path}/extra/kiumd_kgsl.ko
 %{kernel_module_path}/extra/qcom_dma_heaps.ko
 %{kernel_module_path}/extra/mhi_ep_net.ko
+%{kernel_module_path}/extra/qcom_dload_mode.ko
 
 %changelog
+* Sun Apr 28 2024 Sankalp Negi <quic_snegi@quicinc.com> 1.2
+- Add Download Mode Driver
 * Mon Aug 28 2023 Deepti Jaggi <quic_djaggi@quicinc.com> 1.1
 - Add Edac driver
 * Fri Jul 27 2023 Venkatakrishnaiah Pari <quic_vpari@quicinc.com> 1.0
