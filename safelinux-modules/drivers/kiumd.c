@@ -28,15 +28,15 @@
 #include <linux/xarray.h>
 #include <uapi/misc/scm_user_intf.h>
 #include <linux/dma-direction.h>
-#include "arm-smmu.h"
-#include "vfio.h"
 #include <linux/kobject.h>
 #include <linux/sysfs.h>
 #include <linux/init.h>
 #include <linux/fs.h>
+#include <linux/platform_device.h>
 #include <linux/string.h>
 
 #include "arm-smmu.h"
+#include "vfio.h"
 
 static struct kobject *smmu_obj;
 static struct kobject *device_obj;
