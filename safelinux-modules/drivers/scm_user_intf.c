@@ -114,6 +114,28 @@ int qcom_scm_kgsl_set_smmu_aperture(unsigned int num_context_bank)
 }
 EXPORT_SYMBOL(qcom_scm_kgsl_set_smmu_aperture);
 
+int qcom_scm_ddrbw_profiler(uint64_t in_buf,
+    size_t in_buf_size, uint64_t out_buf, size_t out_buf_size)
+{
+	int ret;
+	struct qcom_scm_desc desc = {
+		.svc = QCOM_SCM_SVC_INFO,
+		.cmd = TZ_SVC_BW_PROF_ID,
+		.owner = ARM_SMCCC_OWNER_SIP,
+	};
+
+	desc.args[0] = in_buf;
+	desc.args[1] = in_buf_size;
+	desc.args[2] = out_buf;
+	desc.args[3] = out_buf_size;
+	desc.arginfo = QCOM_SCM_ARGS(4, QCOM_SCM_RW, QCOM_SCM_VAL, QCOM_SCM_RW,
+				 QCOM_SCM_VAL);
+	ret = qcom_scm_call(__scm_dev->dev, &desc, NULL);
+
+	return ret;
+}
+EXPORT_SYMBOL(qcom_scm_ddrbw_profiler);
+
 static int get_pa_from_dmabuf_fd(struct dma_buf* dma_buf, u64 *p_addr)
 {
 	struct dma_buf_attachment *buf_attach = NULL;

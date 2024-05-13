@@ -23,6 +23,13 @@
 #define MAX_QCOM_SCM_RESULT                     3
 #define MAX_QCOM_SCM_IN                         10
 
+enum qcom_scm_arg_types {
+        QCOM_SCM_VAL,
+        QCOM_SCM_RO,
+        QCOM_SCM_RW,
+        QCOM_SCM_BUFVAL,
+};
+
 #define QCOM_SCM_ARGS_IMPL(num, a, b, c, d, e, f, g, h, i, j, ...) (\
                            (((a) & 0x3) << 4) | \
                            (((b) & 0x3) << 6) | \
@@ -49,3 +56,8 @@ struct scm_hand_shake {
 };
 
 int qcom_scm_kgsl_set_smmu_aperture(unsigned int num_context_bank);
+
+#define TZ_SVC_BW_PROF_ID	0x07
+
+extern int qcom_scm_ddrbw_profiler(uint64_t in_buf,
+    size_t in_buf_size, uint64_t out_buf, size_t out_buf_size);
