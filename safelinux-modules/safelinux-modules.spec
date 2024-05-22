@@ -52,7 +52,7 @@ depmod %{kversion_with_debug}
 
 %install
 KERNEL_SRC=%{_usrsrc}/kernels/%{kversion_with_debug}
-make KDIR=${KERNEL_SRC} INSTALL_MOD_PATH=$RPM_BUILD_ROOT modules_install
+make KDIR=${KERNEL_SRC} INSTALL_MOD_DIR=extra INSTALL_MOD_PATH=$RPM_BUILD_ROOT modules_install
 make KDIR=${KERNEL_SRC} HDR_INSTAL_PATH=$RPM_BUILD_ROOT/usr/include headers_install
 rm -rf "$RPM_BUILD_ROOT/lib/modules/%{kversion_with_debug}/modules."*
 
