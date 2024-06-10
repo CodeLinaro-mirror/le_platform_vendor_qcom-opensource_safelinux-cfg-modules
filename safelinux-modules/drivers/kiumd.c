@@ -1744,6 +1744,7 @@ int kiumd_fd_dmabuf_handler(char __user *arg)
 					dma_buf_put((struct dma_buf *) dmabuf);
 					return xa_err(ret);
 				}
+				break; //Handle found, exit the loop
 			}
 		}
 
@@ -1752,15 +1753,17 @@ int kiumd_fd_dmabuf_handler(char __user *arg)
 			dmabuf_handle = kzalloc(sizeof(struct dma_buf_handle), GFP_KERNEL);
 			if (!dmabuf_handle) {
 				pr_err("%s: kzalloc failed.\n", __func__);
+				dma_buf_put((struct dma_buf *) dmabuf);
 				return -ENOMEM;
 			}
 
 			dmabuf_handle->dmabuf = dmabuf;
-			atomic_inc(&dmabuf_handle->handle_refcount);
+			atomic_set(&dmabuf_handle->handle_refcount, 1);
 			err = xa_alloc(&kiumd_xa, &local_id, dmabuf_handle, xa_limit_32b, GFP_KERNEL);
 			if (err < 0) {
 				pr_err("%s:xarray alloc failure %d\n", __func__, err);
 				dma_buf_put((struct dma_buf *) dmabuf);
+				kfree(dmabuf_handle);
 				return err;
 			}
 		}
@@ -1781,7 +1784,7 @@ int kiumd_fd_dmabuf_handler(char __user *arg)
 			return -EINVAL;
 		}
 
-		if (!IS_ERR_OR_NULL(dmabuf_handle->dmabuf)) {
+		if (!IS_ERR_OR_NULL((struct dma_buf *) dmabuf_handle->dmabuf)) {
 			kiusr.dma_buf_fd = dma_buf_fd((struct dma_buf *) dmabuf_handle->dmabuf, (O_CLOEXEC));
 		}
 		if (kiusr.dma_buf_fd < 0) {
@@ -1807,8 +1810,14 @@ int kiumd_fd_dmabuf_handler(char __user *arg)
 
 		kiumd_dmabuf = ((struct dma_buf *)dmabuf_handle->dmabuf);
 		if (atomic_dec_and_test(&dmabuf_handle->handle_refcount)) {
+			if (!IS_ERR_OR_NULL(kiumd_dmabuf))
+				dma_buf_put(kiumd_dmabuf);
+
 			xa_erase(&kiumd_xa, local_id);
-			kfree(dmabuf_handle);
+			if (!dmabuf_handle) {
+				kfree(dmabuf_handle);
+				dmabuf_handle = NULL;
+			}
 		}
 
 		else {
@@ -1817,10 +1826,11 @@ int kiumd_fd_dmabuf_handler(char __user *arg)
 				pr_err("%s: xa_store failed in close handle\n", __func__);
 				return xa_err(ret);
 			}
+
+			if (!IS_ERR_OR_NULL(kiumd_dmabuf))
+				dma_buf_put(kiumd_dmabuf);
 		}
 
-		if (!IS_ERR_OR_NULL(kiumd_dmabuf))
-			dma_buf_put(kiumd_dmabuf);
 		kiusr.dma_buf_fd = 0;
 	}
 	if (copy_to_user(arg, &kiusr, sizeof(kiusr))) {
