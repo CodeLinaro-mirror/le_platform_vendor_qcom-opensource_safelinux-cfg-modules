@@ -23,7 +23,7 @@ Summary: kium kernel module
 License: GPLv2
 Source0: %{name}-%{version}.tar.gz
 
-BuildRequires: modules-signkey
+BuildRequires: modules-signkey security-modules
 BuildRequires: kernel-automotive-devel-uname-r = %{kversion_with_debug}
 Requires: %{kpackage}-core-uname-r = %{kversion_with_debug}
 
@@ -42,7 +42,7 @@ Requires: %{name} = %{version}-%{release}
 
 %build
 KERNEL_SRC=%{_usrsrc}/kernels/%{kversion_with_debug}
-make KDIR=${KERNEL_SRC} modules
+make KDIR=${KERNEL_SRC} modules native_build=y
 
 %post
 depmod %{kversion_with_debug}
@@ -60,6 +60,7 @@ rm -rf "$RPM_BUILD_ROOT/lib/modules/%{kversion_with_debug}/modules."*
 rm -rf $RPM_BUILD_ROOT
 
 %files uapi-headers
+%{_includedir}/linux/qtee_shmbridge.h
 %{_includedir}/linux/iommu_iova_map.h
 %{_includedir}/uapi/misc/iommu_iova_map_user.h
 %{_includedir}/uapi/misc/kiumd.h
@@ -68,6 +69,7 @@ rm -rf $RPM_BUILD_ROOT
 
 %files
 %define kernel_module_path /lib/modules/%{kversion_with_debug}
+%{kernel_module_path}/extra/profiler.ko
 %{kernel_module_path}/extra/apps_pinctrl.ko
 %{kernel_module_path}/extra/scm_user_intf.ko
 %{kernel_module_path}/extra/vfio_iommu_qcom.ko
