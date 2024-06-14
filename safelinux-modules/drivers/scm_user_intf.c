@@ -82,6 +82,10 @@ static const struct svc_cmd_list sip_tbl[] = {
 	[QCOM_SCM_SVC_SAFETY] = SVC_CMD_GRP(QCOM_SCM_SVC_SAFETY,
 					    1,
 					    QCOM_SCM_SAFETY_ENABLE_FFI_ID),
+
+	[QCOM_SCM_SVC_LMH] = SVC_CMD_GRP(QCOM_SCM_SVC_LMH,
+					    1,
+					    QCOM_SCM_LMH_LIMIT_PROFILE_CHANGE),
 };
 
 /*
@@ -239,6 +243,7 @@ static bool validate_svc_cmd(unsigned int svc_id, unsigned int cmd_id)
 	case QCOM_SCM_SVC_MP:
 	case QCOM_SCM_SVC_SHE:
 	case QCOM_SCM_SVC_SAFETY:
+	case QCOM_SCM_SVC_LMH:
 
 		svc_cmd_tmp = sip_tbl[svc_id];
 		break;
