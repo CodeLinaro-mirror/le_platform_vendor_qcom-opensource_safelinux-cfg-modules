@@ -27,6 +27,11 @@ kryo_arm64_edac-objs := drivers/kryo_arm64_edac.o
 obj-m += kiumd_kgsl.o
 kiumd_kgsl-objs := drivers/kiumd_kgsl.o
 
+ifeq (y,$(CONFIG_PROFILER))
+obj-m += profiler.o
+profiler-objs := drivers/profiler.o
+endif
+
 obj-m			+= qcom_dma_heaps.o
 qcom_dma_heaps-objs	:= drivers/qcom_dma_heap.o drivers/qcom_dt_parser.o drivers/qcom_sg_ops.o
 qcom_dma_heaps-objs	+= drivers/qcom_carveout_heap.o
