@@ -51,8 +51,6 @@ struct smmu_device_obj {
 
 struct smmu_device_obj *head = NULL;
 
-/*Global Data structures needed for buffer sharing */
-static DEFINE_XARRAY_ALLOC(kiumd_xa);
 
 /*No.of pages for 3GB IOVA space with 4K page size*/
 #define KGSL_PT_MEM_PAGES 0xC0000
@@ -203,6 +201,8 @@ struct kiumd_ctx {
 	DECLARE_HASHTABLE(smmu_table, SMMU_MAPTABLE_SIZE);
 	struct kiumd_reserved_mem_area *res_mem_area;
 	int num_reserved_regions;
+	struct xarray kiumd_xa;
+	struct mutex kiumd_xa_mutex;
 };
 
 /**
@@ -1717,7 +1717,7 @@ int kiumd_iova_ctrl(char __user *arg)
 *
 * Returns  handle/fd upon success and error codes on failure
 */
-int kiumd_fd_dmabuf_handler(char __user *arg)
+int kiumd_fd_dmabuf_handler(char __user *arg, struct file *fp)
 {
 	struct kiumd_user kiusr;
 	struct dma_buf *kiumd_dmabuf = NULL;
@@ -1730,6 +1730,13 @@ int kiumd_fd_dmabuf_handler(char __user *arg)
 	bool handle_available = false;
 	struct dma_buf_handle *dmabuf_handle = NULL;
 	struct dma_buf_handle *dmabuf_xarray_entry = NULL;
+	struct kiumd_ctx *kiumd_ctx = NULL;
+
+	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
+	if (!kiumd_ctx) {
+		pr_err("%s:kiumd ctx is NULL \n", __func__);
+		return -EINVAL;
+	}
 
 	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user))) {
 		pr_err("%s: copy_from_user failed\n", __func__);
@@ -1744,26 +1751,22 @@ int kiumd_fd_dmabuf_handler(char __user *arg)
 			return -EBADF;
 		}
 
+		mutex_lock(&kiumd_ctx->kiumd_xa_mutex);
 		/* Retrieve struct dma_buf from FD*/
 		dmabuf  = (unsigned long) dma_buf_get(kiusr.dma_buf_fd);
 		if (((struct dma_buf *) dmabuf) == NULL) {
 			pr_err("%s: dma_buf_get returns NULL\n", __func__);
+			mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
 			return -EINVAL;
 		}
 
 		/* Check if handle for buffer already exists, RCU lock acquired*/
-		xa_for_each(&kiumd_xa, xa_index, xa_entry) {
+		xa_for_each(&kiumd_ctx->kiumd_xa, xa_index, xa_entry) {
 			dmabuf_xarray_entry = (struct dma_buf_handle *) xa_entry;
 			if (dmabuf_xarray_entry->dmabuf == dmabuf) {
 				handle_available = true;
 				local_id = xa_index;
 				atomic_inc(&dmabuf_xarray_entry->handle_refcount);
-				ret = xa_store(&kiumd_xa, xa_index, dmabuf_xarray_entry, GFP_KERNEL);
-				if (xa_is_err(ret)) {
-					pr_err("%s: xa_store failed\n", __func__);
-					dma_buf_put((struct dma_buf *) dmabuf);
-					return xa_err(ret);
-				}
 				break; //Handle found, exit the loop
 			}
 		}
@@ -1774,33 +1777,35 @@ int kiumd_fd_dmabuf_handler(char __user *arg)
 			if (!dmabuf_handle) {
 				pr_err("%s: kzalloc failed.\n", __func__);
 				dma_buf_put((struct dma_buf *) dmabuf);
+				mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
 				return -ENOMEM;
 			}
-
 			dmabuf_handle->dmabuf = dmabuf;
 			atomic_set(&dmabuf_handle->handle_refcount, 1);
-			err = xa_alloc(&kiumd_xa, &local_id, dmabuf_handle, xa_limit_32b, GFP_KERNEL);
+			err = xa_alloc(&kiumd_ctx->kiumd_xa, &local_id, (void *)dmabuf_handle, xa_limit_32b, GFP_KERNEL);
 			if (err < 0) {
 				pr_err("%s:xarray alloc failure %d\n", __func__, err);
 				dma_buf_put((struct dma_buf *) dmabuf);
 				kfree(dmabuf_handle);
+				mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
 				return err;
 			}
 		}
 
 		kiumd_dmabuf = (struct dma_buf *) dmabuf;
 		kiusr.handle = local_id;
+		mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
 	} else if (kiusr.dma_buf_fd == HANDLE_TO_FD) { /* Handle to FD */
-
 		if (kiusr.handle < 0) {
 			pr_err("%s: dmabuf handle is invalid\n", __func__);
 			return -EINVAL;
 		}
-
+		mutex_lock(&kiumd_ctx->kiumd_xa_mutex);
 		local_id = kiusr.handle;
-		dmabuf_handle = xa_load(&kiumd_xa, local_id);
+		dmabuf_handle = xa_load(&kiumd_ctx->kiumd_xa, local_id);
 		if (!dmabuf_handle) {
 			pr_err("%s: dmabuf_handle is NULL\n", __func__);
+			mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
 			return -EINVAL;
 		}
 
@@ -1809,49 +1814,44 @@ int kiumd_fd_dmabuf_handler(char __user *arg)
 		}
 		if (kiusr.dma_buf_fd < 0) {
 			pr_err("%s:dma_buf_fd failed\n", __func__);
+			mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
 			return -EBADF;
 		}
-
 		get_dma_buf((struct dma_buf *) dmabuf_handle->dmabuf);
+		mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
 
 	} else if (kiusr.dma_buf_fd == CLOSE_HANDLE) {  /* Close Handle */
-
 		if (kiusr.handle < 0) {
 			pr_err("%s: Invalid dma buf handle.\n", __func__);
 			return -EINVAL;
 		}
 
+		mutex_lock(&kiumd_ctx->kiumd_xa_mutex);
 		local_id = (int32_t)kiusr.handle;
-		dmabuf_handle = xa_load(&kiumd_xa, local_id);
+
+		dmabuf_handle = xa_load(&kiumd_ctx->kiumd_xa, local_id);
 		if (!dmabuf_handle) {
 			pr_err("%s:Entry not available in xarray\n", __func__);
+			mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
 			return -EINVAL;
 		}
 
 		kiumd_dmabuf = ((struct dma_buf *)dmabuf_handle->dmabuf);
 		if (atomic_dec_and_test(&dmabuf_handle->handle_refcount)) {
+
 			if (!IS_ERR_OR_NULL(kiumd_dmabuf))
 				dma_buf_put(kiumd_dmabuf);
-
-			xa_erase(&kiumd_xa, local_id);
+			xa_erase(&kiumd_ctx->kiumd_xa, local_id);
 			if (!dmabuf_handle) {
 				kfree(dmabuf_handle);
 				dmabuf_handle = NULL;
 			}
-		}
-
-		else {
-			ret = xa_store(&kiumd_xa, local_id, dmabuf_handle, GFP_KERNEL);
-			if (xa_is_err(ret)) {
-				pr_err("%s: xa_store failed in close handle\n", __func__);
-				return xa_err(ret);
-			}
-
+		} else {
 			if (!IS_ERR_OR_NULL(kiumd_dmabuf))
 				dma_buf_put(kiumd_dmabuf);
 		}
-
 		kiusr.dma_buf_fd = 0;
+		mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
 	}
 	if (copy_to_user(arg, &kiusr, sizeof(kiusr))) {
 		pr_err("%s: copy_to_user failed...\n", __func__);
@@ -3027,6 +3027,9 @@ static int kiumd_open(struct inode *inode, struct file *filp)
 	kictx->id = 0;
 	hash_init(kictx->smmu_table);
 	spin_lock_init(&kictx->smmu_lock);
+	xa_init(&kictx->kiumd_xa);
+	mutex_init(&kictx->kiumd_xa_mutex);
+	xa_init_flags(&kictx->kiumd_xa, XA_FLAGS_ALLOC);
 	filp->private_data = kictx;
 
 	return 0;
@@ -3049,6 +3052,11 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 	struct kiumd_ctx *ki_ctx = (struct kiumd_ctx *)filp->private_data;
 	struct smmu_map_data *smap;
 	int iter;
+	void *xa_entry;
+	unsigned long xa_index;
+	struct dma_buf_handle *dmabuf_handle = NULL;
+	struct dma_buf *kiumd_dmabuf = NULL;
+	int count;
 
 	if (!ki_ctx) {
 		pr_err("%s:kiumd ctx is NULL\n", __func__);
@@ -3072,6 +3080,28 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 	spin_unlock(&ki_ctx->smmu_lock);
 	if (ki_ctx->res_mem_area)
 		kfree(ki_ctx->res_mem_area);
+	mutex_lock(&ki_ctx->kiumd_xa_mutex);
+	if (!xa_empty(&ki_ctx->kiumd_xa)) {
+		xa_for_each(&ki_ctx->kiumd_xa, xa_index, xa_entry) {
+			dmabuf_handle = (struct dma_buf_handle *) xa_entry;
+			if (!dmabuf_handle) {
+				pr_err("%s:Entry not available in xarray\n", __func__);
+				continue;
+			}
+			kiumd_dmabuf = ((struct dma_buf *)dmabuf_handle->dmabuf);
+			count = atomic_read(&dmabuf_handle->handle_refcount);
+			if (!IS_ERR_OR_NULL(kiumd_dmabuf)) {
+				while (count > 0) {
+					dma_buf_put(kiumd_dmabuf);
+					count--;
+				}
+			}
+			kfree(dmabuf_handle);
+		}
+		xa_destroy(&ki_ctx->kiumd_xa);
+	}
+	mutex_unlock(&ki_ctx->kiumd_xa_mutex);
+
 	kfree(ki_ctx);
 
 	return 0;
@@ -3218,7 +3248,7 @@ static long kiumd_ioctl(struct file *file, unsigned int cmd,
 		err = kiumd_perprocess_pgtble_free(argp);
 		break;
 	case KIUMD_FD_DMABUF_HANDLE:
-		err = kiumd_fd_dmabuf_handler(argp);
+		err = kiumd_fd_dmabuf_handler(argp, file);
 		break;
 	case KIUMD_CUSTOM_IOVA_INIT:
 		err = kiumd_dmabuf_custom_iova_init(argp);
