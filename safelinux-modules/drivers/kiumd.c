@@ -1604,6 +1604,10 @@ int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 		dma_unmap_sgtable(vfio_dev->dev, sgtable, kiumd_dma_direction, DMA_ATTR_PRIVILEGED);
 		fput(file);
 	} else {
+		if(!smap->sgt_ptr) {
+			pr_err("%s: smap->sgt_ptr is NULL\n", __func__);
+			return -EINVAL;
+		}
 		dma_buf_unmap_attachment_unlocked(dmabufattach, (struct sg_table *)smap->sgt_ptr,
 									kiumd_dma_direction);
 
