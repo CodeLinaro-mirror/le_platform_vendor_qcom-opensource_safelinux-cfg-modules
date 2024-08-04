@@ -10,6 +10,7 @@
 #include <linux/of_platform.h>
 #include <linux/of_address.h>
 #include <linux/of_reserved_mem.h>
+#include <linux/of_device.h>
 
 #include "qcom_dt_parser.h"
 
