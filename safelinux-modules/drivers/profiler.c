@@ -24,10 +24,12 @@ Copyright (c) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/delay.h>
-
+#include <linux/version.h>
 #include <linux/qtee_shmbridge.h>
 #include "profiler.h"
-
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 33))
+#include <linux/firmware/qcom/qcom_scm_addon.h>
+#endif
 #define PROFILER_DEV			"profiler"
 
 static struct class *driver_class;
