@@ -225,6 +225,10 @@ struct smmu_map_data {
 	long sgt_ptr;
 	long dmabuf_ptr;
 	long dmabufattach;
+	int dma_dir;
+	int ptselect;
+	int is_iova_zero;
+	struct vfio_device *vfio_dev;
 	void *context;
 	struct hlist_node node;
 };
@@ -1291,6 +1295,23 @@ int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 	struct kiumd_ctx *kiumd_ctx = NULL;
 	struct smmu_map_data *smap = NULL;
 
+	if (!fp) {
+		pr_err("%s:file ptr returns NULL\n", __func__);
+		return -EINVAL;
+	}
+
+	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
+	if (!kiumd_ctx) {
+		pr_err("%s:kiumd ctx is NULL \n", __func__);
+		return -EINVAL;
+	}
+
+	smap = kzalloc(sizeof(struct smmu_map_data), GFP_KERNEL);
+	if (!smap) {
+		pr_err("%s:No memory for smap \n", __func__);
+		return -ENOMEM;
+	}
+
 	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user)))
 		return -EFAULT;
 
@@ -1458,6 +1479,10 @@ int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 	smap->dmabufattach = (long)dmabufattach;
 	smap->sgt_ptr = (long)sgt;
 	smap->dmabuf_ptr = (long)kiumd_dmabuf;
+	smap->dma_dir = kiumd_dma_direction;
+	smap->ptselect = kiusr.ptselect;
+	smap->is_iova_zero = kiusr.is_iova_zero;
+	smap->vfio_dev = vfio_dev;
 	spin_lock(&kiumd_ctx->smmu_lock);
 	smap->id = kiumd_ctx->id++;
 	hash_add(kiumd_ctx->smmu_table, &smap->node, smap->id);
@@ -1550,6 +1575,7 @@ int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 		spin_unlock(&kiumd_ctx->smmu_lock);
 		return -ENOENT;
 	}
+
 	spin_unlock(&kiumd_ctx->smmu_lock);
 	kiumd_dmabuf = (struct dma_buf *)smap->dmabuf_ptr;
 	if (!kiumd_dmabuf) {
@@ -1615,7 +1641,6 @@ int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 		}
 		dma_buf_unmap_attachment_unlocked(dmabufattach, (struct sg_table *)smap->sgt_ptr,
 									kiumd_dma_direction);
-
 		if (kiusr.is_iova_zero == FIXED_IOVA_AT_ZERO) {
 			iommu_dom = kiumd_get_iommu_domain(kiusr.vfio_fd);
 			if (!iommu_dom) {
@@ -1638,10 +1663,8 @@ int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 				pr_err("%s:iommu_dom is NULL\n", __func__);
 				return -EINVAL;
 			}
-
 			iommu_flush_iotlb_all(iommu_dom);
 	}
-
 
 	spin_lock(&kiumd_ctx->smmu_lock);
 	hash_del(&smap->node);
@@ -3061,7 +3084,9 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 	unsigned long xa_index;
 	struct dma_buf_handle *dmabuf_handle = NULL;
 	struct dma_buf *kiumd_dmabuf = NULL;
-	int count;
+	int count, ret;
+	struct iommu_domain *iommu_dom;
+	struct hlist_node *tmp;
 
 	if (!ki_ctx) {
 		pr_err("%s:kiumd ctx is NULL\n", __func__);
@@ -3069,20 +3094,51 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 	}
 	spin_lock(&ki_ctx->smmu_lock);
 	if (!hash_empty(ki_ctx->smmu_table)) {
-		hash_for_each(ki_ctx->smmu_table, iter, smap, node) {
+		hash_for_each_safe(ki_ctx->smmu_table, iter, tmp, smap, node) {
 			if (smap->context) {
 				struct kiumd_smmu_mmio_ctx *mmio_ctx = smap->context;
 
 				pr_debug("Free mmio ctx%p iova:%llx size:%lx\n",
 					 mmio_ctx, mmio_ctx->iova, mmio_ctx->size);
 				dma_unmap_resource(mmio_ctx->dev, mmio_ctx->iova, mmio_ctx->size, 0, 0);
-				hash_del(&smap->node);
 				kfree(smap->context);
-				kfree(smap);
 			}
+			if (smap->dmabuf_ptr) {
+				kiumd_dmabuf = (struct dma_buf *)smap->dmabuf_ptr;
+				iommu_dom = kiumd_iommu_get_dma_domain(smap->vfio_dev->dev);
+				if (!iommu_dom) {
+					pr_err("%s:IOMMU domain is NULL\n", __func__);
+					continue;
+				}
+
+                                pr_debug("kiumd_debug: Driver close : unmap sgt_ptr:%llx, iommu_domain: %llx \n",smap->sgt_ptr, iommu_dom);
+				if (smap->ptselect == KGSL_GLOBAL_PT || smap->ptselect == KGSL_PER_PROCESS_PT
+									|| smap->ptselect == KGSL_DEFAULT_PT) {
+					continue;
+				}
+				if(smap->dmabufattach && smap->sgt_ptr)
+					dma_buf_unmap_attachment_unlocked((struct dma_buf_attachment *)smap->dmabufattach, (struct sg_table *)smap->sgt_ptr,
+									   smap->dma_dir);
+				pr_debug("kiumd_debug: unmap dmabufatach:%llx \n",smap->dmabufattach);
+				if (smap->is_iova_zero == FIXED_IOVA_AT_ZERO) {
+					pr_debug("kiumd_debug: unmap iommu_dom:%llx, size: %d \n",iommu_dom, kiumd_dmabuf->size);
+					ret = iommu_unmap(iommu_dom, 0, kiumd_dmabuf->size);
+					if (ret != kiumd_dmabuf->size) {
+						pr_err("%s:iommu_unmap failed\n", __func__);
+						continue;
+					}
+				}
+
+				dma_buf_detach(kiumd_dmabuf, smap->dmabufattach);
+				dma_buf_put(kiumd_dmabuf);
+				pr_debug("kiumd_debug: unmap done\n");
+			}
+			hash_del(&smap->node);
+			kfree(smap);
 		}
 	}
 	spin_unlock(&ki_ctx->smmu_lock);
+
 	if (ki_ctx->res_mem_area)
 		kfree(ki_ctx->res_mem_area);
 	mutex_lock(&ki_ctx->kiumd_xa_mutex);
