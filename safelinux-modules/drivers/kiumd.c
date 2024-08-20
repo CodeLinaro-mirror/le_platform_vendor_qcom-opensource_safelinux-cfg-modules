@@ -2609,11 +2609,11 @@ static int kiumd_smmu_fault_handler(struct iommu_domain *iomm_domain,
 				temp->smmu_fsr = arm_smmu_cb_read(smmu_domain->smmu,cfg->cbndx,ARM_SMMU_CB_FSR);
 				temp->smmu_iova = iova;
 				temp->flag = 1;
+				sysfs_notify(temp->kobj,NULL,"fsr_iova");
 				break;
 			}
 			temp = temp->next;
 		}
-		sysfs_notify(device_obj,NULL,"fsr_iova");
 
 	} while(0);
 
