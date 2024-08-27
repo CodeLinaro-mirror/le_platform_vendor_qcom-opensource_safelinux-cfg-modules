@@ -75,6 +75,7 @@ struct smmu_device_obj {
 };
 
 struct smmu_device_obj *head = NULL;
+DEFINE_MUTEX(smmu_fault_mutex);
 
 
 /*No.of pages for 6GB IOVA space with 4K page size*/
@@ -296,6 +297,7 @@ struct kiumd_ctx {
 	DECLARE_HASHTABLE(smmu_table, SMMU_MAPTABLE_SIZE);
 	DECLARE_HASHTABLE(hyp_table, SMMU_MAPTABLE_SIZE);
 	struct kiumd_reserved_mem_area *res_mem_area;
+	struct vfio_device *vfio_dev;
 	int num_reserved_regions;
 	struct xarray kiumd_xa;
 	struct mutex kiumd_xa_mutex;
@@ -1605,6 +1607,12 @@ int kiumd_dmabuf_custom_iova_init(char __user *arg, struct file *fp)
 	LIST_HEAD(resrvd);
 	int ret;
 
+	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
+	if (!kiumd_ctx) {
+		pr_err("%s:kiumd ctx is NULL \n", __func__);
+		return -EINVAL;
+	}
+
 	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user)))
 		return -EFAULT;
 
@@ -1629,17 +1637,12 @@ int kiumd_dmabuf_custom_iova_init(char __user *arg, struct file *fp)
 		return -EINVAL;
 	}
 
-	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-	if (!kiumd_ctx) {
-		pr_err("%s:kiumd ctx is NULL \n", __func__);
-		return -EINVAL;
-	}
-
 	/*Get the maximum shift from DT for managed_iova_map api to
 	 * determine alignment for large buffers
 	 */
 	kiumd_ctx->max_shift = get_shift_from_dt(vfio_dev->dev);
 
+	kiumd_ctx->vfio_dev = vfio_dev;
 	ret = dma_set_max_seg_size(vfio_dev->dev, (unsigned int) DMA_BIT_MASK(32));
 	//Print a warning and continue.
 	if (ret)
@@ -4008,6 +4011,7 @@ static int kiumd_smmu_fault_handler_deregister(char __user *arg)
 	struct kiumd_user kiusr;
 	struct smmu_device_obj *temp = head;
 	struct smmu_device_obj *prev = NULL;
+	struct iommu_domain *domain = NULL;
 
 	int retval = 0;
 
@@ -4024,11 +4028,21 @@ static int kiumd_smmu_fault_handler_deregister(char __user *arg)
 			break;
 		}
 
+		domain = kiumd_iommu_get_dma_domain(vfio_dev->dev);
+		if (!domain) {
+			pr_err("%s:iommu domain is NULL\n", __func__);
+			retval = -EINVAL;
+			break;
+		}
+
+		mutex_lock(&smmu_fault_mutex);
 		if (temp != NULL && !strcmp(temp->kobj->name,vfio_dev->dev->kobj.name))
 		{
 			head = head->next;
 			temp->next = NULL;
+			sysfs_remove_file(temp->kobj, &(fsr_iova_attribute.attr));
 			kobject_put(temp->kobj);
+			temp->kobj = NULL;
 			kfree(temp);
 		} else {
 			while(temp != NULL && strcmp(temp->kobj->name,vfio_dev->dev->kobj.name))
@@ -4044,10 +4058,13 @@ static int kiumd_smmu_fault_handler_deregister(char __user *arg)
 			if (prev)
 				prev->next = temp->next;
 			temp->next = NULL;
+			sysfs_remove_file(temp->kobj, &(fsr_iova_attribute.attr));
 			kobject_put(temp->kobj);
+			temp->kobj = NULL;
 			kfree(temp);
 		}
-
+		iommu_set_fault_handler(domain, NULL, NULL);
+		mutex_unlock(&smmu_fault_mutex);
 	} while(0);
 
 	return retval;
@@ -4069,7 +4086,6 @@ static int kiumd_smmu_fault_handler_register(char __user *arg)
 	struct vfio_device *vfio_dev = NULL;
 	struct smmu_device_obj *ptr = NULL;
 	struct smmu_device_obj *temp = NULL;
-
 	struct kiumd_user kiusr;
 	int retval = 0;
 	int err = 0;
@@ -4114,6 +4130,8 @@ static int kiumd_smmu_fault_handler_register(char __user *arg)
 			retval = -ENOMEM;
 			break;
 		}
+
+		mutex_lock(&smmu_fault_mutex);
 		ptr->kobj = device_obj;
 		ptr->flag = 0;
 		ptr->next = NULL;
@@ -4127,6 +4145,7 @@ static int kiumd_smmu_fault_handler_register(char __user *arg)
 			}
 			temp->next = ptr;
 		}
+		mutex_unlock(&smmu_fault_mutex);
 
 		iommu_set_fault_handler(domain, kiumd_smmu_fault_handler, device_obj->name);
 
@@ -4415,6 +4434,7 @@ static int kiumd_open(struct inode *inode, struct file *filp)
 	kictx->hyp_idx = 0;
 	kictx->kgsl_context->kgsl_start_iova = KGSL_PER_PROCESS_PT_BASE_IOVA;
 	kictx->kgsl_context->kgsl_end_iova = KGSL_PER_PROCESS_PT_END_IOVA;
+	kictx->vfio_dev = NULL;
 	hash_init(kictx->smmu_table);
 	hash_init(kictx->hyp_table);
 	spin_lock_init(&kictx->smmu_lock);
@@ -4451,6 +4471,10 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 	int count, ret;
 	struct iommu_domain *iommu_dom;
 	struct hlist_node *tmp;
+	struct vfio_device *vfio_dev = NULL;
+	struct kiumd_user kiusr;
+	struct smmu_device_obj *temp = head;
+	struct smmu_device_obj *prev = NULL;
 
 	if (!ki_ctx) {
 		pr_err("%s:kiumd ctx is NULL\n", __func__);
@@ -4461,7 +4485,6 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 		hash_for_each_safe(ki_ctx->smmu_table, iter, tmp, smap, node) {
 			if (smap->context) {
 				struct kiumd_smmu_mmio_ctx *mmio_ctx = smap->context;
-
 				pr_debug("Free mmio ctx%p iova:%llx size:%lx\n",
 					 mmio_ctx, mmio_ctx->iova, mmio_ctx->size);
 				dma_unmap_resource(mmio_ctx->dev, mmio_ctx->iova, mmio_ctx->size, 0, 0);
@@ -4527,6 +4550,50 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 	}
 	mutex_unlock(&ki_ctx->kiumd_xa_mutex);
 
+	/*smmu fault handler cleanup*/
+	vfio_dev = ki_ctx->vfio_dev;
+	if (!vfio_dev) {
+		pr_err("%s:vfio_dev is NULL \n",__func__);
+		return 0;
+	}
+	iommu_dom = kiumd_iommu_get_dma_domain(vfio_dev->dev);
+	if (!iommu_dom) {
+		pr_err("%s:iommu domain is NULL\n", __func__);
+		return 0;
+	}
+
+	mutex_lock(&smmu_fault_mutex);
+	if (temp != NULL && !strcmp(temp->kobj->name,vfio_dev->dev->kobj.name))
+	{
+		head = head->next;
+		temp->next = NULL;
+		sysfs_remove_file(temp->kobj, &(fsr_iova_attribute.attr));
+		kobject_put(temp->kobj);
+		temp->kobj = NULL;
+		kfree(temp);
+		pr_info("kiumd_debug:cleanup done for %s device \n", vfio_dev->dev->kobj.name);
+	} else {
+		while(temp != NULL && strcmp(temp->kobj->name,vfio_dev->dev->kobj.name))
+		{
+			prev = temp;
+			temp = temp->next;
+		}
+		if (temp == NULL) {
+			pr_err("%s:vfio device is not present in list to deregister\n");
+			return 0;
+		}
+
+		prev->next = temp->next;
+		temp->next = NULL;
+		sysfs_remove_file(temp->kobj, &(fsr_iova_attribute.attr));
+		kobject_put(temp->kobj);
+		temp->kobj = NULL;
+		kfree(temp);
+		pr_info("kiumd_debug:cleanup done for %s device \n", vfio_dev->dev->kobj.name);
+	}
+
+	iommu_set_fault_handler(iommu_dom, NULL, NULL);
+	mutex_unlock(&smmu_fault_mutex);
 	kfree(ki_ctx);
 
 	return 0;
