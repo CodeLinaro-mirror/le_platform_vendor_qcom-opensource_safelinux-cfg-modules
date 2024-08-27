@@ -34,8 +34,13 @@
 #include <linux/fs.h>
 #include <linux/platform_device.h>
 #include <linux/string.h>
+#include <linux/version.h>
 
+#if (LINUX_VERSION_CODE != KERNEL_VERSION(5, 14, 0))
+#include "arm-smmu/arm-smmu.h"
+#else
 #include "arm-smmu.h"
+#endif
 #include "vfio.h"
 
 static struct kobject *smmu_obj;
