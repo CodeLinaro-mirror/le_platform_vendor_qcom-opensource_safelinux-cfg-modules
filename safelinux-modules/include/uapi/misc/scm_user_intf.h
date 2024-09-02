@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note
- * Copyright (C) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (C) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 #include <linux/types.h>
 #include <linux/version.h>
@@ -21,6 +21,10 @@
 #define QCOM_SCM_MP_CP_SMMU_APERTURE_ID         0x1b
 #define QCOM_SCM_CP_APERTURE_REG                0x0
 
+#define QCOM_SCM_SVC_SMC_INVOKE                 0x6
+#define QCOM_SCM_SMCINVOKE                      0x2
+#define QCOM_SCM_SMCINVOKE_CB_RESP              0x1
+
 #define TZ_SVC_BW_PROF_ID			0x07
 
 #define MAX_QCOM_SCM_RESULT                     3
@@ -29,6 +33,7 @@
 struct scm_hand_shake {
 	__u32 svc;
 	__u32 cmd;
+	__u32 owner;
 	__u32 arginfo;
 	__u64 args_buffer[MAX_QCOM_SCM_IN];
 	__u32 ret;
