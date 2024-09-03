@@ -34,8 +34,13 @@
 #include <linux/fs.h>
 #include <linux/platform_device.h>
 #include <linux/string.h>
+#include <linux/version.h>
 
+#if (LINUX_VERSION_CODE != KERNEL_VERSION(5, 14, 0))
+#include "arm-smmu/arm-smmu.h"
+#else
 #include "arm-smmu.h"
+#endif
 #include "vfio.h"
 
 static struct kobject *smmu_obj;
@@ -51,8 +56,6 @@ struct smmu_device_obj {
 
 struct smmu_device_obj *head = NULL;
 
-/*Global Data structures needed for buffer sharing */
-static DEFINE_XARRAY_ALLOC(kiumd_xa);
 
 /*No.of pages for 3GB IOVA space with 4K page size*/
 #define KGSL_PT_MEM_PAGES 0xC0000
@@ -174,11 +177,25 @@ static const struct iommu_flush_ops kgsl_iopgtbl_tlb_ops = {
 };
 
 /**
+ * struct kiumd_reserved_mem_area: Structure for reserved
+ * memory area.
+ * @size: size of reserved memory area
+ * @base: start address of reserved memory area
+ *
+ */
+struct kiumd_reserved_mem_area {
+	size_t size;
+	u64    base;
+};
+
+/**
  * struct kiumd_ctx: Structure for kiumd_ctx .
  * @id: id to map/unmap entries in hashtable
  * @smmu_map_data: structurefor hashtable data
  * @smmu_lock: Lock for map/unmap operations
  * @smmu_table: Hashtable to hold entries based on id
+ * @reserved_mem_area: pointer to hold reserved memory area
+ * @num_reserved_regions : number of reserved memory areas
  *
  */
 
@@ -187,6 +204,10 @@ struct kiumd_ctx {
 	struct hlist_node smmu_map_data;
 	spinlock_t smmu_lock;
 	DECLARE_HASHTABLE(smmu_table, SMMU_MAPTABLE_SIZE);
+	struct kiumd_reserved_mem_area *res_mem_area;
+	int num_reserved_regions;
+	struct xarray kiumd_xa;
+	struct mutex kiumd_xa_mutex;
 };
 
 /**
@@ -398,7 +419,6 @@ struct iommu_domain *kiumd_get_iommu_domain(int vfio_fd)
 {
 	struct vfio_device *vfio_dev = NULL;
 	struct iommu_domain *domain = NULL;
-	int retval = 0;
 
 	do {
 		vfio_dev = kiumd_get_vfio_device(vfio_fd);
@@ -431,7 +451,6 @@ struct arm_smmu_domain *kiumd_get_smmu_domain(int vfio_fd)
 {
 	struct iommu_domain *iommu_dom = NULL;
 	struct arm_smmu_domain *smmu_domain = NULL;
-	int retval = 0;
 
 	do {
 		iommu_dom = kiumd_get_iommu_domain(vfio_fd);
@@ -460,7 +479,7 @@ struct arm_smmu_domain *kiumd_get_smmu_domain(int vfio_fd)
 *
 * Returns void
 */
-void kiumd_smmuv2_write_context_bank(struct arm_smmu_device *smmu, int idx)
+static void kiumd_smmuv2_write_context_bank(struct arm_smmu_device *smmu, int idx)
 {
 	u32 reg;
 	bool stage1;
@@ -511,20 +530,21 @@ void kiumd_smmuv2_write_context_bank(struct arm_smmu_device *smmu, int idx)
 }
 
 /**
-* @Brief: This function call the api to
-* set page table base register configuration
-*
-* Parameters:
-* @*cookie: iommu dma cookie
-* @pgtbl_cfg: pointer for io_pgtable_cfg
-*
-* Returns  0 upon success and -EINVAL on failure
-*/
-int kiumd_smmuv2_set_ttbr0_cfg(const void *cookie,
+ * kiumd_smmuv2_set_ttbr0cfg - Configure TTBR0 settings for the ARM SMMU
+ * for a specific vfio device(as of now used by GPU)
+ * @smmu_domain: Pointer to the SMMU domain structure
+ * @pgtbl_cfg: Pointer to the page table configuration
+ *
+ * This function enables TTBR0 translation in the SMMU and updates the
+ * registers for efficient address translation.
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+
+static int kiumd_smmuv2_set_ttbr0_cfg(struct arm_smmu_domain *smmu_domain,
 		const struct io_pgtable_cfg *pgtbl_cfg)
 {
 
-	struct arm_smmu_domain *smmu_domain = (void *)cookie;
 	struct arm_smmu_cfg *cfg = &smmu_domain->cfg;
 	struct arm_smmu_cb *cb = &smmu_domain->smmu->cbs[cfg->cbndx];
 	u32 tcr = cb->tcr[0];
@@ -547,59 +567,124 @@ int kiumd_smmuv2_set_ttbr0_cfg(const void *cookie,
 }
 
 /**
-* @Brief: This function call the api to
-* set the per process user context
-*
-* Parameters:
-* @arg: user space argument pointer
-* @pgtbl_cfg: pointer for io_pgtable_cfg
-*
-* Returns  0 upon success and -EINVAL on failure
-*/
-int kiumd_perprocess_set_user_context(char __user *arg)
+ * kiumd_smmuv2_set_ttbr1_cfg - Configure TTBR1 settings for the ARM SMMU
+ * for a specific vfio device(as of now used by LPAC).
+ * @smmu_domain: Pointer to the SMMU domain structure
+ * @pgtbl_cfg: Pointer to the page table configuration
+ *
+ * This function enables TTBR1 translation in the SMMU and updates the
+ * registers for efficient address translation.
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+
+static int kiumd_smmuv2_set_ttbr1_cfg(struct arm_smmu_domain *smmu_domain,
+						const struct io_pgtable_cfg *pgtbl_cfg)
 {
-	struct kiumd_smmu_user kismmu_pproc;
-	struct file *file;
-	struct vfio_device *vfio_dev;
-	struct vfio_device_file *df;
+
+	struct arm_smmu_cfg *cfg = &smmu_domain->cfg;
+	struct arm_smmu_cb *cb = &smmu_domain->smmu->cbs[cfg->cbndx];
+	u32 tcr = cb->tcr[0];
+
+	if (!(cb->tcr[0] & ARM_SMMU_TCR_EPD1)) {
+		pr_err("TTBR1 translation is already enabled");
+		return -EINVAL;
+	}
+
+	tcr |= arm_smmu_lpae_tcr(pgtbl_cfg);
+	tcr &= ~(ARM_SMMU_TCR_EPD0 | ARM_SMMU_TCR_EPD1);
+
+	cb->tcr[0] = tcr;
+	cb->ttbr[1] = pgtbl_cfg->arm_lpae_s1_cfg.ttbr;
+	cb->ttbr[1] |= FIELD_PREP(ARM_SMMU_TTBRn_ASID, cb->cfg->asid);
+
+	kiumd_smmuv2_write_context_bank(smmu_domain->smmu, cb->cfg->cbndx);
+
+	return 0;
+}
+
+/**
+ * kiumd_perprocess_set_ttbr1_context - Configure TTTBR1 settings for the
+ * ARM SMMU for a specific vfio device(as of now used by LPAC).
+ * @arg: User-provided argument pointer
+ *
+ * This function allocates a pagetable and invokes the function to program
+ * TTBR1 for the specified VFIO device's SMMU domain. It also configures
+ * the aperture for the specified vfio device.
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+
+static int kiumd_set_pgtble_ttbr1_context(struct iommu_domain *iommu_dom)
+{
+	struct arm_smmu_domain *smmu_dom;
+	struct io_pgtable_cfg cfg;
+	struct io_pgtable *pagetable;
+	struct io_pgtable_ops *pgtable_ops;
+
+	smmu_dom = container_of(iommu_dom, struct arm_smmu_domain, domain);
+	if (!smmu_dom || !smmu_dom->pgtbl_ops) {
+		pr_err("%s: smmu domain/pagetable ops is invalid\n", __func__);
+		return -EINVAL;
+	}
+
+	pagetable = io_pgtable_ops_to_pgtable(smmu_dom->pgtbl_ops);
+	if (!pagetable) {
+		pr_err("%s: pagetable is NULL\n", __func__);
+		return -EINVAL;
+	}
+
+	memcpy(&cfg, &pagetable->cfg, sizeof(struct io_pgtable_cfg));
+	cfg.quirks |= IO_PGTABLE_QUIRK_ARM_TTBR1;
+	cfg.tlb = &kgsl_iopgtbl_tlb_ops;
+
+	if (cfg.quirks & IO_PGTABLE_QUIRK_ARM_TTBR1) {
+		iommu_dom->geometry.aperture_start = ~0UL << 48;
+		iommu_dom->geometry.aperture_end = ~0UL;
+	} else {
+		pr_err("%s: Incorrect quirk set for the device\n", __func__);
+		return -EINVAL;
+	}
+
+	pgtable_ops = alloc_io_pgtable_ops(ARM_64_LPAE_S1, &cfg, NULL);
+	if (!pgtable_ops) {
+		pr_err("%s: failed to allocate pagetable ops\n", __func__);
+		return -EINVAL;
+	}
+
+	smmu_dom->pgtbl_ops = pgtable_ops;
+	if (kiumd_smmuv2_set_ttbr1_cfg(smmu_dom, &cfg) < 0) {
+		pr_err("%s: failed to set TTBR1 cfg\n", __func__);
+		free_io_pgtable_ops(pgtable_ops);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/**
+ * kiumd_perprocess_set_ttbr1_context - Configure TTTBR0 settings
+ * for a specific vfio device(as of now used by GPU)
+ * ARM SMMU for the specified device.
+ * @arg: User-provided argument pointer
+ *
+ * This function allocates a pagetable and invokes the function to program
+ * TTBR0 for the specified VFIO device's SMMU domain. It also configures
+ * the aperture for the specified vfio device through an scm call.
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+
+static int kiumd_set_pgtble_ttbr0_context(struct iommu_domain *iommu_dom)
+{
 	struct io_pgtable_cfg cfg;
 	struct arm_smmu_domain *smmu_dom;
-	struct iommu_domain *iommu_dom;
-	int cbindx, ret;
-	void *cookie;
-
-	if (copy_from_user(&kismmu_pproc, arg, sizeof(struct kiumd_smmu_user)))
-		return -EFAULT;
-
-	if (kismmu_pproc.vfio_fd < 0) {
-		pr_err("%s: Invalid fd from user\n", __func__);
-		return -EBADF;
-	}
-
-	file = fget(kismmu_pproc.vfio_fd);
-	if (!file) {
-		pr_err("%s:failed to get file from vfio fd\n", __func__);
-		return -EBADF;
-	}
-	df = (struct vfio_device_file *)file->private_data;
-	vfio_dev = (struct vfio_device *)df->device;
-	if (!vfio_dev) {
-		pr_err("%s:vfio_dev is NULL\n", __func__);
-		fput(file);
-		return -EINVAL;
-	}
-
-	iommu_dom = kiumd_iommu_get_dma_domain(vfio_dev->dev);
-	if (!iommu_dom) {
-		pr_err("%s:iommu domain is NULL\n", __func__);
-		fput(file);
-		return -EINVAL;
-	}
+	struct io_pgtable_ops *pgtable_ops;
+	int ret;
 
 	smmu_dom = container_of(iommu_dom, struct arm_smmu_domain, domain);
 	if ((!smmu_dom) || (!(smmu_dom->pgtbl_ops))) {
 		pr_err("%s:smmu domain/pagetable ops is invalid\n", __func__);
-		fput(file);
 		return -EINVAL;
 	}
 
@@ -607,37 +692,88 @@ int kiumd_perprocess_set_user_context(char __user *arg)
 		pgtable = io_pgtable_ops_to_pgtable(smmu_dom->pgtbl_ops);
 		if (!pgtable) {
 			pr_err("%s:pagetable is NULL\n", __func__);
-			fput(file);
 			return -EINVAL;
 		}
 	}
 
-	cbindx = smmu_dom->cfg.cbndx;
 	memcpy(&cfg, &pgtable->cfg, sizeof(struct io_pgtable_cfg));
 	cfg.quirks &= ~IO_PGTABLE_QUIRK_ARM_TTBR1;
 	cfg.tlb = &kgsl_iopgtbl_tlb_ops;
 	/*Allocate a default pagetable for TTBR0 in case per process allocation fails*/
-	kismmu_pproc.pgtbl_ops_ptr = (long)alloc_io_pgtable_ops(ARM_64_LPAE_S1, &cfg, NULL);
-	if (!kismmu_pproc.pgtbl_ops_ptr) {
+	pgtable_ops = alloc_io_pgtable_ops(ARM_64_LPAE_S1, &cfg, NULL);
+	if (!pgtable_ops) {
 		pr_err("%s:failed to allocate pagetable ops.\n", __func__);
-		fput(file);
 		return -ENOMEM;
 	}
 
-	cookie = (void *)smmu_dom;
-	kiumd_smmuv2_set_ttbr0_cfg(cookie, &cfg);
-	ret = qcom_scm_kgsl_set_smmu_aperture(cbindx);
+	kiumd_smmuv2_set_ttbr0_cfg(smmu_dom, &cfg);
+	ret = qcom_scm_kgsl_set_smmu_aperture(smmu_dom->cfg.cbndx);
 	if (ret == -EBUSY)
-		ret = qcom_scm_kgsl_set_smmu_aperture(cbindx);
+		ret = qcom_scm_kgsl_set_smmu_aperture(smmu_dom->cfg.cbndx);
 
 	if (ret) {
-		pr_err("%s:Setting smmu aperture error.\n", __func__);
-		fput(file);
+		pr_err("%s:Setting smmu aperture error: %d\n", __func__, ret);
+		free_io_pgtable_ops(pgtable_ops);
 		return ret;
 	}
 
-	fput(file);
 	return 0;
+}
+
+/**
+ * kiumd_set_pgtbl_context - Set the page table context for an SMMU device.
+ * @arg: User-provided pointer to a struct kiumd_smmu_user containing context information
+ *
+ * This function sets the page table context for an SMMU device based on user-provided
+ * information. It validates the VFIO file descriptor, retrieves the VFIO device,
+ * and obtains the IOMMU domain. Depending on the context flags, it configures the
+ * appropriate page table settings.
+ *
+ * Return:
+ *   0 on success, negative error code on failure.
+ */
+
+static int kiumd_set_pgtbl_context(char __user *arg)
+{
+	struct kiumd_smmu_user pgtbl_ctx;
+	struct vfio_device *vfio_dev;
+	struct iommu_domain *iommu_dom;
+	int ret;
+
+	if (copy_from_user(&pgtbl_ctx, arg, sizeof(struct kiumd_smmu_user)))
+		return -EFAULT;
+
+	if (pgtbl_ctx.vfio_fd < 0) {
+		pr_err("%s: Invalid fd from user\n", __func__);
+		return -EBADF;
+	}
+
+	vfio_dev = kiumd_get_vfio_device(pgtbl_ctx.vfio_fd);
+	if (!vfio_dev) {
+		pr_err("%s: vfio_dev is NULL\n", __func__);
+		return -EINVAL;
+	}
+
+	iommu_dom = kiumd_iommu_get_dma_domain(vfio_dev->dev);
+	if (!iommu_dom) {
+		pr_err("%s: iommu domain is NULL\n", __func__);
+		return -EINVAL;
+	}
+
+	switch (pgtbl_ctx.flags) {
+	case KIUMD_SMMU_SET_TTBR0_CONFIG:
+		ret = kiumd_set_pgtble_ttbr0_context(iommu_dom);
+		break;
+	case KIUMD_SMMU_SET_TTBR1_CONFIG:
+		ret = kiumd_set_pgtble_ttbr1_context(iommu_dom);
+		break;
+	default:
+		pr_err("%s: Invalid flags: %d\n", __func__, pgtbl_ctx.flags);
+		ret = -ENOTTY;
+		break;
+	}
+
+	return ret;
 }
 
 /**
@@ -1473,6 +1609,10 @@ int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 		dma_unmap_sgtable(vfio_dev->dev, sgtable, kiumd_dma_direction, DMA_ATTR_PRIVILEGED);
 		fput(file);
 	} else {
+		if(!smap->sgt_ptr) {
+			pr_err("%s: smap->sgt_ptr is NULL\n", __func__);
+			return -EINVAL;
+		}
 		dma_buf_unmap_attachment_unlocked(dmabufattach, (struct sg_table *)smap->sgt_ptr,
 									kiumd_dma_direction);
 
@@ -1582,7 +1722,7 @@ int kiumd_iova_ctrl(char __user *arg)
 *
 * Returns  handle/fd upon success and error codes on failure
 */
-int kiumd_fd_dmabuf_handler(char __user *arg)
+int kiumd_fd_dmabuf_handler(char __user *arg, struct file *fp)
 {
 	struct kiumd_user kiusr;
 	struct dma_buf *kiumd_dmabuf = NULL;
@@ -1595,6 +1735,13 @@ int kiumd_fd_dmabuf_handler(char __user *arg)
 	bool handle_available = false;
 	struct dma_buf_handle *dmabuf_handle = NULL;
 	struct dma_buf_handle *dmabuf_xarray_entry = NULL;
+	struct kiumd_ctx *kiumd_ctx = NULL;
+
+	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
+	if (!kiumd_ctx) {
+		pr_err("%s:kiumd ctx is NULL \n", __func__);
+		return -EINVAL;
+	}
 
 	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user))) {
 		pr_err("%s: copy_from_user failed\n", __func__);
@@ -1609,26 +1756,23 @@ int kiumd_fd_dmabuf_handler(char __user *arg)
 			return -EBADF;
 		}
 
+		mutex_lock(&kiumd_ctx->kiumd_xa_mutex);
 		/* Retrieve struct dma_buf from FD*/
 		dmabuf  = (unsigned long) dma_buf_get(kiusr.dma_buf_fd);
 		if (((struct dma_buf *) dmabuf) == NULL) {
 			pr_err("%s: dma_buf_get returns NULL\n", __func__);
+			mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
 			return -EINVAL;
 		}
 
 		/* Check if handle for buffer already exists, RCU lock acquired*/
-		xa_for_each(&kiumd_xa, xa_index, xa_entry) {
+		xa_for_each(&kiumd_ctx->kiumd_xa, xa_index, xa_entry) {
 			dmabuf_xarray_entry = (struct dma_buf_handle *) xa_entry;
 			if (dmabuf_xarray_entry->dmabuf == dmabuf) {
 				handle_available = true;
 				local_id = xa_index;
 				atomic_inc(&dmabuf_xarray_entry->handle_refcount);
-				ret = xa_store(&kiumd_xa, xa_index, dmabuf_xarray_entry, GFP_KERNEL);
-				if (xa_is_err(ret)) {
-					pr_err("%s: xa_store failed\n", __func__);
-					dma_buf_put((struct dma_buf *) dmabuf);
-					return xa_err(ret);
-				}
+				break; //Handle found, exit the loop
 			}
 		}
 
@@ -1637,76 +1781,82 @@ int kiumd_fd_dmabuf_handler(char __user *arg)
 			dmabuf_handle = kzalloc(sizeof(struct dma_buf_handle), GFP_KERNEL);
 			if (!dmabuf_handle) {
 				pr_err("%s: kzalloc failed.\n", __func__);
+				dma_buf_put((struct dma_buf *) dmabuf);
+				mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
 				return -ENOMEM;
 			}
-
 			dmabuf_handle->dmabuf = dmabuf;
-			atomic_inc(&dmabuf_handle->handle_refcount);
-			err = xa_alloc(&kiumd_xa, &local_id, dmabuf_handle, xa_limit_32b, GFP_KERNEL);
+			atomic_set(&dmabuf_handle->handle_refcount, 1);
+			err = xa_alloc(&kiumd_ctx->kiumd_xa, &local_id, (void *)dmabuf_handle, xa_limit_32b, GFP_KERNEL);
 			if (err < 0) {
 				pr_err("%s:xarray alloc failure %d\n", __func__, err);
 				dma_buf_put((struct dma_buf *) dmabuf);
+				kfree(dmabuf_handle);
+				mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
 				return err;
 			}
 		}
 
 		kiumd_dmabuf = (struct dma_buf *) dmabuf;
 		kiusr.handle = local_id;
+		mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
 	} else if (kiusr.dma_buf_fd == HANDLE_TO_FD) { /* Handle to FD */
-
 		if (kiusr.handle < 0) {
 			pr_err("%s: dmabuf handle is invalid\n", __func__);
 			return -EINVAL;
 		}
-
+		mutex_lock(&kiumd_ctx->kiumd_xa_mutex);
 		local_id = kiusr.handle;
-		dmabuf_handle = xa_load(&kiumd_xa, local_id);
+		dmabuf_handle = xa_load(&kiumd_ctx->kiumd_xa, local_id);
 		if (!dmabuf_handle) {
 			pr_err("%s: dmabuf_handle is NULL\n", __func__);
+			mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
 			return -EINVAL;
 		}
 
-		if (!IS_ERR_OR_NULL(dmabuf_handle->dmabuf)) {
+		if (!IS_ERR_OR_NULL((struct dma_buf *) dmabuf_handle->dmabuf)) {
 			kiusr.dma_buf_fd = dma_buf_fd((struct dma_buf *) dmabuf_handle->dmabuf, (O_CLOEXEC));
 		}
 		if (kiusr.dma_buf_fd < 0) {
 			pr_err("%s:dma_buf_fd failed\n", __func__);
+			mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
 			return -EBADF;
 		}
-
 		get_dma_buf((struct dma_buf *) dmabuf_handle->dmabuf);
+		mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
 
 	} else if (kiusr.dma_buf_fd == CLOSE_HANDLE) {  /* Close Handle */
-
 		if (kiusr.handle < 0) {
 			pr_err("%s: Invalid dma buf handle.\n", __func__);
 			return -EINVAL;
 		}
 
+		mutex_lock(&kiumd_ctx->kiumd_xa_mutex);
 		local_id = (int32_t)kiusr.handle;
-		dmabuf_handle = xa_load(&kiumd_xa, local_id);
+
+		dmabuf_handle = xa_load(&kiumd_ctx->kiumd_xa, local_id);
 		if (!dmabuf_handle) {
 			pr_err("%s:Entry not available in xarray\n", __func__);
+			mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
 			return -EINVAL;
 		}
 
 		kiumd_dmabuf = ((struct dma_buf *)dmabuf_handle->dmabuf);
 		if (atomic_dec_and_test(&dmabuf_handle->handle_refcount)) {
-			xa_erase(&kiumd_xa, local_id);
-			kfree(dmabuf_handle);
-		}
 
-		else {
-			ret = xa_store(&kiumd_xa, local_id, dmabuf_handle, GFP_KERNEL);
-			if (xa_is_err(ret)) {
-				pr_err("%s: xa_store failed in close handle\n", __func__);
-				return xa_err(ret);
+			if (!IS_ERR_OR_NULL(kiumd_dmabuf))
+				dma_buf_put(kiumd_dmabuf);
+			xa_erase(&kiumd_ctx->kiumd_xa, local_id);
+			if (!dmabuf_handle) {
+				kfree(dmabuf_handle);
+				dmabuf_handle = NULL;
 			}
+		} else {
+			if (!IS_ERR_OR_NULL(kiumd_dmabuf))
+				dma_buf_put(kiumd_dmabuf);
 		}
-
-		if (!IS_ERR_OR_NULL(kiumd_dmabuf))
-			dma_buf_put(kiumd_dmabuf);
 		kiusr.dma_buf_fd = 0;
+		mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
 	}
 	if (copy_to_user(arg, &kiusr, sizeof(kiusr))) {
 		pr_err("%s: copy_to_user failed...\n", __func__);
@@ -2882,6 +3032,9 @@ static int kiumd_open(struct inode *inode, struct file *filp)
 	kictx->id = 0;
 	hash_init(kictx->smmu_table);
 	spin_lock_init(&kictx->smmu_lock);
+	xa_init(&kictx->kiumd_xa);
+	mutex_init(&kictx->kiumd_xa_mutex);
+	xa_init_flags(&kictx->kiumd_xa, XA_FLAGS_ALLOC);
 	filp->private_data = kictx;
 
 	return 0;
@@ -2904,6 +3057,11 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 	struct kiumd_ctx *ki_ctx = (struct kiumd_ctx *)filp->private_data;
 	struct smmu_map_data *smap;
 	int iter;
+	void *xa_entry;
+	unsigned long xa_index;
+	struct dma_buf_handle *dmabuf_handle = NULL;
+	struct dma_buf *kiumd_dmabuf = NULL;
+	int count;
 
 	if (!ki_ctx) {
 		pr_err("%s:kiumd ctx is NULL\n", __func__);
@@ -2925,9 +3083,132 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 		}
 	}
 	spin_unlock(&ki_ctx->smmu_lock);
+	if (ki_ctx->res_mem_area)
+		kfree(ki_ctx->res_mem_area);
+	mutex_lock(&ki_ctx->kiumd_xa_mutex);
+	if (!xa_empty(&ki_ctx->kiumd_xa)) {
+		xa_for_each(&ki_ctx->kiumd_xa, xa_index, xa_entry) {
+			dmabuf_handle = (struct dma_buf_handle *) xa_entry;
+			if (!dmabuf_handle) {
+				pr_err("%s:Entry not available in xarray\n", __func__);
+				continue;
+			}
+			kiumd_dmabuf = ((struct dma_buf *)dmabuf_handle->dmabuf);
+			count = atomic_read(&dmabuf_handle->handle_refcount);
+			if (!IS_ERR_OR_NULL(kiumd_dmabuf)) {
+				while (count > 0) {
+					dma_buf_put(kiumd_dmabuf);
+					count--;
+				}
+			}
+			kfree(dmabuf_handle);
+		}
+		xa_destroy(&ki_ctx->kiumd_xa);
+	}
+	mutex_unlock(&ki_ctx->kiumd_xa_mutex);
+
 	kfree(ki_ctx);
 
 	return 0;
+}
+
+/**
+* @Brief: This function facilitates to
+* initialise the context of the device.
+* Currently it reads the Device tree to check if the
+* device has any reserved regions and stores the information
+* of reserved memory regions internally.
+*
+* Parameters:
+* @arg: User space argument ptr
+* @fp: file ptr for device context
+*
+* return value is errno in failure cases
+* or 0 in case of success
+*/
+static int kiumd_vfio_ctx_init(char __user *arg, struct file *fp)
+{
+	struct kiumd_dev_mem_info kiusr;
+	int ret = 0;
+	struct vfio_device *vfio_dev;
+	struct kiumd_ctx *kiumd_ctx = NULL;
+	struct device_node *np;
+	struct device_node *mem_np;
+	struct resource res;
+	int index = 0;
+
+	if (!fp) {
+		pr_err("%s:file ptr returns NULL\n", __func__);
+		return -EINVAL;
+	}
+
+	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
+	if (!kiumd_ctx) {
+		pr_err("%s:kiumd ctx is NULL\n", __func__);
+		return -EINVAL;
+	}
+
+	if (copy_from_user(&kiusr, arg, sizeof(kiusr))) {
+		pr_err("%s:%d invalid args from user\n", __func__, __LINE__);
+		return -EINVAL;
+	}
+
+	vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
+	if (!vfio_dev) {
+		pr_err("%s:%d invalid vfio device fd\n", __func__, __LINE__);
+		return -EINVAL;
+	}
+
+	if (!vfio_dev->dev)
+		return -EINVAL;
+
+	np = dev_of_node(vfio_dev->dev);
+	if (!np) {
+		pr_debug("No memory-region specified\n");
+		return -EINVAL;
+	}
+
+	kiumd_ctx->num_reserved_regions = of_property_count_elems_of_size(np,
+									  "memory-region",
+									  sizeof(phandle));
+	if (kiumd_ctx->num_reserved_regions <= 0) {
+		pr_err("no reserved mem areas\n");
+		return -EINVAL;
+	}
+
+	kiumd_ctx->res_mem_area = kcalloc((kiumd_ctx->num_reserved_regions + 1),
+					  sizeof(struct kiumd_reserved_mem_area),
+					  GFP_KERNEL);
+	if (!kiumd_ctx->res_mem_area)
+		return -EINVAL;
+
+	kiusr.num_regions = kiumd_ctx->num_reserved_regions;
+	for (int i = 0; i < kiusr.num_regions; i++) {
+		mem_np = of_parse_phandle(vfio_dev->dev->of_node, "memory-region", i);
+		if (!mem_np)
+			continue;
+
+		ret = of_address_to_resource(mem_np, i, &res);
+		if (ret) {
+			of_node_put(mem_np);
+			pr_debug("No memory address assigned to the reserved region\n");
+			kfree(kiumd_ctx->res_mem_area);
+			return -EINVAL;
+		}
+
+		of_node_put(mem_np);
+		kiumd_ctx->res_mem_area[i].size = resource_size(&res);
+		kiumd_ctx->res_mem_area[i].base = res.start;
+		kiusr.mem_info[i].size = resource_size(&res);
+		kiusr.mem_info[i].offset = 0;
+	}
+
+	if (copy_to_user(arg, &kiusr, sizeof(kiusr))) {
+		kfree(kiumd_ctx->res_mem_area);
+		pr_err("%s:error in copying vfio ctx data for reserved memory:%d\n", __func__, ret);
+		ret = -EFAULT;
+	}
+	return ret;
 }
 
 /**
@@ -2959,8 +3240,8 @@ static long kiumd_ioctl(struct file *file, unsigned int cmd,
 	case KIUMD_IOVA_MAP_CTRL:
 		err = kiumd_iova_ctrl(argp);
 		break;
-	case KIUMD_SET_USER_CONTEXT:
-		err = kiumd_perprocess_set_user_context(argp);
+	case KIUMD_SET_PGTBL_CONTEXT:
+		err = kiumd_set_pgtbl_context(argp);
 		break;
 	case KIUMD_PER_PROCESS_ALLOC:
 		err = kiumd_perprocess_pt_alloc(argp);
@@ -2972,7 +3253,7 @@ static long kiumd_ioctl(struct file *file, unsigned int cmd,
 		err = kiumd_perprocess_pgtble_free(argp);
 		break;
 	case KIUMD_FD_DMABUF_HANDLE:
-		err = kiumd_fd_dmabuf_handler(argp);
+		err = kiumd_fd_dmabuf_handler(argp, file);
 		break;
 	case KIUMD_CUSTOM_IOVA_INIT:
 		err = kiumd_dmabuf_custom_iova_init(argp);
@@ -2998,6 +3279,10 @@ static long kiumd_ioctl(struct file *file, unsigned int cmd,
 	case KIUMD_SMMU_FAULT_HANDLE_DEREGISTER:
 		err = kiumd_smmu_fault_handler_deregister(argp);
 		break;
+	case KIUMD_VFIO_CTX_INIT:
+		pr_debug("kiumd vfio ctx init\n");
+		err = kiumd_vfio_ctx_init(argp, file);
+		break;
 	default:
 		err = -ENOTTY;
 		break;
@@ -3006,11 +3291,68 @@ static long kiumd_ioctl(struct file *file, unsigned int cmd,
 	return err;
 }
 
+/**
+* @Brief: This function facilitates to
+* map a reserved DDR region as normal memory
+* in user space
+*
+* Parameters:
+* @file: file ptr
+* @vma : pointer to struct vma
+*
+* return value is errno in failure cases
+* or 0 in case of success
+*/
+static int kiumd_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	struct kiumd_ctx *ki_ctx;
+	u64 req_len, index, req_start;
+	int ret;
+
+	if (!file) {
+		pr_err("%s:file ptr returns NULL\n", __func__);
+		return -EINVAL;
+	}
+
+	ki_ctx = (struct kiumd_ctx *)file->private_data;
+	if (!ki_ctx) {
+		pr_err("%s:kiumd ctx is NULL\n", __func__);
+		return -EINVAL;
+	}
+
+	if (!ki_ctx->res_mem_area)
+		return -EINVAL;
+
+	if (vma->vm_end < vma->vm_start)
+		return -EINVAL;
+
+	if (ki_ctx->num_reserved_regions <= vma->vm_pgoff)
+		return -EINVAL;
+
+	if (ki_ctx->res_mem_area[index].base & ~PAGE_MASK)
+		return -EINVAL;
+
+	req_len = vma->vm_end - vma->vm_start;
+	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+	index = vma->vm_pgoff;
+
+	pr_debug("%s:res mem start:%llx End:%llx size:%llu vma start:%lx vma end:%lx size:%lu offset:%d\n",
+			__func__, ki_ctx->res_mem_area[index].base,
+			ki_ctx->res_mem_area[index].base + ki_ctx->res_mem_area[index].size,
+			ki_ctx->res_mem_area[index].size, vma->vm_start,
+			vma->vm_end, vma->vm_end - vma->vm_start, vma->vm_pgoff);
+
+	return remap_pfn_range(vma, vma->vm_start,
+				ki_ctx->res_mem_area[index].base >> PAGE_SHIFT,
+				req_len, vma->vm_page_prot);
+}
+
 static const struct file_operations kiumd_fops = {
 	.open = kiumd_open,
 	.unlocked_ioctl = kiumd_ioctl,
 	.compat_ioctl = kiumd_ioctl,
 	.release = kiumd_close,
+	.mmap = kiumd_mmap,
 };
 
 /**

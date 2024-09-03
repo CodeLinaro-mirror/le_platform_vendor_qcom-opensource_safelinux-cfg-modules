@@ -101,6 +101,20 @@ static int do_power_operation(scmi_oper_ioctl_t *req,
 	return ret >= 0 ? 0 : ret;
 }
 
+static int dev_pm_opp_apply_level(struct device *dev, unsigned int level)
+{
+	struct dev_pm_opp *opp = dev_pm_opp_find_level_exact(dev, level);
+	int ret = 0;
+
+	if (IS_ERR(opp))
+		return -EINVAL;
+
+	ret = dev_pm_opp_set_opp(dev, opp);
+	dev_pm_opp_put(opp);
+
+	return ret;
+}
+
 static int do_performance_operation(scmi_oper_ioctl_t *req,
 				    struct qcom_uscmi_dev *uscmi)
 {
@@ -120,7 +134,7 @@ static int do_performance_operation(scmi_oper_ioctl_t *req,
 
 	switch(req->oper) {
 	  case SCMI_PRF_LVL_SET:
-		ret = dev_pm_opp_set_level(dev, req->level);
+		ret = dev_pm_opp_apply_level(dev, req->level);
 		break;
 
 	  default:
@@ -296,6 +310,7 @@ static struct platform_driver qcom_uscmi_driver = {
 		.name = "qcom-uscmi",
 		.pm = &qcom_uscmi_pm_ops,
 		.of_match_table = qcom_uscmi_match_table,
+		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
 	},
 	.probe = qcom_uscmi_probe,
 };

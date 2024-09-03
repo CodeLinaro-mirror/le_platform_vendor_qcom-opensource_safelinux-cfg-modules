@@ -3,6 +3,7 @@
  */
 #include <linux/arm-smccc.h>
 #include <linux/cdev.h>
+#include <linux/dma-buf.h>
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/miscdevice.h>
@@ -12,8 +13,12 @@
 #include <linux/platform_device.h>
 #include <linux/types.h>
 #include <linux/firmware/qcom/qcom_scm.h>
+#include <linux/version.h>
 #include <uapi/misc/scm_user_intf.h>
-#include <linux/dma-buf.h>
+
+#if (LINUX_VERSION_CODE != KERNEL_VERSION(5, 14, 0))
+#include <qcom_scm.h>
+#endif
 
 #define ARG_TO_ARRAY(type, ...) ((type[]) {__VA_ARGS__})
 
@@ -25,6 +30,10 @@
 		.num_cmd = (__u32)num_of_cmds,                  \
 		.cmd_ids = ARG_TO_ARRAY(__u32, __VA_ARGS__),        \
 	}
+
+struct scm_user_res {
+	u64 result[MAX_QCOM_SCM_RETS];
+};
 
 struct svc_cmd_list {
 	__u32 svc_id;
@@ -82,6 +91,10 @@ static const struct svc_cmd_list sip_tbl[] = {
 	[QCOM_SCM_SVC_SAFETY] = SVC_CMD_GRP(QCOM_SCM_SVC_SAFETY,
 					    1,
 					    QCOM_SCM_SAFETY_ENABLE_FFI_ID),
+
+	[QCOM_SCM_SVC_LMH] = SVC_CMD_GRP(QCOM_SCM_SVC_LMH,
+					    1,
+					    QCOM_SCM_LMH_LIMIT_PROFILE_CHANGE),
 };
 
 /*
@@ -93,6 +106,7 @@ static const struct svc_cmd_dma_list dma_fd_tbl[] = {
 
 };
 
+#if (LINUX_VERSION_CODE == KERNEL_VERSION(5, 14, 0))
 int qcom_scm_kgsl_set_smmu_aperture(unsigned int num_context_bank);
 
 int qcom_scm_kgsl_set_smmu_aperture(unsigned int num_context_bank)
@@ -113,6 +127,29 @@ int qcom_scm_kgsl_set_smmu_aperture(unsigned int num_context_bank)
 	return qcom_scm_call(__scm_dev->dev, &desc, NULL);
 }
 EXPORT_SYMBOL(qcom_scm_kgsl_set_smmu_aperture);
+
+int qcom_scm_ddrbw_profiler(uint64_t in_buf,
+    size_t in_buf_size, uint64_t out_buf, size_t out_buf_size)
+{
+	int ret;
+	struct qcom_scm_desc desc = {
+		.svc = QCOM_SCM_SVC_INFO,
+		.cmd = TZ_SVC_BW_PROF_ID,
+		.owner = ARM_SMCCC_OWNER_SIP,
+	};
+
+	desc.args[0] = in_buf;
+	desc.args[1] = in_buf_size;
+	desc.args[2] = out_buf;
+	desc.args[3] = out_buf_size;
+	desc.arginfo = QCOM_SCM_ARGS(4, QCOM_SCM_RW, QCOM_SCM_VAL, QCOM_SCM_RW,
+				 QCOM_SCM_VAL);
+	ret = qcom_scm_call(__scm_dev->dev, &desc, NULL);
+
+	return ret;
+}
+EXPORT_SYMBOL(qcom_scm_ddrbw_profiler);
+#endif
 
 static int get_pa_from_dmabuf_fd(struct dma_buf* dma_buf, u64 *p_addr)
 {
@@ -217,6 +254,7 @@ static bool validate_svc_cmd(unsigned int svc_id, unsigned int cmd_id)
 	case QCOM_SCM_SVC_MP:
 	case QCOM_SCM_SVC_SHE:
 	case QCOM_SCM_SVC_SAFETY:
+	case QCOM_SCM_SVC_LMH:
 
 		svc_cmd_tmp = sip_tbl[svc_id];
 		break;
@@ -249,8 +287,13 @@ static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	struct platform_device *scm_pdev = dev_data->scm_pdev;
 	void __user *ip = (void __user *)arg;
 	struct scm_hand_shake scm_data;
+#if (LINUX_VERSION_CODE == KERNEL_VERSION(5, 14, 0))
 	struct qcom_scm_desc desc;
 	struct qcom_scm_res res;
+#else
+	struct scm_user_res res;
+#endif
+
 	int id, i, no_of_args, no_dma_fds, ret = 0;
 	u32 dma_fd_args[MAX_QCOM_SCM_ARGS];
 
@@ -267,31 +310,126 @@ static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return -EINVAL;
 	}
 
-	desc.svc = scm_data.svc;
-	desc.cmd = scm_data.cmd;
-	desc.owner = ARM_SMCCC_OWNER_SIP;
-
 	// Validate number of args
 	no_of_args = scm_data.arginfo & 0x0F;
 	if (no_of_args > MAX_QCOM_SCM_ARGS)
 		ret = -EINVAL;
 
+        no_dma_fds = get_dmafd_args(scm_data.svc, scm_data.cmd, dma_fd_args);
+        if (no_dma_fds > 0) {
+                //translate fd to pa
+                ret = translate_fd_to_pa(dma_fd_args, no_dma_fds, scm_data.args_buffer);
+                if (ret)
+                        return ret;
+        }
+
+#if (LINUX_VERSION_CODE != KERNEL_VERSION(5, 14, 0))
+	switch(scm_data.svc) {
+	case QCOM_SCM_SVC_BOOT:
+		switch(scm_data.cmd) {
+		case QCOM_SCM_BOOT_SET_REMOTE_STATE:
+			scm_data.ret = qcom_scm_set_remote_state(scm_data.args_buffer[0],
+							         scm_data.args_buffer[1]);
+			break;
+		}
+		break;
+
+	case QCOM_SCM_SVC_PIL:
+		switch(scm_data.cmd) {
+		case QCOM_SCM_PIL_PAS_INIT_IMAGE:
+			void *data;
+			__u32 meta_len = scm_data.args_buffer[2];
+
+			data = memremap((void *)scm_data.args_buffer[1], meta_len, MEMREMAP_WB);
+			if(!data)
+				return -ENOMEM;
+
+			scm_data.ret = qcom_scm_pas_init_image(scm_data.args_buffer[0],
+							       data, meta_len, NULL);
+			if(data)
+				memunmap(data);
+			break;
+		case QCOM_SCM_PIL_PAS_MEM_SETUP:
+			scm_data.ret = qcom_scm_pas_mem_setup(scm_data.args_buffer[0],
+							      scm_data.args_buffer[1],
+							      scm_data.args_buffer[2]);
+			break;
+		case QCOM_SCM_PIL_PAS_AUTH_AND_RESET:
+			scm_data.ret = qcom_scm_pas_auth_and_reset(scm_data.args_buffer[0]);
+			break;
+		case QCOM_SCM_PIL_PAS_SHUTDOWN:
+			scm_data.ret = qcom_scm_pas_shutdown(scm_data.args_buffer[0]);
+			break;
+		}
+		break;
+
+	case QCOM_SCM_SVC_INFO:
+		switch(scm_data.cmd) {
+		case QCOM_SCM_INFO_GET_FEAT_VERSION_CMD:
+			scm_data.ret = qcom_scm_get_tz_feat_id_version(scm_data.args_buffer[0], NULL);
+			break;
+		case  QCOM_SCM_INFO_BW_PROF_ID:
+			scm_data.ret = qcom_scm_ddrbw_profiler(scm_data.args_buffer[0],
+							       scm_data.args_buffer[1],
+							       scm_data.args_buffer[2],
+							       scm_data.args_buffer[3]);
+			break;
+		}
+		break;
+
+	case QCOM_SCM_SVC_MP:
+		switch(scm_data.cmd) {
+		case QCOM_SCM_MP_VIDEO_VAR:
+			scm_data.ret = qcom_scm_mem_protect_video_var(scm_data.args_buffer[0],
+								      scm_data.args_buffer[1],
+								      scm_data.args_buffer[2],
+								      scm_data.args_buffer[3]);
+			break;
+		}
+		break;
+
+	case QCOM_SCM_SVC_SHE:
+		switch(scm_data.cmd) {
+		case QCOM_SCM_SHE_ID:
+			scm_data.ret = qcom_scm_she_op(scm_data.args_buffer[0],
+						       scm_data.args_buffer[1],
+						       scm_data.args_buffer[2],
+						       scm_data.args_buffer[3]);
+			break;
+		}
+		break;
+
+	case QCOM_SCM_SVC_LMH:
+		switch(scm_data.cmd) {
+		case QCOM_SCM_LMH_LIMIT_PROFILE_CHANGE:
+			scm_data.ret = qcom_scm_lmh_profile_change(scm_data.args_buffer[0]);
+			break;
+		}
+		break;
+	}
+
+#else
+	desc.svc = scm_data.svc;
+	desc.cmd = scm_data.cmd;
+	desc.owner = ARM_SMCCC_OWNER_SIP;
 	desc.arginfo = scm_data.arginfo;
 
 	for (id = 0; id < no_of_args; id++)
 		desc.args[id] = scm_data.args_buffer[id];
 
-        no_dma_fds = get_dmafd_args(desc.svc, desc.cmd, dma_fd_args);
-        if (no_dma_fds > 0) {
-                //translate fd to pa
-                ret = translate_fd_to_pa(dma_fd_args, no_dma_fds, desc.args);
-                if (ret)
-                        return ret;
-        }
+	// Special case for PIL_INIT_IMAGE, to remove metadata length
+	if (desc.cmd == QCOM_SCM_PIL_PAS_INIT_IMAGE) {
+		desc.arginfo = 0x82;
+		desc.args[2] = 0;
+	}
 
 	scm_data.ret = qcom_scm_call(&scm_pdev->dev, &desc, &res);
-	if (scm_data.ret)
+#endif
+
+	if (scm_data.ret) {
 		dev_err(dev_data->dev, "scm ioctl failed - ret : %d\n", scm_data.ret);
+		return scm_data.ret;
+	}
 
 	for (i = 0; i < MAX_QCOM_SCM_RETS; i++)
 		scm_data.qcom_scm_res[i] = res.result[i];
@@ -333,6 +471,9 @@ static int qcom_scm_intf_probe(struct platform_device *pdev)
 
 	__scm_dev = dev_data;
 	__scm_dev->dev = dev_data->dev;
+
+	if (!qcom_scm_is_available())
+		dev_err_probe(dev_data->dev, -EPROBE_DEFER, "qcom_scm is not up!\n");
 
 	platform_set_drvdata(pdev, dev_data);
 	return 0;
