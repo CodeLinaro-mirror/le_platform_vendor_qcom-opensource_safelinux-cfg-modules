@@ -292,6 +292,7 @@ static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	struct qcom_scm_res res;
 #else
 	struct scm_user_res res;
+	u64 res1 = 0;
 #endif
 
 	int id, i, no_of_args, no_dma_fds, ret = 0;
@@ -394,7 +395,9 @@ static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			scm_data.ret = qcom_scm_she_op(scm_data.args_buffer[0],
 						       scm_data.args_buffer[1],
 						       scm_data.args_buffer[2],
-						       scm_data.args_buffer[3]);
+						       scm_data.args_buffer[3],
+						       &res1);
+			res.result[0] = res1;
 			break;
 		}
 		break;
