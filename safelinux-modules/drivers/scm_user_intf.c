@@ -337,6 +337,7 @@ static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case QCOM_SCM_SVC_PIL:
 		switch(scm_data.cmd) {
 		case QCOM_SCM_PIL_PAS_INIT_IMAGE:
+		{
 			void *data;
 			__u32 meta_len = scm_data.args_buffer[2];
 
@@ -349,6 +350,8 @@ static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			if(data)
 				memunmap(data);
 			break;
+		}
+
 		case QCOM_SCM_PIL_PAS_MEM_SETUP:
 			scm_data.ret = qcom_scm_pas_mem_setup(scm_data.args_buffer[0],
 							      scm_data.args_buffer[1],
