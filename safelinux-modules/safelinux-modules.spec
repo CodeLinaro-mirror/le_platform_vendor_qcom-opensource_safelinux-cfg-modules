@@ -66,6 +66,7 @@ rm -rf $RPM_BUILD_ROOT
 %{_includedir}/uapi/misc/kiumd.h
 %{_includedir}/uapi/misc/scm_user_intf.h
 %{_includedir}/uapi/misc/qcom_uscmi.h
+%{_includedir}/safelinux_modules_trace.h
 
 %files
 %define kernel_module_path /lib/modules/%{kversion_with_debug}

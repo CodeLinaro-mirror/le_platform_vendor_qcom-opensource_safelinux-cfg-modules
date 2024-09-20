@@ -19,6 +19,8 @@ INSTALL_HDR=$(shell mkdir -p $(HDR_INSTAL_PATH)/linux; \
 			 $(PWD)/include/uapi/misc/kiumd.h $(HDR_INSTAL_PATH)/uapi/misc/kiumd.h; \
 			 $(KDIR)/scripts/headers_install.sh \
 			 $(PWD)/include/uapi/misc/scm_user_intf.h $(HDR_INSTAL_PATH)/uapi/misc/scm_user_intf.h; \
+			 $(KDIR)/scripts/headers_install.sh \
+			 $(PWD)/include/safelinux_modules_trace.h $(HDR_INSTAL_PATH)/safelinux_modules_trace.h; \
 			 [ -f $(HDR_INSTAL_PATH)/uapi/misc/kiumd.h ] && [ -f $(HDR_INSTAL_PATH)/uapi/misc/scm_user_intf.h ] && echo "passed" || echo "failed")
 
 all: clean modules
