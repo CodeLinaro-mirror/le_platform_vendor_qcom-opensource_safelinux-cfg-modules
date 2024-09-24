@@ -2,6 +2,7 @@
  * Copyright (C) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 #include <linux/types.h>
+#include <linux/version.h>
 
 #define SCM_HAND_SHAKE_IOCTL       _IOWR('R', 10, struct scm_hand_shake)
 
@@ -20,9 +21,22 @@
 #define QCOM_SCM_MP_CP_SMMU_APERTURE_ID         0x1b
 #define QCOM_SCM_CP_APERTURE_REG                0x0
 
+#define TZ_SVC_BW_PROF_ID			0x07
+
 #define MAX_QCOM_SCM_RESULT                     3
 #define MAX_QCOM_SCM_IN                         10
 
+struct scm_hand_shake {
+	__u32 svc;
+	__u32 cmd;
+	__u32 arginfo;
+	__u64 args_buffer[MAX_QCOM_SCM_IN];
+	__u32 ret;
+	__u32 arg_type;
+	__u64 qcom_scm_res[MAX_QCOM_SCM_RESULT];
+};
+
+#if (LINUX_VERSION_CODE ==  KERNEL_VERSION(5, 14, 0))
 enum qcom_scm_arg_types {
         QCOM_SCM_VAL,
         QCOM_SCM_RO,
@@ -45,19 +59,9 @@ enum qcom_scm_arg_types {
 
 #define QCOM_SCM_ARGS(...) QCOM_SCM_ARGS_IMPL(__VA_ARGS__, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
 
-struct scm_hand_shake {
-	__u32 svc;
-	__u32 cmd;
-	__u32 arginfo;
-	__u64 args_buffer[MAX_QCOM_SCM_IN];
-	__u32 ret;
-	__u32 arg_type;
-	__u64 qcom_scm_res[MAX_QCOM_SCM_RESULT];
-};
-
 int qcom_scm_kgsl_set_smmu_aperture(unsigned int num_context_bank);
 
-#define TZ_SVC_BW_PROF_ID	0x07
 
 extern int qcom_scm_ddrbw_profiler(uint64_t in_buf,
     size_t in_buf_size, uint64_t out_buf, size_t out_buf_size);
+#endif
