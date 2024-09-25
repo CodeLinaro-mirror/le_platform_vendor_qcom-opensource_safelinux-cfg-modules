@@ -310,6 +310,7 @@ static struct platform_driver qcom_uscmi_driver = {
 		.name = "qcom-uscmi",
 		.pm = &qcom_uscmi_pm_ops,
 		.of_match_table = qcom_uscmi_match_table,
+		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
 	},
 	.probe = qcom_uscmi_probe,
 };
