@@ -230,6 +230,7 @@ struct smmu_map_data {
 	int dma_dir;
 	int ptselect;
 	int is_iova_zero;
+	bool is_fixed_map;
 	struct vfio_device *vfio_dev;
 	void *context;
 	struct hlist_node node;
@@ -1290,6 +1291,25 @@ static void kiumd_mangle_sg_table(struct sg_table *sg_table)
 		sg->page_link ^= ~0xffUL;
 }
 
+/**
+* @Brief: This function facilitates to to check the fixed iova mapping  by
+* checking the cookie type for the vfio device.
+*
+* Parameters:
+* @vfio_dev: pointer for vfio device structure
+*
+* Returns true/false
+*/
+bool is_fixed_mapping(struct vfio_device *vfio_dev)
+{
+	struct kiumd_iommu_dma_cookie *cookie;
+
+	cookie = kiumd_get_dma_cookie(vfio_dev);
+	if (cookie->type == IOMMU_DMA_MSI_COOKIE)
+		return true;
+
+	return false;
+}
 
 /**
  * kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
@@ -1506,6 +1526,12 @@ int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 		ret = -ENOMEM;
 		goto fail_fput;
 	}
+
+	if (is_fixed_mapping(vfio_dev))
+		smap->is_fixed_map = true;
+	else
+		smap->is_fixed_map = false;
+
 	smap->dmabufattach = (long)dmabufattach;
 	smap->sgt_ptr = (long)sgt;
 	smap->dmabuf_ptr = (long)kiumd_dmabuf;
@@ -1574,6 +1600,7 @@ int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 	struct smmu_map_data *smap;
 	bool found = false;
 	struct kiumd_ctx *kiumd_ctx = NULL;
+	struct kiumd_iommu_dma_cookie *cookie;
 
 	if (!fp) {
 		pr_err("%s:file ptr returns NULL\n", __func__);
@@ -1645,6 +1672,20 @@ int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 		kiumd_dma_direction = kiusr.dma_direction;
 	else
 		kiumd_dma_direction = 0;
+
+	if (smap->is_fixed_map) {
+		cookie = kiumd_get_dma_cookie(vfio_dev);
+		if (!cookie) {
+			pr_err("%s failed to get cookie\n", __func__);
+			return -EINVAL;
+		}
+
+		ret = kiumd_set_dma_cookie_unlocked(cookie, 0, kiusr.dma_addr);
+		if (ret) {
+			pr_err("%s %d failed to set cookie\n", __func__, __LINE__);
+			return -EINVAL;
+		}
+	}
 
 	if ((kiusr.dma_attr == DMA_ATTR_PRIVILEGED) && (kiusr.is_iova_zero != FIXED_IOVA_AT_ZERO)) {
 		if (!(dmabufattach->priv)) {
