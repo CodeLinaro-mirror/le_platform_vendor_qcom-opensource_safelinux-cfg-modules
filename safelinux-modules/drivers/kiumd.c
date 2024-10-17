@@ -1861,6 +1861,13 @@ int kiumd_fd_dmabuf_handler(char __user *arg, struct file *fp)
 				mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
 				return err;
 			}
+		} else {
+			dmabuf_handle = xa_load(&kiumd_ctx->kiumd_xa, local_id);
+			if (!dmabuf_handle) {
+				pr_err("%s: dmabuf_handle is NULL\n", __func__);
+				mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
+				return -EINVAL;
+			}
 		}
 
 		kiumd_dmabuf = (struct dma_buf *) dmabuf;
