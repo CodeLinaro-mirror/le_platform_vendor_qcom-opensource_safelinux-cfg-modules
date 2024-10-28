@@ -77,8 +77,8 @@ struct smmu_device_obj {
 struct smmu_device_obj *head = NULL;
 
 
-/*No.of pages for 3GB IOVA space with 4K page size*/
-#define KGSL_PT_MEM_PAGES 0xC0000
+/*No.of pages for 6GB IOVA space with 4K page size*/
+#define KGSL_PT_MEM_PAGES 0x180000
 static DECLARE_BITMAP(global_map, KGSL_PT_MEM_PAGES);
 static DECLARE_BITMAP(perprocess_map, KGSL_PT_MEM_PAGES);
 
@@ -261,6 +261,7 @@ struct kiumd_ctx {
 	unsigned long pt_end_iova;
 	DECLARE_HASHTABLE(page_table, SMMU_MAPTABLE_SIZE);
 	unsigned long max_shift;
+	struct io_pgtable *pgtable;
 };
 
 struct pgtable_map {
@@ -301,8 +302,6 @@ struct smmu_map_data {
 	void *context;
 	struct hlist_node node;
 };
-
-static struct io_pgtable *pgtable;
 
 /**
  * struct  hyp_map_data: Structure for hashtable data for hyp assign/unassign
@@ -966,11 +965,12 @@ static int kiumd_set_pgtble_ttbr1_context(struct iommu_domain *iommu_dom)
  * Return: 0 on success, negative error code on failure
  */
 
-static int kiumd_set_pgtble_ttbr0_context(struct iommu_domain *iommu_dom)
+static int kiumd_set_pgtble_ttbr0_context(struct iommu_domain *iommu_dom, struct kiumd_ctx *kiumd_ctx)
 {
 	struct io_pgtable_cfg cfg;
 	struct arm_smmu_domain *smmu_dom;
 	struct io_pgtable_ops *pgtable_ops;
+	struct io_pgtable *pgtable;
 	int ret;
 
 	smmu_dom = container_of(iommu_dom, struct arm_smmu_domain, domain);
@@ -979,14 +979,15 @@ static int kiumd_set_pgtble_ttbr0_context(struct iommu_domain *iommu_dom)
 		return -EINVAL;
 	}
 
-	if (!pgtable) {
-		pgtable = io_pgtable_ops_to_pgtable(smmu_dom->pgtbl_ops);
-		if (!pgtable) {
+	if (!kiumd_ctx->pgtable) {
+		kiumd_ctx->pgtable = io_pgtable_ops_to_pgtable(smmu_dom->pgtbl_ops);
+		if (!kiumd_ctx->pgtable) {
 			pr_err("%s:pagetable is NULL\n", __func__);
 			return -EINVAL;
 		}
 	}
 
+	pgtable = kiumd_ctx->pgtable;
 	memcpy(&cfg, &pgtable->cfg, sizeof(struct io_pgtable_cfg));
 	cfg.quirks &= ~IO_PGTABLE_QUIRK_ARM_TTBR1;
 	cfg.tlb = &kgsl_iopgtbl_tlb_ops;
@@ -1024,11 +1025,13 @@ static int kiumd_set_pgtble_ttbr0_context(struct iommu_domain *iommu_dom)
  *   0 on success, negative error code on failure.
  */
 
-static int kiumd_set_pgtbl_context(char __user *arg)
+static int kiumd_set_pgtbl_context(char __user *arg, struct file *fp)
 {
 	struct kiumd_smmu_user pgtbl_ctx;
 	struct vfio_device *vfio_dev;
 	struct iommu_domain *iommu_dom;
+	struct kiumd_ctx *kiumd_ctx;
+
 	int ret;
 
 	if (copy_from_user(&pgtbl_ctx, arg, sizeof(struct kiumd_smmu_user)))
@@ -1051,9 +1054,15 @@ static int kiumd_set_pgtbl_context(char __user *arg)
 		return -EINVAL;
 	}
 
+	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
+	if (!kiumd_ctx) {
+		pr_err("%s:kiumd ctx is NULL \n", __func__);
+		return -EINVAL;
+	}
+
 	switch (pgtbl_ctx.flags) {
 	case KIUMD_SMMU_SET_TTBR0_CONFIG:
-		ret = kiumd_set_pgtble_ttbr0_context(iommu_dom);
+		ret = kiumd_set_pgtble_ttbr0_context(iommu_dom, kiumd_ctx);
 		break;
 	case KIUMD_SMMU_SET_TTBR1_CONFIG:
 		ret = kiumd_set_pgtble_ttbr1_context(iommu_dom);
@@ -1076,7 +1085,7 @@ static int kiumd_set_pgtbl_context(char __user *arg)
 *
 * Returns  0 upon success and -EINVAL on failure
 */
-int kiumd_perprocess_pt_alloc(char __user *arg)
+int kiumd_perprocess_pt_alloc(char __user *arg, struct file *fp)
 {
 	struct kiumd_smmu_user kismmu_pproc;
 	struct file *file;
@@ -1085,6 +1094,8 @@ int kiumd_perprocess_pt_alloc(char __user *arg)
 	struct io_pgtable_cfg cfg;
 	struct arm_smmu_domain *smmu_dom;
 	struct iommu_domain *iommu_dom;
+	struct kiumd_ctx *kiumd_ctx;
+	struct io_pgtable *pgtable;
 
 	if (copy_from_user(&kismmu_pproc, arg, sizeof(struct kiumd_smmu_user)))
 		return -EFAULT;
@@ -1110,6 +1121,13 @@ int kiumd_perprocess_pt_alloc(char __user *arg)
 		return -EINVAL;
 	}
 
+	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
+	if (!kiumd_ctx) {
+		pr_err("%s:kiumd ctx is NULL \n", __func__);
+		fput(file);
+		return -EINVAL;
+	}
+
 	iommu_dom = kiumd_iommu_get_dma_domain(vfio_dev->dev);
 	if (!iommu_dom) {
 		pr_err("%s:iommu domain is NULL\n", __func__);
@@ -1124,6 +1142,7 @@ int kiumd_perprocess_pt_alloc(char __user *arg)
 		return -EINVAL;
 	}
 
+	pgtable = kiumd_ctx->pgtable;
 	memcpy(&cfg, &pgtable->cfg, sizeof(struct io_pgtable_cfg));
 	cfg.quirks &= ~IO_PGTABLE_QUIRK_ARM_TTBR1;
 	cfg.tlb = &kgsl_iopgtbl_tlb_ops;
@@ -1158,7 +1177,7 @@ int kiumd_perprocess_pt_alloc(char __user *arg)
 * Returns  0 upon success and error codes
 * on failure
 */
-int kiumd_global_pgtble_set(char __user *arg)
+int kiumd_global_pgtble_set(char __user *arg, struct file *fp)
 {
 
 	struct kiumd_smmu_user kismmu_pproc;
@@ -1168,6 +1187,8 @@ int kiumd_global_pgtble_set(char __user *arg)
 	struct iommu_domain *iommu_dom;
 	struct arm_smmu_domain *smmu_dom;
 	struct io_pgtable_ops *ki_pgtbl_ops;
+	struct kiumd_ctx *kiumd_ctx;
+	struct io_pgtable *pgtable;
 
 	if (copy_from_user(&kismmu_pproc, arg, sizeof(struct kiumd_smmu_user)))
 		return -EFAULT;
@@ -1193,6 +1214,13 @@ int kiumd_global_pgtble_set(char __user *arg)
 		return -ENOTTY;
 	}
 
+	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
+	if (!kiumd_ctx) {
+		pr_err("%s:kiumd ctx is NULL \n", __func__);
+		fput(file);
+		return -EINVAL;
+	}
+
 	iommu_dom = kiumd_iommu_get_dma_domain(vfio_dev->dev);
 	if (!iommu_dom) {
 		pr_err("%s:IOMMU domain is NULL\n", __func__);
@@ -1207,15 +1235,16 @@ int kiumd_global_pgtble_set(char __user *arg)
 		return -ENOMEM;
 	}
 
-	if (!pgtable) {
-		pgtable = io_pgtable_ops_to_pgtable(smmu_dom->pgtbl_ops);
-		if (!pgtable) {
+	if (!kiumd_ctx->pgtable) {
+		kiumd_ctx->pgtable = io_pgtable_ops_to_pgtable(smmu_dom->pgtbl_ops);
+		if (!kiumd_ctx->pgtable) {
 			pr_err("%s:pagetable is NULL\n", __func__);
 			fput(file);
 			return -EINVAL;
 		}
 	}
 
+	pgtable = kiumd_ctx->pgtable;
 	ki_pgtbl_ops = (struct io_pgtable_ops *) (&pgtable->ops);
 	if (!ki_pgtbl_ops) {
 		pr_err("%s:pagetable ops is NULL\n", __func__);
@@ -4254,10 +4283,10 @@ static long kiumd_ioctl(struct file *file, unsigned int cmd,
 		err = kiumd_iova_ctrl(argp);
 		break;
 	case KIUMD_SET_PGTBL_CONTEXT:
-		err = kiumd_set_pgtbl_context(argp);
+		err = kiumd_set_pgtbl_context(argp, file);
 		break;
 	case KIUMD_PER_PROCESS_ALLOC:
-		err = kiumd_perprocess_pt_alloc(argp);
+		err = kiumd_perprocess_pt_alloc(argp, file);
 		break;
 	case KIUMD_PER_PROCESS_SET:
 		err = kiumd_perprocess_pgtble_set(argp);
@@ -4272,7 +4301,7 @@ static long kiumd_ioctl(struct file *file, unsigned int cmd,
 		err = kiumd_dmabuf_custom_iova_init(argp, file);
 		break;
 	case KIUMD_GLOBAL_PT_SET:
-		err = kiumd_global_pgtble_set(argp);
+		err = kiumd_global_pgtble_set(argp, file);
 		break;
 	case KIUMD_SMMU_SECURE_MAP:
 		err = kiumd_dmabuf_vfio_secure_map(argp, file);
