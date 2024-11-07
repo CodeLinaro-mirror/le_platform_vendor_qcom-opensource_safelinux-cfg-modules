@@ -104,8 +104,8 @@ struct kiumd_smmu_mmio_map {
 };
 
 struct kiumd_mem_info {
-	__u32 offset;
-	__u32 size;
+	__u64 offset;
+	__u64 size;
 };
 
 struct kiumd_dev_mem_info {
