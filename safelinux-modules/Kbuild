@@ -49,3 +49,8 @@ endif
 
 obj-m += mhi_ep_net.o
 mhi_ep_net-objs := drivers/mhi_ep_net.o
+
+ifdef CONFIG_QTI_SCMI_VENDOR_PROTOCOL
+obj-m += vendor_uscmi.o
+vendor_uscmi-objs := drivers/vendor_uscmi.o
+endif
