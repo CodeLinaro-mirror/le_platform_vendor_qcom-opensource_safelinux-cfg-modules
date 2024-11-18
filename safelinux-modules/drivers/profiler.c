@@ -198,6 +198,8 @@ static int bw_profiling_get(void __user *argp, struct tz_bw_svc_buf *bwbuf)
 							+ offset_reg_values.cabo_offset[ch*2]);
 			cnt_buf.cabo_values[ch*2 + 1] = readl(profiler->llcc_base
 							+ offset_reg_values.cabo_offset[ch*2+1]);
+
+			devm_iounmap(profiler->pdev, profiler->llcc_base);
 		}
 
 		profiler->gemnoc_base = devm_ioremap(profiler->pdev, dev_params.gemnoc_base, dev_params.gemnoc_map_size);
@@ -210,6 +212,9 @@ static int bw_profiling_get(void __user *argp, struct tz_bw_svc_buf *bwbuf)
 			}
 
 		}
+
+		devm_iounmap(profiler->pdev, profiler->gemnoc_base);
+
 		profiler->mmnoc_base = devm_ioremap(profiler->pdev, dev_params.mmnoc_base, dev_params.mmnoc_map_size);
 
 		for(hf = 0; hf < dev_params.num_hf_metrics; hf++)
@@ -220,6 +225,8 @@ static int bw_profiling_get(void __user *argp, struct tz_bw_svc_buf *bwbuf)
 		{
 			cnt_buf.mmnoc_sf_values[sf] = readl(profiler->mmnoc_base + offset_reg_values.mmnoc_sf_offset[sf]);
 		}
+
+		devm_iounmap(profiler->pdev, profiler->mmnoc_base);
 
 		/* Allocate memory for get buffer */
 		ret = qtee_shmbridge_allocate_shm(PAGE_ALIGN(bufsize), &buf_shm);
