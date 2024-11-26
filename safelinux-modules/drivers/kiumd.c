@@ -10,6 +10,7 @@
 #include <linux/of_address.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
+#include <linux/of_reserved_mem.h>
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
 #include <linux/vfio.h>
@@ -73,6 +74,7 @@ static DECLARE_BITMAP(perprocess_map, KGSL_PT_MEM_PAGES);
 #define KIUMD_MAX_PERMS       8
 
 #define KIUMD_MAX_REG_NAME_LEN (100)
+#define KIUMD_INDEX_OFFSET     (40)
 
 struct kiumd_smmu_mmio_ctx {
 	struct device *dev;
@@ -3270,8 +3272,7 @@ static int kiumd_vfio_ctx_init(char __user *arg, struct file *fp)
 	struct kiumd_ctx *kiumd_ctx = NULL;
 	struct device_node *np;
 	struct device_node *mem_np;
-	struct resource res;
-	int index = 0;
+	struct reserved_mem *rmem;
 
 	if (!fp) {
 		pr_err("%s:file ptr returns NULL\n", __func__);
@@ -3302,7 +3303,7 @@ static int kiumd_vfio_ctx_init(char __user *arg, struct file *fp)
 
 	np = dev_of_node(vfio_dev->dev);
 	if (!np) {
-		pr_debug("No memory-region specified\n");
+		pr_err("%s:No memory-region specified\n", __func__);
 		return -EINVAL;
 	}
 
@@ -3310,7 +3311,7 @@ static int kiumd_vfio_ctx_init(char __user *arg, struct file *fp)
 									  "memory-region",
 									  sizeof(phandle));
 	if (kiumd_ctx->num_reserved_regions <= 0) {
-		pr_err("no reserved mem areas\n");
+		pr_err(":%s:no reserved mem areas\n", __func__);
 		return -EINVAL;
 	}
 
@@ -3318,31 +3319,36 @@ static int kiumd_vfio_ctx_init(char __user *arg, struct file *fp)
 					  sizeof(struct kiumd_reserved_mem_area),
 					  GFP_KERNEL);
 	if (!kiumd_ctx->res_mem_area)
-		return -EINVAL;
+		return -ENOMEM;
 
 	kiusr.num_regions = kiumd_ctx->num_reserved_regions;
-	for (int i = 0; i < kiusr.num_regions; i++) {
+	for (u64 i = 0; i < kiusr.num_regions; i++) {
 		mem_np = of_parse_phandle(vfio_dev->dev->of_node, "memory-region", i);
-		if (!mem_np)
+		if (!mem_np) {
+			pr_debug("%s:cant find phandle\n", __func__);
 			continue;
+		}
 
-		ret = of_address_to_resource(mem_np, i, &res);
-		if (ret) {
+		rmem = of_reserved_mem_lookup(mem_np);
+		if (!rmem) {
 			of_node_put(mem_np);
-			pr_debug("No memory address assigned to the reserved region\n");
+			pr_err("%s:No memory address assigned to the reserved region\n", __func__);
 			kfree(kiumd_ctx->res_mem_area);
 			return -EINVAL;
 		}
 
 		of_node_put(mem_np);
-		kiumd_ctx->res_mem_area[i].size = resource_size(&res);
-		kiumd_ctx->res_mem_area[i].base = res.start;
-		kiusr.mem_info[i].size = resource_size(&res);
-		kiusr.mem_info[i].offset = 0;
+		kiumd_ctx->res_mem_area[i].size = rmem->size;
+		kiumd_ctx->res_mem_area[i].base = rmem->base;
+		kiusr.mem_info[i].size = rmem->size;
+		kiusr.mem_info[i].offset = i << KIUMD_INDEX_OFFSET;
+		pr_debug("%s:base:%lx size:%lx offset:%lx\n", __func__, kiumd_ctx->res_mem_area[i].base,
+				kiusr.mem_info[i].size, kiusr.mem_info[i].offset);
 	}
 
 	if (copy_to_user(arg, &kiusr, sizeof(kiusr))) {
 		kfree(kiumd_ctx->res_mem_area);
+                kiumd_ctx->res_mem_area = NULL;
 		pr_err("%s:error in copying vfio ctx data for reserved memory:%d\n", __func__, ret);
 		ret = -EFAULT;
 	}
@@ -3445,8 +3451,7 @@ static long kiumd_ioctl(struct file *file, unsigned int cmd,
 static int kiumd_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	struct kiumd_ctx *ki_ctx;
-	u64 req_len, index, req_start;
-	int ret;
+	u64 req_len, index, pgoff;
 
 	if (!file) {
 		pr_err("%s:file ptr returns NULL\n", __func__);
@@ -3459,23 +3464,36 @@ static int kiumd_mmap(struct file *file, struct vm_area_struct *vma)
 		return -EINVAL;
 	}
 
-	if (!ki_ctx->res_mem_area)
+	if (!ki_ctx->res_mem_area) {
+		pr_err("%s:No reserved mem areas\n", __func__);
 		return -EINVAL;
+	}
 
-	if (vma->vm_end < vma->vm_start)
+	if (vma->vm_end < vma->vm_start) {
+		pr_err("%s:Invalid vm start and end\n", __func__);
 		return -EINVAL;
+	}
 
-	if (ki_ctx->num_reserved_regions <= vma->vm_pgoff)
+	index = vma->vm_pgoff >> (KIUMD_INDEX_OFFSET - PAGE_SHIFT) ;
+	if (ki_ctx->num_reserved_regions <= index) {
+		pr_err("%s:Invalid index:%lx\n", __func__, index);
 		return -EINVAL;
+	}
 
-	if (ki_ctx->res_mem_area[index].base & ~PAGE_MASK)
+	pr_debug("%s:index:%lx\n", __func__, index);
+	if (ki_ctx->res_mem_area[index].base & ~PAGE_MASK) {
+		pr_err("%s:Unalligned base address\n", __func__);
 		return -EINVAL;
+	}
 
 	req_len = vma->vm_end - vma->vm_start;
-	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
-	index = vma->vm_pgoff;
 
-	pr_debug("%s:res mem start:%llx End:%llx size:%llu vma start:%lx vma end:%lx size:%lu offset:%d\n",
+	vma->vm_pgoff = vma->vm_pgoff &
+		((1ULL << (KIUMD_INDEX_OFFSET - PAGE_SHIFT)) - 1);
+
+	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+
+	pr_debug("%s:res mem start:%llx End:%llx size:%lx vma start:%lx vma end:%lx size:%lx offset:%lx\n",
 			__func__, ki_ctx->res_mem_area[index].base,
 			ki_ctx->res_mem_area[index].base + ki_ctx->res_mem_area[index].size,
 			ki_ctx->res_mem_area[index].size, vma->vm_start,
