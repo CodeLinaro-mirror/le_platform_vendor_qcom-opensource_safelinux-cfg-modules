@@ -25,6 +25,9 @@
 #define QCOM_SCM_SMCINVOKE                      0x2
 #define QCOM_SCM_SMCINVOKE_CB_RESP              0x1
 
+#define QCOM_SCM_SVC_CAMERA                     0x18
+#define QCOM_SCM_CAMERA_UPDATE_CAMNOC_QOS       0x0A
+
 #define TZ_SVC_BW_PROF_ID			0x07
 
 #define MAX_QCOM_SCM_RESULT                     3
