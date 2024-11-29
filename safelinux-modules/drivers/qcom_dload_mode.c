@@ -19,8 +19,15 @@ enum qcom_download_mode {
 	QCOM_DOWNLOAD_BOTHDUMP  = (QCOM_DOWNLOAD_FULLDUMP | QCOM_DOWNLOAD_MINIDUMP),
 };
 
+enum qcom_download_dest {
+	QCOM_DOWNLOAD_DEST_UNKNOWN = -1,
+	QCOM_DOWNLOAD_DEST_QPST = 0,
+	QCOM_DOWNLOAD_DEST_EMMC = 2,
+};
+
 static enum qcom_download_mode dump_mode = QCOM_DOWNLOAD_FULLDUMP;
 static u64 dload_mode_addr;
+static void __iomem *dload_dest_addr;
 
 static int get_dump_mode(int *mode)
 {
@@ -43,6 +50,20 @@ static int set_dump_mode(enum qcom_download_mode mode)
 	else
 		dump_mode = mode;
 	return ret;
+}
+
+static void set_download_dest(enum qcom_download_dest dest)
+{
+	if (dload_dest_addr)
+		__raw_writel(dest, dload_dest_addr);
+}
+
+static enum qcom_download_dest get_download_dest(void)
+{
+	if (dload_dest_addr)
+		return __raw_readl(dload_dest_addr);
+	else
+		return QCOM_DOWNLOAD_DEST_UNKNOWN;
 }
 
 struct reset_attribute {
@@ -82,7 +103,7 @@ static const struct sysfs_ops reset_sysfs_ops = {
 	.store  = attr_store,
 };
 
-static struct kobj_type qcom_dload_mode_kobj_type = {
+static struct kobj_type qcom_dload_kobj_type = {
 	.sysfs_ops      = &reset_sysfs_ops,
 };
 
@@ -127,8 +148,51 @@ static ssize_t dload_mode_store(struct kobject *kobj, struct attribute *this,
 
 	return set_dump_mode(mode) ? : count;
 }
-
 static struct reset_attribute attr_dload_mode = __ATTR_RW(dload_mode);
+
+static ssize_t emmc_dload_show(struct kobject *kobj,
+			       struct attribute *this,
+			       char *buf)
+{
+	if (!dload_dest_addr)
+		return -ENODEV;
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n",
+			get_download_dest() == QCOM_DOWNLOAD_DEST_EMMC);
+}
+static ssize_t emmc_dload_store(struct kobject *kobj,
+				struct attribute *this,
+				const char *buf, size_t count)
+{
+	int ret;
+	bool enabled;
+
+	if (!dload_dest_addr)
+		return -ENODEV;
+
+	ret = kstrtobool(buf, &enabled);
+
+	if (ret < 0)
+		return ret;
+
+	if (enabled)
+		set_download_dest(QCOM_DOWNLOAD_DEST_EMMC);
+	else
+		set_download_dest(QCOM_DOWNLOAD_DEST_QPST);
+
+	return count;
+}
+static struct reset_attribute attr_emmc_dload = __ATTR_RW(emmc_dload);
+
+static struct attribute *qcom_dload_attrs[] = {
+	&attr_emmc_dload.attr,
+	&attr_dload_mode.attr,
+	NULL
+};
+
+static struct attribute_group qcom_dload_attr_group = {
+	.attrs = qcom_dload_attrs,
+};
 
 static int qcom_scm_find_dload_mode_address(struct device_node *np, u64 *addr)
 {
@@ -154,7 +218,30 @@ static int qcom_scm_find_dload_mode_address(struct device_node *np, u64 *addr)
 	return 0;
 }
 
-static int qcom_dload_mode_probe(struct platform_device *pdev)
+static void __iomem *map_prop_mem(const char *propname)
+{
+	struct device_node *np = of_find_compatible_node(NULL, NULL, propname);
+	void __iomem *addr;
+
+	if (!np) {
+		pr_err("Unable to find DT property: %s\n", propname);
+		return NULL;
+	}
+
+	addr = of_iomap(np, 0);
+	if (!addr)
+		pr_err("Unable to map memory for DT property: %s\n", propname);
+	return addr;
+}
+
+static int qcom_dload_remove(struct platform_device *pdev)
+{
+	if (dload_dest_addr)
+		iounmap(dload_dest_addr);
+	return 0;
+}
+
+static int qcom_dload_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	static struct kobject kobj;
@@ -174,7 +261,7 @@ static int qcom_dload_mode_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	ret = kobject_init_and_add(&kobj, &qcom_dload_mode_kobj_type,
+	ret = kobject_init_and_add(&kobj, &qcom_dload_kobj_type,
 				   kernel_kobj, "dload");
 	if (ret) {
 		dev_err(dev, "Error in creation kobject_add!\n");
@@ -182,31 +269,32 @@ static int qcom_dload_mode_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	ret = sysfs_create_file(&kobj, &attr_dload_mode.attr);
+	ret = sysfs_create_group(&kobj, &qcom_dload_attr_group);
 	if (ret) {
 		dev_err(dev, "Error in creation sysfs_create_group!\n");
 		kobject_del(&kobj);
 		return ret;
 	}
 	dump_mode = get_dump_mode(&temp) ? dump_mode : temp;
-
+	dload_dest_addr = map_prop_mem("qcom,msm-imem-dload-type");
 	return 0;
 }
 
-static const struct of_device_id of_qcom_dload_mode_match[] = {
+static const struct of_device_id of_qcom_dload_match[] = {
 	{.compatible = "qcom,dload-mode", },
 	{}
 };
-MODULE_DEVICE_TABLE(of, of_qcom_dload_mode_match);
+MODULE_DEVICE_TABLE(of, of_qcom_dload_match);
 
-static struct platform_driver qcom_dload_mode_driver = {
-	.probe = qcom_dload_mode_probe,
+static struct platform_driver qcom_dload_driver = {
+	.probe = qcom_dload_probe,
+	.remove = qcom_dload_remove,
 	.driver = {
 		.name = "qcom-dload-mode",
-		.of_match_table = of_qcom_dload_mode_match,
+		.of_match_table = of_qcom_dload_match,
 	},
 };
 
-module_platform_driver(qcom_dload_mode_driver);
+module_platform_driver(qcom_dload_driver);
 MODULE_DESCRIPTION("Qualcomm Technologies, Inc. Download Mode Driver");
 MODULE_LICENSE("GPL v2");
