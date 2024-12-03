@@ -1670,7 +1670,6 @@ int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 		}
 
 		dma_unmap_sgtable(vfio_dev->dev, sgtable, kiumd_dma_direction, DMA_ATTR_PRIVILEGED);
-		fput(file);
 	} else {
 		if(!smap->sgt_ptr) {
 			pr_err("%s: smap->sgt_ptr is NULL\n", __func__);
@@ -1709,6 +1708,7 @@ int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 	spin_unlock(&kiumd_ctx->smmu_lock);
 	dma_buf_detach(kiumd_dmabuf, dmabufattach);
 	dma_buf_put(kiumd_dmabuf);
+	fput(file);
 
 	trace_kiumd_dmabuf_vfio_unmap_end(kiusr.vfio_fd);
 
