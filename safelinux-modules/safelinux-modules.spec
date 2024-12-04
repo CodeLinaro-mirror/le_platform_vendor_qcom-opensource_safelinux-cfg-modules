@@ -71,6 +71,7 @@ rm -rf $RPM_BUILD_ROOT
 %files
 %define kernel_module_path /lib/modules/%{kversion_with_debug}
 %{kernel_module_path}/extra/profiler.ko
+%{kernel_module_path}/extra/qcom_ethqos_filter.ko
 %{kernel_module_path}/extra/apps_pinctrl.ko
 %{kernel_module_path}/extra/scm_user_intf.ko
 %{kernel_module_path}/extra/vfio_iommu_qcom.ko
