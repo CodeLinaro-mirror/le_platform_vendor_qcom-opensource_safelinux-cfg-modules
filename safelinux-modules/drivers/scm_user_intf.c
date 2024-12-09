@@ -95,6 +95,10 @@ static const struct svc_cmd_list sip_tbl[] = {
 	[QCOM_SCM_SVC_LMH] = SVC_CMD_GRP(QCOM_SCM_SVC_LMH,
 					    1,
 					    QCOM_SCM_LMH_LIMIT_PROFILE_CHANGE),
+
+	[QCOM_SCM_SVC_CAMERA] = SVC_CMD_GRP(QCOM_SCM_SVC_CAMERA,
+					    1,
+					    QCOM_SCM_CAMERA_UPDATE_CAMNOC_QOS),
 };
 
 /*
@@ -255,6 +259,7 @@ static bool validate_svc_cmd(unsigned int svc_id, unsigned int cmd_id)
 	case QCOM_SCM_SVC_SHE:
 	case QCOM_SCM_SVC_SAFETY:
 	case QCOM_SCM_SVC_LMH:
+	case QCOM_SCM_SVC_CAMERA:
 
 		svc_cmd_tmp = sip_tbl[svc_id];
 		break;
@@ -412,6 +417,25 @@ static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			break;
 		}
 		break;
+
+	case QCOM_SCM_SVC_CAMERA:
+		switch(scm_data.cmd) {
+		case QCOM_SCM_CAMERA_UPDATE_CAMNOC_QOS:
+			uint32_t size;
+			struct qcom_scm_camera_qos scm_buf[QCOM_SCM_CAMERA_MAX_QOS_CNT] = {0};
+			size = scm_data.args_buffer[2] * sizeof(struct qcom_scm_camera_qos);
+
+			if (copy_from_user(scm_buf,
+					(struct qcom_scm_camera_qos *)scm_data.args_buffer[1],
+					size)) {
+				dev_err(dev_data->dev, "copy_from_user failed\n");
+			}
+			scm_data.ret = qcom_scm_camera_update_camnoc_qos(
+								scm_data.args_buffer[0],
+								scm_data.args_buffer[2],
+								scm_buf);
+		}
+		break;
 	}
 
 #else
@@ -432,17 +456,14 @@ static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	scm_data.ret = qcom_scm_call(&scm_pdev->dev, &desc, &res);
 #endif
 
-	if (scm_data.ret) {
-		dev_err(dev_data->dev, "scm ioctl failed - ret : %d\n", scm_data.ret);
-		return scm_data.ret;
-	}
-
 	for (i = 0; i < MAX_QCOM_SCM_RETS; i++)
 		scm_data.qcom_scm_res[i] = res.result[i];
 
 	if (copy_to_user(ip, &scm_data, sizeof(struct scm_hand_shake)))
 		ret = -EFAULT;
 
+	if (scm_data.ret)
+		dev_err(dev_data->dev, "scm ioctl failed - ret : %d\n", scm_data.ret);
 
         return ret;
 }
