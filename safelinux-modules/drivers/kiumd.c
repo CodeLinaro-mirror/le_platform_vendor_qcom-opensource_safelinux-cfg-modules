@@ -76,6 +76,9 @@ static DECLARE_BITMAP(perprocess_map, KGSL_PT_MEM_PAGES);
 #define KIUMD_MAX_REG_NAME_LEN (100)
 #define KIUMD_INDEX_OFFSET     (40)
 
+#define KIUMD_32BIT_START_IOVA 0x1000
+#define KIUMD_32BIT_END_IOVA 0xFFFFFFFF
+
 struct kiumd_smmu_mmio_ctx {
 	struct device *dev;
 	dma_addr_t iova;
@@ -205,14 +208,38 @@ struct kiumd_reserved_mem_area {
 
 struct kiumd_ctx {
 	int id;
+	u32 pt_id;
+	bool is_initialized;
 	struct hlist_node smmu_map_data;
+	struct hlist_node pgtable_map;
 	spinlock_t smmu_lock;
+	spinlock_t pt_lock;
 	DECLARE_HASHTABLE(smmu_table, SMMU_MAPTABLE_SIZE);
 	struct kiumd_reserved_mem_area *res_mem_area;
 	int num_reserved_regions;
 	struct xarray kiumd_xa;
 	struct mutex kiumd_xa_mutex;
+	unsigned long pt_start_iova;
+	unsigned long pt_end_iova;
+	DECLARE_HASHTABLE(page_table, SMMU_MAPTABLE_SIZE);
+	unsigned long max_shift;
 };
+
+struct pgtable_map {
+	unsigned long idx;
+	unsigned long start_iova;
+	unsigned long end_iova;
+	struct rb_root rbtree;
+	struct hlist_node node;
+};
+
+struct iommu_addr_entry {
+	unsigned long base_addr;
+	unsigned long size;
+	struct rb_node rbnode;
+};
+
+static struct kmem_cache *iommu_addr_cache;
 
 /**
  * struct  smmu_map_data: Structure for hashtable data .
@@ -476,6 +503,202 @@ struct arm_smmu_domain *kiumd_get_smmu_domain(int vfio_fd)
 	} while(0);
 
 	return smmu_domain;
+}
+
+struct pgtable_map *kiumd_get_pgtable_entry(struct kiumd_ctx *kiumd_ctx, unsigned long idx)
+{
+	struct pgtable_map *pgtble_ctx;
+	bool found = false;
+
+	spin_lock(&kiumd_ctx->pt_lock);
+	hash_for_each_possible(kiumd_ctx->page_table, pgtble_ctx, node, idx) {
+		if (pgtble_ctx->idx == idx) {
+			found = true;
+			break;
+		}
+	}
+
+	spin_unlock(&kiumd_ctx->pt_lock);
+	if (!found) {
+		pr_err("%s:id not found in hash table\n", __func__);
+		return NULL;
+	}
+
+	return pgtble_ctx;
+}
+
+static void free_iommu_addr_entry(struct iommu_addr_entry *entry)
+{
+	kmem_cache_free(iommu_addr_cache, entry);
+}
+
+static int free_iova_range(struct pgtable_map *map, unsigned long iova)
+{
+	struct rb_node *node = map->rbtree.rb_node;
+
+	while (node) {
+		struct iommu_addr_entry *entry = rb_entry(node, struct iommu_addr_entry, rbnode);
+
+		if (iova < entry->base_addr)
+			node = node->rb_left;
+		else if (iova > entry->base_addr)
+			node = node->rb_right;
+		else {
+			rb_erase(&entry->rbnode, &map->rbtree);
+			free_iommu_addr_entry(entry);
+			return 0;
+		}
+	}
+
+	return -EINVAL; // IOVA not found
+}
+
+int free_allocated_iova(struct kiumd_ctx *kiumd_ctx, unsigned long iova, unsigned long idx)
+{
+	struct pgtable_map *pgtble_ctx;
+
+	pgtble_ctx = kiumd_get_pgtable_entry(kiumd_ctx, idx);
+	if (!pgtble_ctx) {
+		pr_err("%s:invalid id for hash table: id: %d\n", __func__, idx);
+		return -EINVAL;
+	}
+
+	return free_iova_range(pgtble_ctx, iova);
+}
+
+static struct iommu_addr_entry *alloc_iommu_addr_entry(unsigned long base_addr, unsigned long size)
+{
+	struct iommu_addr_entry *entry = kmem_cache_alloc(iommu_addr_cache, GFP_KERNEL);
+
+	if (!entry)
+		return NULL;
+
+	entry->base_addr = base_addr;
+	entry->size = size;
+	return entry;
+}
+
+static int insert_iova(struct pgtable_map *pgtable_ctx, struct iommu_addr_entry *entry)
+{
+	struct rb_node **new = &(pgtable_ctx->rbtree.rb_node), *parent = NULL;
+
+	while (*new) {
+		struct iommu_addr_entry *this = rb_entry(*new, struct iommu_addr_entry, rbnode);
+
+		parent = *new;
+
+		if (entry->base_addr < this->base_addr)
+			new = &((*new)->rb_left);
+		else if (entry->base_addr > this->base_addr)
+			new = &((*new)->rb_right);
+		else
+			return -EEXIST;
+	}
+
+	rb_link_node(&entry->rbnode, parent, new);
+	rb_insert_color(&entry->rbnode, &pgtable_ctx->rbtree);
+
+	return 0;
+}
+
+struct iova_domain *kiumd_get_iova_domain(struct device *dev)
+{
+	struct iommu_domain *domain;
+	struct kiumd_iommu_dma_cookie *cookie;
+	struct iova_domain *iovad;
+
+	domain = kiumd_iommu_get_dma_domain(dev);
+	if (!domain) {
+		pr_err("%s:dma_domain is invalid \n", __func__);
+		return -EINVAL;
+	}
+
+	cookie = (struct kiumd_iommu_dma_cookie *)domain->iova_cookie;
+	iovad = &cookie->iovad;
+
+	return iovad;
+}
+
+unsigned long get_shift_from_dt(struct device *dev)
+{
+	struct device_node *node;
+	u32 shift = 0;
+
+	node = dev->of_node;
+	if (!of_property_read_u32(node, "qcom,iova-align-shift-max", &shift))
+		return shift;
+
+	return 0;
+}
+
+
+static unsigned long limit_align_shift(struct device *dev, unsigned long shift, unsigned long max_shift)
+{
+	struct iova_domain *iovad;
+	unsigned long max_align_shift, final_shift;
+
+	iovad = kiumd_get_iova_domain(dev);
+	max_align_shift = max_shift + PAGE_SHIFT - iova_shift(iovad);
+
+	final_shift = min_t(unsigned long, max_align_shift, shift);
+
+	return final_shift;
+}
+
+static unsigned long align_iova(struct device *dev, unsigned long start_iova, unsigned long size, unsigned long max_shift)
+{
+	unsigned long align_mask, final_shift;
+
+	final_shift = limit_align_shift(dev, fls_long(size-1), max_shift);
+	align_mask = (1UL << final_shift) - 1;
+
+	if (start_iova % size != 0)
+		start_iova = (start_iova + align_mask) & ~align_mask;
+
+	return start_iova;
+}
+
+static unsigned int alloc_iova_range(struct vfio_device *vfio_dev, struct pgtable_map *ptable_ctx, unsigned long size, unsigned long max_shift)
+{
+	struct rb_node *node = rb_first(&ptable_ctx->rbtree);
+	unsigned long start_iova = ptable_ctx->start_iova;
+
+	start_iova = align_iova(vfio_dev->dev, start_iova, size, max_shift);
+
+	while (node) {
+		struct iommu_addr_entry *entry = rb_entry(node, struct iommu_addr_entry, rbnode);
+
+		if (start_iova + size < entry->base_addr) {
+			if (start_iova + size <= ptable_ctx->end_iova) {
+				struct iommu_addr_entry *new_entry = alloc_iommu_addr_entry(start_iova, size);
+
+				if (!new_entry)
+					return 0;
+
+				insert_iova(ptable_ctx, new_entry);
+				return start_iova;
+			}
+
+			return 0;
+		}
+
+		start_iova = entry->base_addr + entry->size;
+		start_iova = align_iova(vfio_dev->dev, start_iova, size, max_shift);
+		node = rb_next(node);
+	}
+
+	if (start_iova + size <= ptable_ctx->end_iova) {
+		struct iommu_addr_entry *new_entry = alloc_iommu_addr_entry(start_iova, size);
+
+		if (!new_entry)
+			return 0;
+
+
+		insert_iova(ptable_ctx, new_entry);
+		return start_iova;
+	}
+
+	return 0;
 }
 
 /**
@@ -1090,7 +1313,7 @@ int kiumd_perprocess_pgtble_free(char __user *arg)
 *
 * Returns  0 upon success and error codes on failure
 */
-int kiumd_dmabuf_custom_iova_init(char __user *arg)
+int kiumd_dmabuf_custom_iova_init(char __user *arg, struct file *fp)
 {
 	struct kiumd_user kiusr;
 	struct vfio_device *vfio_dev;
@@ -1100,6 +1323,7 @@ int kiumd_dmabuf_custom_iova_init(char __user *arg)
 	struct iommu_domain *domain = NULL;
 	struct iova_domain *iovad = NULL;
 	struct iommu_resv_region *region;
+	struct kiumd_ctx *kiumd_ctx;
 	unsigned long lo, hi;
 	LIST_HEAD(resrvd);
 	int ret;
@@ -1127,6 +1351,17 @@ int kiumd_dmabuf_custom_iova_init(char __user *arg)
 		fput(file);
 		return -EINVAL;
 	}
+
+	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
+	if (!kiumd_ctx) {
+		pr_err("%s:kiumd ctx is NULL \n", __func__);
+		return -EINVAL;
+	}
+
+	/*Get the maximum shift from DT for managed_iova_map api to
+	 * determine alignment for large buffers
+	 */
+	kiumd_ctx->max_shift = get_shift_from_dt(vfio_dev->dev);
 
 	ret = dma_set_max_seg_size(vfio_dev->dev, (unsigned int) DMA_BIT_MASK(32));
 	//Print a warning and continue.
@@ -1311,6 +1546,326 @@ bool is_fixed_mapping(struct vfio_device *vfio_dev)
 		return true;
 
 	return false;
+}
+
+void add_to_smmu_table(struct kiumd_ctx *ctx, struct smmu_map_data *map_data)
+{
+	spin_lock(&ctx->smmu_lock);
+	map_data->id = ctx->id++;
+	hash_add(ctx->smmu_table, &map_data->node, map_data->id);
+	spin_unlock(&ctx->smmu_lock);
+}
+
+int set_allocated_iova(struct vfio_device *vfio_dev, unsigned long iova)
+{
+	struct kiumd_iommu_dma_cookie *cookie;
+	int ret;
+
+	cookie = kiumd_get_dma_cookie(vfio_dev);
+	if (!cookie) {
+		pr_err("%s failed to get cookie\n", __func__);
+		return -EINVAL;
+	}
+
+	ret = kiumd_set_dma_cookie_unlocked(cookie, IOMMU_DMA_MSI_COOKIE, iova);
+	if (ret)
+		pr_err("%s failed to set cookie\n", __func__);
+
+	return ret;
+}
+
+static int init_and_allocate_iova(struct vfio_device *vfio_dev, struct kiumd_ctx *kiumd_ctx, unsigned long idx, unsigned int size, unsigned long max_shift)
+{
+	struct pgtable_map *pgtable_ctx;
+	unsigned long iova;
+	int ret;
+
+	if (!kiumd_ctx->is_initialized) {
+
+		pgtable_ctx = kzalloc(sizeof(*pgtable_ctx), GFP_KERNEL);
+		if (!pgtable_ctx) {
+			pr_err("%s: Failed to allocate pagetable_map\n", __func__);
+			return -ENOMEM;
+		}
+
+		pgtable_ctx->rbtree = RB_ROOT;
+		pgtable_ctx->idx = idx;
+		pgtable_ctx->start_iova = kiumd_ctx->pt_start_iova;
+		pgtable_ctx->end_iova = kiumd_ctx->pt_end_iova;
+
+		spin_lock(&kiumd_ctx->pt_lock);
+		hash_add(kiumd_ctx->page_table, &pgtable_ctx->node, idx);
+		spin_unlock(&kiumd_ctx->pt_lock);
+
+		kiumd_ctx->is_initialized = true;
+	} else {
+		pgtable_ctx = kiumd_get_pgtable_entry(kiumd_ctx, idx);
+		if (!pgtable_ctx) {
+			pr_err("%s: Failed to find pgtable_map for device: %d", __func__, idx);
+			return -EINVAL;
+		}
+	}
+
+	iova = alloc_iova_range(vfio_dev, pgtable_ctx, size, max_shift);
+	if (!iova) {
+		pr_err("%s: Failed to allocate iova.\n", __func__);
+		return -ENOMEM;
+	}
+
+	ret = set_allocated_iova(vfio_dev, iova);
+	if (ret < 0) {
+		pr_err("%s: Failed to set the iova.\n", __func__);
+		return -ENOMEM;
+	}
+
+	return 0;
+}
+
+unsigned long get_hash_key(int vfio_fd)
+{
+	unsigned long hash_id;
+	struct vfio_device *vfio_dev;
+
+	if (vfio_fd < 0) {
+		pr_err("%s:%d invalid fd from user\n", __func__, __LINE__);
+		return -EBADF;
+	}
+
+	vfio_dev = kiumd_get_vfio_device(vfio_fd);
+	if (!vfio_dev) {
+		pr_err("%s:invalid vfio_fd from user \n", __func__);
+		return -EINVAL;
+	}
+
+	hash_id = (unsigned long) kiumd_iommu_get_dma_domain(vfio_dev->dev);
+	if (!hash_id) {
+		pr_err("%s:invalid domain\n", __func__);
+		return -EINVAL;
+	}
+
+	return hash_id;
+}
+
+
+int kiumd_dmabuf_managed_iova_map(char __user *arg, struct file *fp)
+{
+	struct dma_buf_attachment *dmabufattach;
+	struct vfio_device *vfio_dev;
+	struct dma_buf *kiumd_dmabuf;
+	int kiumd_dma_direction, ret;
+	struct kiumd_ctx *kiumd_ctx;
+	struct smmu_map_data *smap;
+	struct kiumd_user kiusr;
+	unsigned long max_shift;
+	unsigned long hash_id;
+	struct sg_table *sgt;
+
+	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user)))
+		return -EFAULT;
+
+	if (!fp) {
+		pr_err("%s:invalid file ptr\n", __func__);
+		return -EINVAL;
+	}
+
+	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
+	if (!kiumd_ctx) {
+		pr_err("%s:kiumd ctx is NULL \n", __func__);
+		ret = -EINVAL;
+		goto fail_detach;
+	}
+
+	vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
+	if (!vfio_dev) {
+		pr_err("%s: invalid vfio device fd\n", __func__);
+		return -EINVAL;
+	}
+
+	hash_id = get_hash_key(kiusr.vfio_fd);
+	if (!hash_id) {
+		pr_err("%s:invalid domain\n", __func__);
+		return -EINVAL;
+	}
+
+	kiumd_dmabuf = dma_buf_get(kiusr.dma_buf_fd);
+	if (IS_ERR_OR_NULL(kiumd_dmabuf)) {
+		pr_err("%s:dma_buf_get failed with error: %ld, for device: %s\n", __func__, PTR_ERR(kiumd_dmabuf), dev_name(vfio_dev->dev));
+		ret = (kiumd_dmabuf == NULL ? -EINVAL : PTR_ERR(kiumd_dmabuf));
+		return ret;
+	}
+
+	if (kiumd_ctx->max_shift) {
+		ret = init_and_allocate_iova(vfio_dev, kiumd_ctx, hash_id, kiumd_dmabuf->size, kiumd_ctx->max_shift);
+		if (ret) {
+			pr_err("%s: failed to allocate iova for: %s, ret: %d\n", __func__, dev_name(vfio_dev->dev), ret);
+			return ret;
+		}
+	}
+
+	if (!(vfio_dev->dev)) {
+		pr_err("%s:vfio_dev->dev is NULL\n", __func__);
+		return -ENODEV;
+	}
+
+	dmabufattach = dma_buf_attach(kiumd_dmabuf, vfio_dev->dev);
+	if (IS_ERR(dmabufattach)) {
+		pr_err("%s:dmabufattach failed with error: %ld, for device: %s\n", __func__, PTR_ERR(dmabufattach), dev_name(vfio_dev->dev));
+		ret = PTR_ERR(dmabufattach);
+		goto fail_put;
+	}
+
+	if (IS_ERR_OR_NULL(dmabufattach->dmabuf)) {
+		pr_err("%s:dmabuf is NULL\n", __func__);
+		return -EINVAL;
+	}
+
+	if ((kiusr.dma_direction < DMA_BIDIRECTIONAL) || (kiusr.dma_direction > DMA_NONE)) {
+		pr_err("%s:Invalid DMA direction: %d\n", __func__, kiusr.dma_direction);
+		ret = -EINVAL;
+		goto fail_detach;
+	}
+
+	if (kiusr.dma_direction == DMA_TO_DEVICE)
+		kiumd_dma_direction = kiusr.dma_direction;
+	else
+		kiumd_dma_direction = DMA_BIDIRECTIONAL;
+
+	sgt = dma_buf_map_attachment_unlocked(dmabufattach, kiumd_dma_direction);
+	if (IS_ERR_OR_NULL(sgt)) {
+		pr_err("%s: mapping failed with error: %ld, for device: %s\n", __func__, PTR_ERR(sgt), dev_name(vfio_dev->dev));
+		ret = (sgt == NULL ? -EINVAL : PTR_ERR(sgt));
+		goto fail_detach;
+	}
+
+	smap = kzalloc(sizeof(struct smmu_map_data), GFP_KERNEL);
+	if (!smap) {
+		pr_err("%s:No memory for smap \n", __func__);
+		ret = -ENOMEM;
+		goto fail_detach;
+	}
+
+	smap->dmabufattach = (long)dmabufattach;
+	smap->sgt_ptr = (long)sgt;
+	smap->dmabuf_ptr = (long)kiumd_dmabuf;
+	add_to_smmu_table(kiumd_ctx, smap);
+
+	kiusr.id = smap->id;
+	kiusr.dma_addr = (unsigned long) sg_dma_address(sgt->sgl);
+
+	if (copy_to_user(arg, &kiusr, sizeof(kiusr))) {
+		pr_err("%s: copy_to_user failed...\n", __func__);
+		dma_buf_unmap_attachment_unlocked(dmabufattach, sgt, kiumd_dma_direction);
+		ret = -EFAULT;
+		goto fail_detach;
+	}
+
+	return 0;
+
+fail_detach:
+	dma_buf_detach(kiumd_dmabuf, dmabufattach);
+
+fail_put:
+	dma_buf_put(kiumd_dmabuf);
+
+	return ret;
+}
+
+int kiumd_dmabuf_managed_iova_unmap(char __user *arg, struct file *fp)
+{
+	struct dma_buf_attachment *dmabufattach;
+	int kiumd_dma_direction, ret = 0;
+	struct iommu_domain *iommu_dom;
+	struct dma_buf *kiumd_dmabuf;
+	struct kiumd_ctx *kiumd_ctx;
+	struct smmu_map_data *smap;
+	struct kiumd_user kiusr;
+	unsigned long hash_id;
+	bool found = false;
+
+	if (!fp) {
+		pr_err("%s:file ptr returns NULL\n", __func__);
+		return -EINVAL;
+	}
+	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
+
+	if (!kiumd_ctx) {
+		pr_err("%s:kiumd ctx is NULL\n", __func__);
+		return -EINVAL;
+	}
+
+	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user)))
+		return -EFAULT;
+
+	if (kiusr.id < 0) {
+		pr_err("%s:id passed from user should be positive value\n", __func__);
+		return -EFAULT;
+	}
+
+	spin_lock(&kiumd_ctx->smmu_lock);
+	hash_for_each_possible(kiumd_ctx->smmu_table, smap, node, kiusr.id) {
+		if (smap->id == kiusr.id) {
+			found = true;
+			break;
+		}
+	}
+
+	if (!found) {
+		spin_unlock(&kiumd_ctx->smmu_lock);
+		return -ENOENT;
+	}
+
+	spin_unlock(&kiumd_ctx->smmu_lock);
+
+	kiumd_dmabuf = (struct dma_buf *)smap->dmabuf_ptr;
+	if (!kiumd_dmabuf) {
+		pr_err("%s:kiumd_dmabuf is NULL\n", __func__);
+		return -EINVAL;
+	}
+
+	hash_id = get_hash_key(kiusr.vfio_fd);
+	if (hash_id < 0) {
+		pr_err("%s:invalid domain\n", __func__);
+		return -EINVAL;
+	}
+
+	if (kiumd_ctx->max_shift) {
+		ret = free_allocated_iova(kiumd_ctx, kiusr.dma_addr, hash_id);
+		if (ret) {
+			pr_err("%s:unable to free iova\n", __func__);
+			return ret;
+		}
+	}
+
+	dmabufattach = (struct dma_buf_attachment *)smap->dmabufattach;
+	if (!dmabufattach) {
+		pr_err("%s:dmabufattach is NULL\n", __func__);
+		return -EINVAL;
+	}
+
+	if (kiusr.dma_direction == 1)
+		kiumd_dma_direction = kiusr.dma_direction;
+	else
+		kiumd_dma_direction = 0;
+
+	if (!smap->sgt_ptr) {
+		pr_err("%s: smap->sgt_ptr is NULL\n", __func__);
+		return -EINVAL;
+	}
+
+	dma_buf_unmap_attachment_unlocked(dmabufattach, (struct sg_table *)smap->sgt_ptr,
+									kiumd_dma_direction);
+
+	iommu_dom = kiumd_get_iommu_domain(kiusr.vfio_fd);
+	iommu_flush_iotlb_all(iommu_dom);
+
+	spin_lock(&kiumd_ctx->smmu_lock);
+	hash_del(&smap->node);
+	kfree(smap);
+	spin_unlock(&kiumd_ctx->smmu_lock);
+	dma_buf_detach(kiumd_dmabuf, dmabufattach);
+	dma_buf_put(kiumd_dmabuf);
+
+	return ret;
 }
 
 /**
@@ -3176,6 +3731,9 @@ static int kiumd_open(struct inode *inode, struct file *filp)
 	if (!kictx)
 		return -ENOMEM;
 	kictx->id = 0;
+	kictx->pt_start_iova = KIUMD_32BIT_START_IOVA;
+	kictx->pt_end_iova = KIUMD_32BIT_END_IOVA;
+	kictx->is_initialized = false;
 	hash_init(kictx->smmu_table);
 	spin_lock_init(&kictx->smmu_lock);
 	xa_init(&kictx->kiumd_xa);
@@ -3442,7 +4000,7 @@ static long kiumd_ioctl(struct file *file, unsigned int cmd,
 		err = kiumd_fd_dmabuf_handler(argp, file);
 		break;
 	case KIUMD_CUSTOM_IOVA_INIT:
-		err = kiumd_dmabuf_custom_iova_init(argp);
+		err = kiumd_dmabuf_custom_iova_init(argp, file);
 		break;
 	case KIUMD_GLOBAL_PT_SET:
 		err = kiumd_global_pgtble_set(argp);
@@ -3469,6 +4027,13 @@ static long kiumd_ioctl(struct file *file, unsigned int cmd,
 		pr_debug("kiumd vfio ctx init\n");
 		err = kiumd_vfio_ctx_init(argp, file);
 		break;
+	case KIUMD_SMMU_MANAGED_IOVA_MAP:
+		err = kiumd_dmabuf_managed_iova_map(argp, file);
+		break;
+	case KIUMD_SMMU_MANAGED_IOVA_UNMAP:
+		err = kiumd_dmabuf_managed_iova_unmap(argp, file);
+		break;
+
 	default:
 		err = -ENOTTY;
 		break;
@@ -3581,6 +4146,12 @@ static int kiumd_probe(struct platform_device *pdev)
 		devname = devm_kstrdup(dev, name, GFP_KERNEL);
 	else
 		devname = devm_kasprintf(dev, GFP_KERNEL, "%pOFn", np);
+
+	iommu_addr_cache = kmem_cache_create("iommu_addr_cache", sizeof(struct iommu_addr_entry), 0, 0, NULL);
+	if (!iommu_addr_cache) {
+		pr_err("kiumd kmem cache creation failure\n");
+		return -ENOMEM;
+	}
 
 	miscdev->minor = MISC_DYNAMIC_MINOR;
 	miscdev->name = devname;
