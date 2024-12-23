@@ -421,7 +421,8 @@ static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case QCOM_SCM_SVC_CAMERA:
 		switch(scm_data.cmd) {
 		case QCOM_SCM_CAMERA_UPDATE_CAMNOC_QOS:
-			uint32_t size;
+		{
+			__u32 size;
 			struct qcom_scm_camera_qos scm_buf[QCOM_SCM_CAMERA_MAX_QOS_CNT] = {0};
 			size = scm_data.args_buffer[2] * sizeof(struct qcom_scm_camera_qos);
 
@@ -434,6 +435,8 @@ static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 								scm_data.args_buffer[0],
 								scm_data.args_buffer[2],
 								scm_buf);
+			break;
+		}
 		}
 		break;
 	}
