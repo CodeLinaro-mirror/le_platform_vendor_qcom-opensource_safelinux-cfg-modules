@@ -4261,13 +4261,8 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 			}
 			if (smap->dmabuf_ptr) {
 				kiumd_dmabuf = (struct dma_buf *)smap->dmabuf_ptr;
-				iommu_dom = kiumd_iommu_get_dma_domain(smap->vfio_dev->dev);
-				if (!iommu_dom) {
-					pr_err("%s:IOMMU domain is NULL\n", __func__);
-					continue;
-				}
 
-                                pr_debug("kiumd_debug: Driver close : unmap sgt_ptr:%llx, iommu_domain: %llx \n",smap->sgt_ptr, iommu_dom);
+                                pr_debug("kiumd_debug: Driver close : unmap sgt_ptr:%llx \n",smap->sgt_ptr);
 				if (smap->ptselect == KGSL_GLOBAL_PT || smap->ptselect == KGSL_PER_PROCESS_PT
 									|| smap->ptselect == KGSL_DEFAULT_PT) {
 					continue;
@@ -4277,6 +4272,12 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 									   smap->dma_dir);
 				pr_debug("kiumd_debug: unmap dmabufatach:%llx \n",smap->dmabufattach);
 				if (smap->is_iova_zero == FIXED_IOVA_AT_ZERO) {
+					iommu_dom = kiumd_iommu_get_dma_domain(smap->vfio_dev->dev);
+					if (!iommu_dom) {
+						pr_err("%s:IOMMU domain is NULL\n", __func__);
+						continue;
+					}
+
 					pr_debug("kiumd_debug: unmap iommu_dom:%llx, size: %d \n",iommu_dom, kiumd_dmabuf->size);
 					ret = iommu_unmap(iommu_dom, 0, kiumd_dmabuf->size);
 					if (ret != kiumd_dmabuf->size) {
