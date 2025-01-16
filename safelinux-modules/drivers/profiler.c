@@ -20,7 +20,6 @@ Copyright (c) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
 #include <linux/mm.h>
 #include <linux/of_platform.h>
 #include <uapi/misc/scm_user_intf.h>
-#include <linux/clk.h>
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/delay.h>
@@ -43,7 +42,6 @@ static bool bw_profiling_disabled;
 struct profiler_control {
 	struct device *pdev;
 	struct cdev cdev;
-	struct clk *clk;
 	struct mutex lock;
 	void __iomem *llcc_base;
 	void __iomem *gemnoc_base;
@@ -365,7 +363,6 @@ static int profiler_open(struct inode *inode, struct file *file)
 
 	if (lock_status == 1) {
 		file->private_data = profiler;
-		clk_prepare_enable(profiler->clk);
 	} else
 		return -EBUSY;
 
@@ -421,7 +418,6 @@ static int profiler_release(struct inode *inode, struct file *file)
 
 	pr_info("profiler release\n");
 
-	clk_disable_unprepare(profiler->clk);
 	mutex_unlock(&profiler->lock);
 
 	bwbuf = kzalloc(sizeof(struct tz_bw_svc_buf), GFP_KERNEL);
@@ -457,14 +453,9 @@ static int bwprofiler_probe(struct platform_device *pdev)
 	if (!profiler)
 		return -ENOMEM;
 
-	profiler->clk = devm_clk_get(&pdev->dev, "qdss_clk");
 
 	mutex_init(&profiler->lock);
 
-	if (IS_ERR_OR_NULL(profiler->clk)) {
-		pr_err("could not locate qdss_clk\n");
-		return PTR_ERR(profiler->clk);
-	}
 
 	rc = alloc_chrdev_region(&profiler_device_no, 0, 1, PROFILER_DEV);
 	if (rc < 0) {
