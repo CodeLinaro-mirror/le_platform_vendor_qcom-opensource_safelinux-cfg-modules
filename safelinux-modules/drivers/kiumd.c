@@ -3774,7 +3774,7 @@ static int kiumd_mmio_smmu_map(char __user *arg, struct file *fp)
 		return -EFAULT;
 	}
 
-	trace_kiumd_mmio_smmu_map_start(kiusr.reg_name, kiusr.vfio_fd, kiusr.fixed_iova, kiusr.iova);
+	trace_kiumd_mmio_smmu_map_start(kiusr.vfio_fd, kiusr.fixed_iova, kiusr.iova);
 
 	vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
 	if (!vfio_dev) {
@@ -3879,8 +3879,8 @@ static int kiumd_mmio_smmu_map(char __user *arg, struct file *fp)
 		goto smap_del;
 	}
 
+	trace_kiumd_mmio_smmu_map_end(reg_name, kiusr.vfio_fd,  kiusr.id, kiusr.iova, kiusr.reg_len);
 	kfree(reg_name);
-	trace_kiumd_mmio_smmu_map_end(kiusr.vfio_fd,  kiusr.id, kiusr.iova, kiusr.reg_len);
 	return ret;
 smap_del:
 	dma_unmap_resource(vfio_dev->dev, dma_addr, size, 0, 0);
@@ -3933,7 +3933,8 @@ static int kiumd_mmio_smmu_unmap(char __user *arg, struct file *fp)
 		pr_err("%s:%d invalid args from user\n", __func__, __LINE__);
 		return -EFAULT;
 	}
-	trace_kiumd_mmio_smmu_unmap_start(kiusr.reg_name, kiusr.vfio_fd, kiusr.iova, kiusr.id);
+
+	trace_kiumd_mmio_smmu_unmap_start(kiusr.vfio_fd, kiusr.iova, kiusr.id);
 
 	if (kiusr.id < 0) {
 		pr_err("%s:id passed from user should be positive value\n", __func__);
