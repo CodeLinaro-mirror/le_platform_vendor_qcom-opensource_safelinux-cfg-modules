@@ -100,6 +100,7 @@ struct kiumd_user {
 	struct kiumd_mem_parcel mem_parcel;
 	int id;
 	unsigned int hyp_id;
+	int pid;
 };
 
 struct kiumd_smmu_mmio_map {
