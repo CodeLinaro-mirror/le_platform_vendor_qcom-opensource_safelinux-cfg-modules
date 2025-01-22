@@ -1325,6 +1325,11 @@ int kiumd_perprocess_pgtble_set(char __user *arg)
 	}
 
 	ki_pgtbl_ops = (struct io_pgtable_ops *)kismmu_pproc.pgtbl_ops_ptr;
+	if (!ki_pgtbl_ops) {
+		pr_err("%s:pagetable ops is NULL\n", __func__);
+		return -EINVAL;
+	}
+
 	smmu_dom->pgtbl_ops = ki_pgtbl_ops;
 	fput(file);
 
