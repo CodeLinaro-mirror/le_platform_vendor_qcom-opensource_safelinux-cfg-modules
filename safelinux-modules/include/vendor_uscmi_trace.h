@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-only
+/* SPDX-License-Identifier: GPL-2.0-only*/
 /*
  * Copyright (c) 2025 Qualcomm Innovation Center, Inc. All rights reserved.
  */
@@ -36,7 +36,7 @@ TRACE_EVENT(vendor_uscmi_ioctl,
 		  __entry->size, __entry->ret, __entry->algo, __entry->param_id)
 );
 
-#endif /* _TRACE_VENDOR_USCMI_H */
+#endif /* _TRACE_VENDOR_USCMI */
 
 /* This part must be outside protection */
 #undef TRACE_INCLUDE_PATH

@@ -10,7 +10,7 @@
 #include <linux/qcom_scmi_vendor.h>
 #include <linux/scmi_protocol.h>
 #include <uapi/misc/vendor_uscmi.h>
-#define CREATE_TRACEPOINTS
+#define CREATE_TRACE_POINTS
 #include "vendor_uscmi_trace.h"
 
 extern struct bus_type scmi_bus_type;
