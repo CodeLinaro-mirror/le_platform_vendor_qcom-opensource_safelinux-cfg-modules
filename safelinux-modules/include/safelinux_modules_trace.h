@@ -715,35 +715,34 @@ TRACE_EVENT(kiumd_dmabuf_vfio_secure_unmap_end,
 
 TRACE_EVENT(kiumd_mmio_smmu_map_start,
 
-	TP_PROTO(char * reg_name, int vfio_fd, __u8 fixed_iova, __u64 iova),
+	TP_PROTO(int vfio_fd, __u8 fixed_iova, __u64 iova),
 
-	TP_ARGS(reg_name, vfio_fd, fixed_iova, iova),
+	TP_ARGS(vfio_fd, fixed_iova, iova),
 
 	TP_STRUCT__entry(
-		__string(str, reg_name)
 		__field(int, vfio_fd)
 		__field(__u8, fixed_iova)
 		__field(__u64, iova)
 	),
 
 	TP_fast_assign(
-		__assign_str(str, reg_name);
 		__entry->vfio_fd = vfio_fd;
 		__entry->fixed_iova = fixed_iova;
 		__entry->iova = iova;
 	),
 
-	TP_printk("reg_name=%s, vfio_fd=%d, fixed_iova=%u, iova=0x%x", __get_str(str), __entry->vfio_fd, __entry->fixed_iova, __entry->iova)
+	TP_printk("vfio_fd=%d, fixed_iova=%u, iova=0x%x", __entry->vfio_fd, __entry->fixed_iova, __entry->iova)
 );
 
 TRACE_EVENT(kiumd_mmio_smmu_map_end,
 
-	TP_PROTO(int vfio_fd, int id, __u64 iova, __u64 reg_len),
+	TP_PROTO(char * reg_name, int vfio_fd, int id, __u64 iova, __u64 reg_len),
 
-	TP_ARGS(vfio_fd, id, iova, reg_len),
+	TP_ARGS(reg_name, vfio_fd, id, iova, reg_len),
 
 
 	TP_STRUCT__entry(
+		__string(str, reg_name)
 		__field(int, vfio_fd)
 		__field(int, id)
 		__field(__u64, iova)
@@ -751,36 +750,35 @@ TRACE_EVENT(kiumd_mmio_smmu_map_end,
 	),
 
 	TP_fast_assign(
+		__assign_str(str, reg_name);
 		__entry->vfio_fd = vfio_fd;
 		__entry->id = id;
 		__entry->iova = iova;
 		__entry->reg_len = reg_len;
 	),
 
-	TP_printk("vfio_fd=%d, id=%d, iova=%llx, reg_len=%llx", __entry->vfio_fd, __entry->id, __entry->iova, __entry->reg_len)
+	TP_printk("reg_name=%s, vfio_fd=%d, id=%d, iova=%llx, reg_len=%llx", __get_str(str), __entry->vfio_fd, __entry->id, __entry->iova, __entry->reg_len)
 );
 
 TRACE_EVENT(kiumd_mmio_smmu_unmap_start,
 
-	TP_PROTO(char * reg_name, int vfio_fd, __u64 iova, int id),
+	TP_PROTO(int vfio_fd, __u64 iova, int id),
 
-	TP_ARGS(reg_name, vfio_fd, iova, id),
+	TP_ARGS(vfio_fd, iova, id),
 
 	TP_STRUCT__entry(
-		__string(str, reg_name)
 		__field(int, vfio_fd)
 		__field(__u64, iova)
 		__field(int, id)
 	),
 
 	TP_fast_assign(
-		__assign_str(str, reg_name);
 		__entry->vfio_fd =  vfio_fd;
 		__entry->iova = iova;
 		__entry->id = id;
 	),
 
-	TP_printk("reg_name=%s, vfio_fd=%d, iova=%llx, id=%d", __get_str(str), __entry->vfio_fd, __entry->iova, __entry->id)
+	TP_printk("vfio_fd=%d, iova=%llx, id=%d", __entry->vfio_fd, __entry->iova, __entry->id)
 );
 
 TRACE_EVENT(kiumd_mmio_smmu_unmap_end,
