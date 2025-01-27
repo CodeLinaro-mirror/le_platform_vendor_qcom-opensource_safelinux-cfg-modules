@@ -46,6 +46,23 @@
 #endif
 #include "vfio.h"
 
+/* Struct accessors */
+#define io_pgtable_to_data(x)						\
+	container_of((x), struct arm_lpae_io_pgtable, iop)
+
+#define io_pgtable_ops_to_data(x)					\
+	io_pgtable_to_data(io_pgtable_ops_to_pgtable(x))
+
+struct arm_lpae_io_pgtable {
+	struct io_pgtable	iop;
+
+	int			pgd_bits;
+	int			start_level;
+	int			bits_per_level;
+
+	void			*pgd;
+};
+
 static struct kobject *smmu_obj;
 static struct kobject *device_obj;
 
@@ -1233,6 +1250,7 @@ int kiumd_perprocess_pgtble_set(char __user *arg)
 	struct iommu_domain *iommu_dom;
 	struct arm_smmu_domain *smmu_dom;
 	struct io_pgtable_ops *ki_pgtbl_ops;
+	struct arm_lpae_io_pgtable *data;
 
 	if (copy_from_user(&kismmu_pproc, arg, sizeof(struct kiumd_smmu_user)))
 		return -EFAULT;
@@ -1274,7 +1292,16 @@ int kiumd_perprocess_pgtble_set(char __user *arg)
 	}
 
 	ki_pgtbl_ops = (struct io_pgtable_ops *)kismmu_pproc.pgtbl_ops_ptr;
+	if (ki_pgtbl_ops->iova_to_phys == NULL) {
+		pr_err("%s: ki_pgtbl_ops->iova_to_phys is NULL\n", __func__);
+		return -EINVAL;
+	}
 	smmu_dom->pgtbl_ops = ki_pgtbl_ops;
+	data = io_pgtable_ops_to_data(ki_pgtbl_ops);
+	if(data->pgd == NULL) {
+		pr_err("%s: arm_lpae_io_pgtable is NULL\n", __func__);
+		return -EINVAL;
+	}
 	fput(file);
 
 	trace_kiumd_perprocess_pgtble_set_end(kismmu_pproc.vfio_fd);
