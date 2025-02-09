@@ -881,10 +881,8 @@ static int kiumd_smmuv2_set_ttbr1_cfg(struct arm_smmu_domain *smmu_domain,
 	struct arm_smmu_cb *cb = &smmu_domain->smmu->cbs[cfg->cbndx];
 	u32 tcr = cb->tcr[0];
 
-	if (!(cb->tcr[0] & ARM_SMMU_TCR_EPD1)) {
-		pr_err("TTBR1 translation is already enabled");
+	if (!(cb->tcr[0] & ARM_SMMU_TCR_EPD1))
 		return -EINVAL;
-	}
 
 	tcr |= arm_smmu_lpae_tcr(pgtbl_cfg);
 	tcr &= ~(ARM_SMMU_TCR_EPD0 | ARM_SMMU_TCR_EPD1);
@@ -948,11 +946,8 @@ static int kiumd_set_pgtble_ttbr1_context(struct iommu_domain *iommu_dom)
 	}
 
 	smmu_dom->pgtbl_ops = pgtable_ops;
-	if (kiumd_smmuv2_set_ttbr1_cfg(smmu_dom, &cfg) < 0) {
-		pr_err("%s: failed to set TTBR1 cfg\n", __func__);
-		free_io_pgtable_ops(pgtable_ops);
-		return -EINVAL;
-	}
+	if (kiumd_smmuv2_set_ttbr1_cfg(smmu_dom, &cfg) < 0)
+		pr_err("%s: TTBR1 is already enabled for the device\n", __func__);
 
 	return 0;
 }
