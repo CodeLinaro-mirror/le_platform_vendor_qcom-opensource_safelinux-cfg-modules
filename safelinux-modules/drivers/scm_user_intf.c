@@ -466,7 +466,8 @@ static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		ret = -EFAULT;
 
 	if (scm_data.ret)
-		dev_err(dev_data->dev, "scm ioctl failed - ret : %d\n", scm_data.ret);
+		dev_err(dev_data->dev, "scm ioctl failed for svc_id : %u and cmd_id : %u with ret : %d\n",
+			scm_data.svc, scm_data.cmd, scm_data.ret);
 
         return ret;
 }
