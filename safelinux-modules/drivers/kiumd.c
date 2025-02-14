@@ -4647,7 +4647,6 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 			dmabuf_handle = (struct dma_buf_handle *) gxa_entry;
 
 			if (!dmabuf_handle) {
-				pr_err("%s:Entry not available in xarray\n", __func__);
 				continue;
 			}
 
@@ -4760,7 +4759,6 @@ static int kiumd_vfio_ctx_init(char __user *arg, struct file *fp)
 									  "memory-region",
 									  sizeof(phandle));
 	if (kiumd_ctx->num_reserved_regions <= 0) {
-		pr_err(":%s:no reserved mem areas\n", __func__);
 		return -EINVAL;
 	}
 
@@ -4874,7 +4872,6 @@ static long kiumd_ioctl(struct file *file, unsigned int cmd,
 		err = kiumd_smmu_fault_handler_deregister(argp);
 		break;
 	case KIUMD_VFIO_CTX_INIT:
-		pr_debug("kiumd vfio ctx init\n");
 		err = kiumd_vfio_ctx_init(argp, file);
 		break;
 	case KIUMD_SMMU_MANAGED_IOVA_MAP:
