@@ -36,7 +36,6 @@
 #include <linux/platform_device.h>
 #include <linux/string.h>
 #include <linux/version.h>
-#include <linux/pm_runtime.h>
 #define CREATE_TRACE_POINTS
 #include "safelinux_modules_trace.h"
 
@@ -1656,7 +1655,6 @@ int kiumd_dmabuf_custom_iova_init(char __user *arg, struct file *fp)
 		reserve_iova(iovad, lo, hi);
 	}
 
-	pm_runtime_put(vfio_dev->dev);
 	fput(file);
 	trace_kiumd_dmabuf_custom_iova_init_end(kiusr.vfio_fd);
 	return 0;
