@@ -660,6 +660,26 @@ static int insert_iova(struct pgtable_map *pgtable_ctx, struct iommu_addr_entry 
 	return 0;
 }
 
+int kiumd_configure_dma_cookie(struct vfio_device *vfio_dev, enum iommu_dma_cookie_type cookie_type, dma_addr_t dma_addr)
+{
+	struct kiumd_iommu_dma_cookie *cookie;
+	int ret;
+
+	cookie = kiumd_get_dma_cookie(vfio_dev);
+	if (!cookie) {
+		pr_err("%s failed to get cookie\n", __func__);
+		return -EINVAL;
+	}
+
+	ret = kiumd_set_dma_cookie_unlocked(cookie, cookie_type, dma_addr);
+	if (ret) {
+		pr_err("%s %d failed to set cookie\n", __func__, __LINE__);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 struct iova_domain *kiumd_get_iova_domain(struct device *dev)
 {
 	struct iommu_domain *domain;
@@ -881,10 +901,8 @@ static int kiumd_smmuv2_set_ttbr1_cfg(struct arm_smmu_domain *smmu_domain,
 	struct arm_smmu_cb *cb = &smmu_domain->smmu->cbs[cfg->cbndx];
 	u32 tcr = cb->tcr[0];
 
-	if (!(cb->tcr[0] & ARM_SMMU_TCR_EPD1)) {
-		pr_err("TTBR1 translation is already enabled");
+	if (!(cb->tcr[0] & ARM_SMMU_TCR_EPD1))
 		return -EINVAL;
-	}
 
 	tcr |= arm_smmu_lpae_tcr(pgtbl_cfg);
 	tcr &= ~(ARM_SMMU_TCR_EPD0 | ARM_SMMU_TCR_EPD1);
@@ -948,11 +966,8 @@ static int kiumd_set_pgtble_ttbr1_context(struct iommu_domain *iommu_dom)
 	}
 
 	smmu_dom->pgtbl_ops = pgtable_ops;
-	if (kiumd_smmuv2_set_ttbr1_cfg(smmu_dom, &cfg) < 0) {
-		pr_err("%s: failed to set TTBR1 cfg\n", __func__);
-		free_io_pgtable_ops(pgtable_ops);
-		return -EINVAL;
-	}
+	if (kiumd_smmuv2_set_ttbr1_cfg(smmu_dom, &cfg) < 0)
+		pr_err("%s: TTBR1 is already enabled for the device\n", __func__);
 
 	return 0;
 }
@@ -2304,8 +2319,15 @@ int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 		return -EINVAL;
 	}
 
-	if (kiusr.ptselect == KGSL_GLOBAL_PT || kiusr.ptselect == KGSL_PER_PROCESS_PT)
+	if (kiusr.ptselect == KGSL_GLOBAL_PT || kiusr.ptselect == KGSL_PER_PROCESS_PT) {
+		ret = kiumd_configure_dma_cookie(vfio_dev, IOMMU_DMA_MSI_COOKIE, kiusr.dma_addr);
+		if (ret) {
+			pr_err("%s %d failed to configure cookie\n", __func__, __LINE__);
+			return -EINVAL;
+		}
+
 		clear_map_iova(kiusr.dma_addr, kiumd_dmabuf->size, kiusr.ptselect);
+	}
 
 	if (kiusr.dma_direction == 1)
 		kiumd_dma_direction = kiusr.dma_direction;
@@ -2313,15 +2335,9 @@ int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 		kiumd_dma_direction = 0;
 
 	if (smap->is_fixed_map) {
-		cookie = kiumd_get_dma_cookie(vfio_dev);
-		if (!cookie) {
-			pr_err("%s failed to get cookie\n", __func__);
-			return -EINVAL;
-		}
-
-		ret = kiumd_set_dma_cookie_unlocked(cookie, 0, kiusr.dma_addr);
+		ret = kiumd_configure_dma_cookie(vfio_dev, IOMMU_DMA_MSI_COOKIE, kiusr.dma_addr);
 		if (ret) {
-			pr_err("%s %d failed to set cookie\n", __func__, __LINE__);
+			pr_err("%s %d failed to configure cookie\n", __func__, __LINE__);
 			return -EINVAL;
 		}
 	}
@@ -2367,6 +2383,14 @@ int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 				pr_err("%s:iommu_unmap failed\n", __func__);
 				return -EINVAL;
 			}
+		}
+	}
+
+	if (smap->is_fixed_map) {
+		ret = kiumd_configure_dma_cookie(vfio_dev, IOMMU_DMA_IOVA_COOKIE, kiusr.dma_addr);
+		if (ret) {
+			pr_err("%s %d failed to configure cookie\n", __func__, __LINE__);
+			return -EINVAL;
 		}
 	}
 
