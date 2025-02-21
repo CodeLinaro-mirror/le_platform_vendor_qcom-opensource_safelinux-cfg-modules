@@ -1233,7 +1233,6 @@ static int kiumd_set_pgtbl_context(char __user *arg, struct file *fp)
 int kiumd_perprocess_pt_alloc(char __user *arg, struct file *fp)
 {
 	struct kiumd_user kiusr;
-	struct file *file;
 	struct vfio_device *vfio_dev;
 	struct vfio_device_file *df;
 	struct io_pgtable_cfg cfg;
@@ -2140,6 +2139,12 @@ int kiumd_dmabuf_managed_iova_map(char __user *arg, struct file *fp)
 		return -EFAULT;
 
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
+
+	if (!kiumd_ctx) {
+		pr_err("%s:kiumd ctx is NULL \n", __func__);
+		return -EINVAL;
+	}
+
 	vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
 	if (!vfio_dev) {
 		pr_err("%s: invalid vfio device fd\n", __func__);
@@ -4086,6 +4091,7 @@ static int kiumd_mmio_smmu_map(char __user *arg, struct file *fp)
 
 	if (!dev_is_platform(vfio_dev->dev)) {
 		pr_err("%s:%d not platform device\n", __func__, __LINE__);
+		ret = -EINVAL;
 		goto reg_free;
 	}
 
@@ -4106,6 +4112,7 @@ static int kiumd_mmio_smmu_map(char __user *arg, struct file *fp)
 		if (ret) {
 			pr_err("%s: failed to allocate iova for: %s, ret: %d\n",
 			       __func__, dev_name(vfio_dev->dev), ret);
+			ret = -EFAULT;
 			goto reg_free;
 		}
 	}
@@ -4115,6 +4122,7 @@ static int kiumd_mmio_smmu_map(char __user *arg, struct file *fp)
 
 	if (ret) {
 		pr_err("%s:Failed to map with error: %d\n", __func__, ret);
+		ret = -EINVAL;
 		goto reg_free;
 	}
 
