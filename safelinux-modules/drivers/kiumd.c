@@ -693,8 +693,10 @@ static struct iommu_addr_entry *alloc_iommu_addr_entry(unsigned long base_addr, 
 {
 	struct iommu_addr_entry *entry = kmem_cache_alloc(iommu_addr_cache, GFP_KERNEL);
 
-	if (!entry)
+	if (!entry) {
+		pr_err("%s:%d failed to create entry for addr: %lx, size: %lu)\n", __func__, __LINE__, base_addr, size);
 		return NULL;
+	}
 
 	entry->base_addr = base_addr;
 	entry->size = size;
@@ -1834,8 +1836,10 @@ static unsigned long alloc_iova_range_contiguous(struct pgtable_map *ptable_ctx,
 	if ((last_allocated_end + size <= ptable_ctx->end_iova) && ptable_ctx->is_contiguous) {
 		new_entry = alloc_iommu_addr_entry(last_allocated_end, size);
 
-		if (!new_entry)
+		if (!new_entry) {
+			pr_err("%s:%d failed to create new entry for iova: %lx with size: %lu\n", __func__, __LINE__, last_allocated_end, size);
 			return 0;
+		}
 
 
 		insert_iova(ptable_ctx, new_entry);
@@ -1847,6 +1851,7 @@ static unsigned long alloc_iova_range_contiguous(struct pgtable_map *ptable_ctx,
 	if (last_allocated_end + size > ptable_ctx->end_iova) {
 		ptable_ctx->last_allocated_end = ptable_ctx->start_iova;
 		ptable_ctx->is_contiguous = false;
+		last_allocated_end = ptable_ctx->start_iova;
 	}
 
 	available_start = last_allocated_end;
@@ -1874,8 +1879,10 @@ static unsigned long alloc_iova_range_contiguous(struct pgtable_map *ptable_ctx,
 	if (found_hole) {
 		new_entry = alloc_iommu_addr_entry(available_start, size);
 
-		if (!new_entry)
+		if (!new_entry) {
+			pr_err("%s:%d failed to create entry for addr: %lx with size: %lu\n", __func__, __LINE__, last_allocated_end, size);
 			return 0;
+		}
 
 		insert_iova(ptable_ctx, new_entry);
 		ptable_ctx->last_allocated_end = available_start + size;
