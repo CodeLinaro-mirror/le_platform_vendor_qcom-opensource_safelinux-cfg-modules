@@ -1132,6 +1132,11 @@ static int kiumd_set_pgtble_ttbr0_context(struct iommu_domain *iommu_dom, struct
 	}
 
 	pgtable = kiumd_ctx->pgtable;
+	if (!pgtable) {
+		pr_err("%s: pgtable is null\n", __func__);
+		return -EINVAL;
+	}
+
 	memcpy(&cfg, &pgtable->cfg, sizeof(struct io_pgtable_cfg));
 	cfg.quirks &= ~IO_PGTABLE_QUIRK_ARM_TTBR1;
 	cfg.tlb = &kgsl_iopgtbl_tlb_ops;
@@ -1285,6 +1290,11 @@ int kiumd_perprocess_pt_alloc(char __user *arg, struct file *fp)
 	}
 
 	pgtable = kiumd_ctx->pgtable;
+	if (!pgtable) {
+		pr_err("%s: pgtable is null\n", __func__);
+		return -EINVAL;
+	}
+
 	memcpy(&cfg, &pgtable->cfg, sizeof(struct io_pgtable_cfg));
 	cfg.quirks &= ~IO_PGTABLE_QUIRK_ARM_TTBR1;
 	cfg.tlb = &kgsl_iopgtbl_tlb_ops;
