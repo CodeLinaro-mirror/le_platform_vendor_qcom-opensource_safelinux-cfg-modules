@@ -1740,7 +1740,7 @@ s64 get_map_offset(u64 size, int ptselect)
 */
 int set_map_iova(u64 offset, struct vfio_device *vfio_dev, int ptselect)
 {
-	dma_addr_t iova;
+	dma_addr_t iova = offset;
 	int ret;
 	struct kiumd_iommu_dma_cookie *cookie;
 
@@ -1748,8 +1748,10 @@ int set_map_iova(u64 offset, struct vfio_device *vfio_dev, int ptselect)
 		iova = KGSL_GLOBAL_PT_BASE_IOVA + offset;
 	else if (ptselect == KGSL_PER_PROCESS_PT)
 		iova = offset;
-	else
+	else {
 		pr_err("%s invalid ptselect\n", __func__);
+		return -EINVAL;
+	}
 
 	cookie = kiumd_get_dma_cookie(vfio_dev);
 	if (!cookie) {
@@ -1779,8 +1781,10 @@ static void kiumd_mangle_sg_table(struct sg_table *sg_table)
 	int i;
 	struct scatterlist *sg;
 
-	for_each_sgtable_sg(sg_table, sg, i)
-		sg->page_link ^= ~0xffUL;
+	for_each_sgtable_sg(sg_table, sg, i) {
+		if (sg)
+			sg->page_link ^= ~0xffUL;
+	}
 }
 
 /**
@@ -1797,8 +1801,10 @@ bool is_fixed_mapping(struct vfio_device *vfio_dev)
 	struct kiumd_iommu_dma_cookie *cookie;
 
 	cookie = kiumd_get_dma_cookie(vfio_dev);
-	if (cookie->type == IOMMU_DMA_MSI_COOKIE)
-		return true;
+	if (cookie) {
+		if (cookie->type == IOMMU_DMA_MSI_COOKIE)
+			return true;
+	}
 
 	return false;
 }
@@ -3076,8 +3082,10 @@ static int kiumd_hyp_unassign_sg(struct sg_table *sgt, int *source_vm_list,
 	} while (sg);
 
 	if (clear_page_private)
-		for_each_sg(sgt->sgl, sg, sgt->nents, i)
-			ClearPagePrivate(sg_page(sg));
+		for_each_sg(sgt->sgl, sg, sgt->nents, i) {
+			if (sg)
+				ClearPagePrivate(sg_page(sg));
+		}
 
 	trace_kiumd_hyp_unassign_sg_end(sgt);
 out:
@@ -4009,8 +4017,8 @@ static int kiumd_smmu_fault_handler_deregister(char __user *arg)
 				retval = -1;
 				break;
 			}
-
-			prev->next = temp->next;
+			if (prev)
+				prev->next = temp->next;
 			temp->next = NULL;
 			kobject_put(temp->kobj);
 			kfree(temp);
@@ -4121,7 +4129,7 @@ static int kiumd_smmu_fault_handler_register(char __user *arg)
 static int kiumd_mmio_smmu_map(char __user *arg, struct file *fp)
 {
 	struct kiumd_smmu_mmio_map kiusr;
-	int ret;
+	int ret = 0;
 	struct vfio_device *vfio_dev;
 	struct kiumd_iommu_dma_cookie *cookie;
 	char *reg_name;
