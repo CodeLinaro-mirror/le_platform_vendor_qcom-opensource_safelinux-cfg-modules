@@ -428,7 +428,7 @@ static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 			if (copy_from_user(scm_buf,
 					(struct qcom_scm_camera_qos *)scm_data.args_buffer[1],
-					size)) {
+					min(size, sizeof(scm_buf)))) {
 				dev_err(dev_data->dev, "copy_from_user failed\n");
 			}
 			scm_data.ret = qcom_scm_camera_update_camnoc_qos(
