@@ -4615,11 +4615,7 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 	struct iommu_domain *iommu_dom;
 	struct hlist_node *tmp;
 
-	if (!ki_ctx) {
-		pr_err("%s:kiumd ctx is NULL\n", __func__);
-		return -EINVAL;
-	}
-	spin_lock(&ki_ctx->smmu_lock);
+
 	if (!hash_empty(ki_ctx->smmu_table)) {
 		hash_for_each_safe(ki_ctx->smmu_table, iter, tmp, smap, node) {
 			if (smap->context) {
@@ -4630,6 +4626,7 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 				dma_unmap_resource(mmio_ctx->dev, mmio_ctx->iova, mmio_ctx->size, 0, 0);
 				kfree(smap->context);
 			}
+
 			if (smap->dmabuf_ptr) {
 				kiumd_dmabuf = (struct dma_buf *)smap->dmabuf_ptr;
 
@@ -4641,11 +4638,20 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 				    smap->ptselect == KGSL_DEFAULT_PT)
 					continue;
 
+				if (smap->is_fixed_map) {
+					ret = kiumd_configure_dma_cookie(smap->vfio_dev, IOMMU_DMA_MSI_COOKIE, smap->dmabuf_ptr);
+					if (ret) {
+						pr_err("%s %d failed to configure cookie\n", __func__, __LINE__);
+						break;
+					}
+				}
+
 				if (smap->dmabufattach && smap->sgt_ptr)
 					dma_buf_unmap_attachment_unlocked((struct dma_buf_attachment *)
 									  smap->dmabufattach,
 									  (struct sg_table *)smap->sgt_ptr,
 									  smap->dma_dir);
+
 				pr_debug("kiumd_debug: unmap dmabufatach:%llx\n", smap->dmabufattach);
 				if (smap->is_iova_zero == FIXED_IOVA_AT_ZERO) {
 					iommu_dom = kiumd_iommu_get_dma_domain(smap->vfio_dev->dev);
@@ -4665,15 +4671,23 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 					}
 				}
 
+                                if (smap->is_fixed_map) {
+					ret = kiumd_configure_dma_cookie(smap->vfio_dev, IOMMU_DMA_IOVA_COOKIE, smap->dmabuf_ptr);
+					if (ret) {
+						pr_err("%s %d failed to configure cookie\n", __func__, __LINE__);
+						break;
+					}
+				}
+
 				dma_buf_detach(kiumd_dmabuf, smap->dmabufattach);
 				dma_buf_put(kiumd_dmabuf);
 				pr_debug("kiumd_debug: unmap done\n");
 			}
+
 			hash_del(&smap->node);
 			kfree(smap);
 		}
 	}
-	spin_unlock(&ki_ctx->smmu_lock);
 
 	kfree(ki_ctx->res_mem_area);
 	mutex_lock(&ki_ctx->kiumd_xa_mutex);
