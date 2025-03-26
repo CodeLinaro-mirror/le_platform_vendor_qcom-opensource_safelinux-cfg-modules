@@ -35,17 +35,22 @@ static int qcom_uscmi_release(struct inode *inode, struct file *filp)
         return 0;
 }
 
-static struct device * get_pd_dev(struct qcom_uscmi_dev *uscmi, const char *name, int *idx)
+static struct device * get_pd_dev(struct qcom_uscmi_dev *uscmi, char *name, int *idx)
 {
-	int index = -EINVAL;
+	int index;
+	size_t len;
 
 	if (!uscmi->pd_list) { /* single domain */
 		*idx = 0;
 		return uscmi->dev;
 	}
 
-	if (strlen(name))
-		index = of_property_match_string(uscmi->dev->of_node, "power-domain-names",
+	len = strnlen(name, NAME_LEN);
+	if (!len || len == NAME_LEN)
+		return NULL;
+
+	name[len] = '\0';
+	index = of_property_match_string(uscmi->dev->of_node, "power-domain-names",
 						 name);
 
 	if (index < 0) {
@@ -165,13 +170,20 @@ static int do_reset_operation(scmi_oper_ioctl_t *req,
 			      struct qcom_uscmi_dev *uscmi)
 {
 	struct device *dev = uscmi->dev;
-	const char *id = strlen(req->name) ? req->name : NULL;
+	const char *id;
 	struct reset_control *rstc;
 	int ret = 0;
+	size_t len;
 
 	if (req->proto != SCMI_PROTO_RESET)
 		return -EINVAL;
 
+	len = strnlen(req->name, NAME_LEN);
+	if (!len || len == NAME_LEN)
+		return -EINVAL;
+
+	req->name[len] = '\0';
+	id = req->name;
 	rstc = devm_reset_control_get_optional(dev, id);
 	if (IS_ERR_OR_NULL(rstc))
 		return -ENODEV;
