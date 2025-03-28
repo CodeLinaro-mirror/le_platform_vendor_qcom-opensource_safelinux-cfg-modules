@@ -803,7 +803,7 @@ static unsigned long align_iova(struct device *dev, unsigned long start_iova, un
 	return start_iova;
 }
 
-static unsigned int alloc_iova_range(struct vfio_device *vfio_dev, struct pgtable_map *ptable_ctx, unsigned long size, unsigned long max_shift)
+static unsigned long alloc_iova_range(struct vfio_device *vfio_dev, struct pgtable_map *ptable_ctx, unsigned long size, unsigned long max_shift)
 {
 	struct rb_node *node = rb_first(&ptable_ctx->rbtree);
 	unsigned long start_iova = ptable_ctx->start_iova;
@@ -834,10 +834,8 @@ static unsigned int alloc_iova_range(struct vfio_device *vfio_dev, struct pgtabl
 
 	if (start_iova + size <= ptable_ctx->end_iova) {
 		struct iommu_addr_entry *new_entry = alloc_iommu_addr_entry(start_iova, size);
-
 		if (!new_entry)
 			return 0;
-
 
 		insert_iova(ptable_ctx, new_entry);
 		return start_iova;
@@ -1563,6 +1561,41 @@ int kiumd_perprocess_pgtble_free(char __user *arg, struct file *fp)
 	return 0;
 }
 
+int kiumd_set_dma_addr_ranges(struct kiumd_ctx *kiumd_ctx, struct device *dev)
+{
+	const __be32 *addr_range;
+	u64 start_addr, end_addr;
+	struct device_node *np;
+	int len;
+
+	np = dev->of_node;
+	if (!np) {
+		dev_err(dev, "Device tree node not found\n");
+		return -EINVAL;
+	}
+
+	addr_range = of_get_property(np, "qcom,iommu-dma-addr-range", &len);
+	if (!addr_range)
+		return 0; /*This is not an error, not every device need to have this property set*/
+
+	if (len < (2 * sizeof(u32))) {
+		dev_err(dev, "qcom,iommu-dma-addr-range property length is invalid\n");
+		return -EINVAL;
+	}
+
+	start_addr = of_read_number(addr_range, 2);
+	end_addr = of_read_number(addr_range + 2, 2);
+	if (end_addr < start_addr) {
+		dev_err(dev, "invalid address specified in the device tree\n");
+		return -EINVAL;
+	}
+
+	kiumd_ctx->pt_start_iova = start_addr;
+	kiumd_ctx->pt_end_iova = end_addr;
+
+	return 0;
+}
+
 /**
 * @Brief: This function is to map the IOVAs in a predefined address range. The
 * IOVA address range should be specified in the device tree using the attribute
@@ -1616,6 +1649,7 @@ int kiumd_dmabuf_custom_iova_init(char __user *arg, struct file *fp)
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
 	if (!kiumd_ctx) {
 		pr_err("%s:kiumd ctx is NULL \n", __func__);
+		fput(file);
 		return -EINVAL;
 	}
 
@@ -1628,6 +1662,13 @@ int kiumd_dmabuf_custom_iova_init(char __user *arg, struct file *fp)
 	//Print a warning and continue.
 	if (ret)
 		pr_err("%s:WARNING: max_segment size not set.\n", __func__);
+
+	ret = kiumd_set_dma_addr_ranges(kiumd_ctx, vfio_dev->dev);
+	if (ret) {
+		pr_err("%s:set dma addr ranges failed for %s\n", __func__, dev_name(vfio_dev->dev));
+		fput(file);
+		return -EINVAL;
+	}
 
 	domain = kiumd_iommu_get_dma_domain(vfio_dev->dev);
 	if (!domain) {
