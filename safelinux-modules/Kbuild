@@ -40,6 +40,9 @@ kiumd_kgsl-objs := drivers/kiumd_kgsl.o
 obj-m += profiler.o
 profiler-objs := drivers/profiler.o
 
+obj-m += qcom_ethqos_filter.o
+qcom_ethqos_filter-objs := drivers/qcom_ethqos_filter.o
+
 ifndef CONFIG_QCOM_DMABUF_HEAPS
 obj-m			+= qcom_dma_heaps.o
 qcom_dma_heaps-objs	:= drivers/qcom_dma_heap.o drivers/qcom_dt_parser.o drivers/qcom_sg_ops.o
@@ -49,3 +52,8 @@ endif
 
 obj-m += mhi_ep_net.o
 mhi_ep_net-objs := drivers/mhi_ep_net.o
+
+ifdef CONFIG_QTI_SCMI_VENDOR_PROTOCOL
+obj-m += vendor_uscmi.o
+vendor_uscmi-objs := drivers/vendor_uscmi.o
+endif
