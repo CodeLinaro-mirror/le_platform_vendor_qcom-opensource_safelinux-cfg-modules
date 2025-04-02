@@ -28,6 +28,7 @@
 #define KIUMD_SMMU_MANAGED_IOVA_UNMAP	_IOWR('R', 30, struct kiumd_user)
 #define KIUMD_SMMU_ASSIGN_BUF		_IOWR('R', 31, struct kiumd_user)
 #define KIUMD_SMMU_UNASSIGN_BUF		_IOWR('R', 32, struct kiumd_user)
+#define KIUMD_MANAGE_RUNTIME_PM        _IOWR('R', 33, struct kiumd_user)
 
 #define IOMMU_NOEXEC    (1 << 3)
 #define IOMMU_MMIO      (1 << 4)
@@ -55,6 +56,9 @@
 
 #define KIUMD_IOVA_SIZE_ALIGNED 6
 #define KIUMD_IOVA_PAGE_ALIGNED 7
+
+#define DEV_PWR_OFF 1
+#define DEV_PWR_ON 2
 
 enum kiumd_iova_addr_type {
 	KGSL_SMMU_GLOBALPT_FIXED_ADDR_SET,
