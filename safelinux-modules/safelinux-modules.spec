@@ -67,10 +67,13 @@ rm -rf $RPM_BUILD_ROOT
 %{_includedir}/uapi/misc/scm_user_intf.h
 %{_includedir}/uapi/misc/qcom_uscmi.h
 %{_includedir}/safelinux_modules_trace.h
+%{_includedir}/uapi/misc/vendor_uscmi.h
+%{_includedir}/vendor_uscmi_trace.h
 
 %files
 %define kernel_module_path /lib/modules/%{kversion_with_debug}
 %{kernel_module_path}/extra/profiler.ko
+%{kernel_module_path}/extra/qcom_ethqos_filter.ko
 %{kernel_module_path}/extra/apps_pinctrl.ko
 %{kernel_module_path}/extra/scm_user_intf.ko
 %{kernel_module_path}/extra/vfio_iommu_qcom.ko
@@ -82,6 +85,7 @@ rm -rf $RPM_BUILD_ROOT
 %{kernel_module_path}/extra/qcom_dma_heaps.ko
 %{kernel_module_path}/extra/mhi_ep_net.ko
 %{kernel_module_path}/extra/qcom_dload_mode.ko
+%{kernel_module_path}/extra/vendor_uscmi.ko
 
 %changelog
 * Sun Apr 28 2024 Sankalp Negi <quic_snegi@quicinc.com> 1.2

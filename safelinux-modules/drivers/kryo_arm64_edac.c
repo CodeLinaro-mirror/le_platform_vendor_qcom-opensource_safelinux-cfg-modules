@@ -60,6 +60,10 @@
 #define KRYO_ERRXMISC_LVL_GOLD(a)	(a & 0xF)
 #define KRYO_ERRXMISC_WAY(a)		((a >> 28) & 0xF)
 
+#define CPU_0_CLUSTER_0			(0U)
+#define CPU_0_CLUSTER_1			(4U)
+
+
 #define edac_cpu_printk(level, prefix, fmt, arg...) \
 	printk(level "EDAC " prefix ": " fmt, ##arg)
 
@@ -209,7 +213,7 @@ static int request_erp_irq(struct platform_device *pdev, const char *propname,
 	if (!percpu) {
 		rc = devm_request_threaded_irq(&pdev->dev, irq, NULL,
 					       handler,
-					       IRQF_ONESHOT | IRQF_TRIGGER_HIGH,
+					       IRQF_ONESHOT | IRQF_TRIGGER_HIGH | IRQF_NOBALANCING | IRQF_NO_AUTOEN,
 					       desc,
 					       ed);
 
@@ -577,26 +581,13 @@ static int kryo_cpu_erp_probe(struct platform_device *pdev)
 			kryo_l1_l2_handler, drv, 1 , &irq))
 		fail++;
 
-	if (request_erp_irq(pdev, "l3-scu-faultirq",
-			"KRYO L3-SCU ECC FAULTIRQ",
-			kryo_l3_scu_handler, drv, 0, &irq))
-		fail++;
-
 	if (request_erp_irq(pdev, "l3-c0-scu-faultirq",
 			"KRYO L3-SCU ECC FAULTIRQ CLUSTER 0",
 			kryo_l3_scu_handler, drv, 0, &irq))
 		fail++;
 	else {
-		for_each_possible_cpu(cpu) {
-			pr_debug("kryo : package id:%u mask:%*pb\n",
-				 topology_physical_package_id(cpu),
-				 cpumask_pr_args(topology_core_cpumask(cpu)));
-			if (topology_physical_package_id(cpu) == 0 ||
-			    topology_cluster_id(cpu) == 0) {
-				irq_set_affinity(irq, topology_llc_cpumask(cpu));
-				break;
-			}
-		}
+		irq_set_affinity(irq, cpumask_of(CPU_0_CLUSTER_0));
+		enable_irq(irq);
 	}
 
 	if (request_erp_irq(pdev, "l3-c1-scu-faultirq",
@@ -604,20 +595,8 @@ static int kryo_cpu_erp_probe(struct platform_device *pdev)
 			kryo_l3_scu_handler, drv, 0, &irq))
 		fail++;
 	else {
-		for_each_possible_cpu(cpu) {
-			pr_debug("kryo:package id:%u cluster id:%d core mask:%*pb llc :%*pb cluster mask:%*pb topology: %*pb\n",
-				 topology_physical_package_id(cpu),
-				 topology_cluster_id(cpu),
-				 cpumask_pr_args(topology_core_cpumask(cpu)),
-				 cpumask_pr_args(topology_llc_cpumask(cpu)),
-				 cpumask_pr_args(topology_cluster_cpumask(cpu)),
-				 cpumask_pr_args(topology_sibling_cpumask(cpu)));
-			if (topology_physical_package_id(cpu) == 1 ||
-			    topology_cluster_id(cpu) == 1) {
-				irq_set_affinity(irq, topology_llc_cpumask(cpu));
-				break;
-			}
-		}
+		irq_set_affinity(irq, cpumask_of(CPU_0_CLUSTER_1));
+		enable_irq(irq);
 	}
 
 	num_irqs = platform_irq_count(pdev);
