@@ -177,6 +177,10 @@ next:
 		list_add(&new->list, inverted);
 	}
 
+	if (!prev) {
+		ret = -ENOMEM;
+		goto out_err;
+	}
 	/* Handle the end - checking for overflow */
 	rsv_start = prev->start + prev->length;
 	rsv_size = -rsv_start;
