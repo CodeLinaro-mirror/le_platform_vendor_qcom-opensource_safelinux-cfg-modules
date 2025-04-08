@@ -40,6 +40,12 @@ kryo_arm64_edac-objs := drivers/kryo_arm64_edac.o
 obj-m += kiumd_kgsl.o
 kiumd_kgsl-objs := drivers/kiumd_kgsl.o
 
+obj-m += iommu_faults.o
+ifneq ($(KERNELRELEASE), "5.14.0")
+ccflags-y += -I$(KERNEL_SRC)/drivers/iommu/arm
+endif
+iommu_faults-objs := drivers/iommu_faults.o
+
 obj-m += profiler.o
 profiler-objs := drivers/profiler.o
 
