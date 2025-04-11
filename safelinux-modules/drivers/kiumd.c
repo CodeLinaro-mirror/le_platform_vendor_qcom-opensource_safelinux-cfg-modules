@@ -1074,16 +1074,12 @@ static int kiumd_smmuv2_set_ttbr0_cfg(struct arm_smmu_domain *smmu_domain,
  * Return: 0 on success, negative error code on failure
  */
 
-static int kiumd_smmuv2_set_ttbr1_cfg(struct arm_smmu_domain *smmu_domain,
-						const struct io_pgtable_cfg *pgtbl_cfg)
+static void kiumd_smmuv2_set_ttbr1_cfg(struct arm_smmu_domain *smmu_domain,
+				      const struct io_pgtable_cfg *pgtbl_cfg)
 {
-
 	struct arm_smmu_cfg *cfg = &smmu_domain->cfg;
 	struct arm_smmu_cb *cb = &smmu_domain->smmu->cbs[cfg->cbndx];
 	u32 tcr = cb->tcr[0];
-
-	if (!(cb->tcr[0] & ARM_SMMU_TCR_EPD1))
-		return -EINVAL;
 
 	tcr |= arm_smmu_lpae_tcr(pgtbl_cfg);
 	tcr &= ~(ARM_SMMU_TCR_EPD0 | ARM_SMMU_TCR_EPD1);
@@ -1094,8 +1090,9 @@ static int kiumd_smmuv2_set_ttbr1_cfg(struct arm_smmu_domain *smmu_domain,
 
 	kiumd_smmuv2_write_context_bank(smmu_domain->smmu, cb->cfg->cbndx);
 
-	return 0;
+	return;
 }
+
 
 /**
  * kiumd_perprocess_set_ttbr1_context - Configure TTTBR1 settings for the
@@ -1112,14 +1109,25 @@ static int kiumd_smmuv2_set_ttbr1_cfg(struct arm_smmu_domain *smmu_domain,
 static int kiumd_set_pgtble_ttbr1_context(struct iommu_domain *iommu_dom)
 {
 	struct arm_smmu_domain *smmu_dom;
+	struct arm_smmu_cfg *smmu_cfg;
 	struct io_pgtable_cfg cfg;
 	struct io_pgtable *pagetable;
 	struct io_pgtable_ops *pgtable_ops;
+	struct arm_smmu_cb *cb;
 
 	smmu_dom = container_of(iommu_dom, struct arm_smmu_domain, domain);
 	if (!smmu_dom || !smmu_dom->pgtbl_ops) {
 		pr_err("%s: smmu domain/pagetable ops is invalid\n", __func__);
 		return -EINVAL;
+	}
+
+	smmu_cfg = &smmu_dom->cfg;
+	cb = &smmu_dom->smmu->cbs[smmu_cfg->cbndx];
+	if (!(cb->tcr[0] & ARM_SMMU_TCR_EPD1)) {
+		/** Not an error. During kgsl relaunch, we dont have to reprogram
+		*  TTBR1 if its already enabled.*/
+		pr_err("%s: TTBR1 is already enabled for the device\n", __func__);
+		return 0;
 	}
 
 	pagetable = io_pgtable_ops_to_pgtable(smmu_dom->pgtbl_ops);
@@ -1133,11 +1141,8 @@ static int kiumd_set_pgtble_ttbr1_context(struct iommu_domain *iommu_dom)
 	cfg.tlb = &kgsl_iopgtbl_tlb_ops;
 
 	if (cfg.quirks & IO_PGTABLE_QUIRK_ARM_TTBR1) {
-		iommu_dom->geometry.aperture_start = ~0UL << 48;
+		iommu_dom->geometry.aperture_start = ~0UL << cfg.ias;
 		iommu_dom->geometry.aperture_end = ~0UL;
-	} else {
-		pr_err("%s: Incorrect quirk set for the device\n", __func__);
-		return -EINVAL;
 	}
 
 	pgtable_ops = alloc_io_pgtable_ops(ARM_64_LPAE_S1, &cfg, NULL);
@@ -1146,9 +1151,8 @@ static int kiumd_set_pgtble_ttbr1_context(struct iommu_domain *iommu_dom)
 		return -EINVAL;
 	}
 
+	kiumd_smmuv2_set_ttbr1_cfg(smmu_dom, &cfg);
 	smmu_dom->pgtbl_ops = pgtable_ops;
-	if (kiumd_smmuv2_set_ttbr1_cfg(smmu_dom, &cfg) < 0)
-		pr_err("%s: TTBR1 is already enabled for the device\n", __func__);
 
 	return 0;
 }
