@@ -46,6 +46,20 @@
 #endif
 #include "vfio.h"
 
+#ifdef CONFIG_SAFELINUX_KERNEL
+#define kiumd_set_dma_max_seg_size(_dev, _size)				\
+({									\
+	dma_set_max_seg_size(_dev, _size);				\
+})
+#else
+#define kiumd_set_dma_max_seg_size(_dev, _size)				\
+({									\
+	ret = dma_set_max_seg_size(_dev, _size);			\
+	if (ret)							\
+		pr_warn("%s: max_segment size not set.\n", __func__);	\
+})
+#endif
+
 static struct kobject *smmu_obj;
 static struct kobject *device_obj;
 
@@ -1656,10 +1670,7 @@ int kiumd_dmabuf_custom_iova_init(char __user *arg, struct file *fp)
 	 */
 	kiumd_ctx->max_shift = get_shift_from_dt(vfio_dev->dev);
 
-	ret = dma_set_max_seg_size(vfio_dev->dev, (unsigned int) DMA_BIT_MASK(32));
-	//Print a warning and continue.
-	if (ret)
-		pr_err("%s:WARNING: max_segment size not set.\n", __func__);
+	kiumd_set_dma_max_seg_size(vfio_dev->dev, (unsigned int) DMA_BIT_MASK(32));
 
 	ret = kiumd_set_dma_addr_ranges(kiumd_ctx, vfio_dev->dev);
 	if (ret) {
