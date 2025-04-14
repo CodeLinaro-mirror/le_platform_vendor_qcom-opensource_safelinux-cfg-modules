@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Copyright (C) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
+/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 #include <linux/arm-smccc.h>
 #include <linux/cdev.h>
@@ -103,6 +103,11 @@ static const struct svc_cmd_list sip_tbl[] = {
 	[QCOM_SCM_SVC_CAMERA] = SVC_CMD_GRP(QCOM_SCM_SVC_CAMERA,
 					    1,
 					    QCOM_SCM_CAMERA_UPDATE_CAMNOC_QOS),
+
+	[QCOM_SCM_SVC_GPU] = SVC_CMD_GRP(QCOM_SCM_SVC_GPU,
+					 2,
+					 QCOM_SCM_SVC_GPU0_INIT_REGS,
+					 QCOM_SCM_SVC_GPU1_INIT_REGS),
 };
 
 /*
@@ -315,6 +320,7 @@ static bool validate_svc_cmd(unsigned int svc_id, unsigned int cmd_id)
 	case QCOM_SCM_SVC_SAFETY:
 	case QCOM_SCM_SVC_LMH:
 	case QCOM_SCM_SVC_CAMERA:
+	case QCOM_SCM_SVC_GPU:
 
 		svc_cmd_tmp = sip_tbl[svc_id];
 		break;
@@ -496,6 +502,10 @@ static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			break;
 		}
 		}
+		break;
+
+	case QCOM_SCM_SVC_GPU:
+		scm_data.ret = qcom_scm_multi_kgsl_init_regs(scm_data.args_buffer[0], scm_data.cmd);
 		break;
 	}
 
