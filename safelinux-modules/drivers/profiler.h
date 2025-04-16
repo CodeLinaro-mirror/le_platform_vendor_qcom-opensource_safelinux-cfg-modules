@@ -1,19 +1,23 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (c) 2017, 2020-2021 The Linux Foundation. All rights reserved.
-Copyright (c) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 */
 
 #ifndef __PROFILER_H_
 #define __PROFILER_H_
 
 /* Configure the number of channels per chipset. */
-#define LLCC_CHANNELS 6
-#define CABO_CHANNELS 6
+#define LLCC_CHANNELS 16
+#define CABO_CHANNELS 16
 #define NUM_REG_TYPES 2
 #define HF_COUNTERS 16
 #define SF_COUNTERS 12
 #define GEMNOC_COUNTERS 8
+#define GEMNOC_CHANNELS_NUM 8
+#define LLCC_CAB0_COUNTER_OFFSET(n)    (0x4*n)
+#define GEMNOC_OFFSET(n)               (0x140 + 0x80*n)
+#define MMNOC_OFFSETS(n)               (0x80*n)
 
 /* Structure for backward compatibility. */
 struct profiler_bw_cntrs_req_m {
@@ -56,8 +60,8 @@ struct device_param_init {
 	int num_sf_metrics;
 	uint32_t mmnoc_base;
 	uint32_t mmnoc_map_size;
+	int gemnoc_channels;
 };
-
 
 /* Error types */
 enum tz_bw_svc_err {
@@ -79,12 +83,6 @@ enum tz_bw_svc_err {
 
 #define PROFILER_IOCTL_GET_BW_INFO \
 	_IOWR(PROFILER_IOC_MAGIC, 1, struct profiler_bw_cntrs_req)
-
-#define PROFILER_IOCTL_SET_OFFSETS \
-	_IOWR(PROFILER_IOC_MAGIC, 2, struct reg_offset)
-
-#define PROFILER_IOCTL_DEVICE_INIT \
-	_IOWR(PROFILER_IOC_MAGIC, 3, struct device_param_init)
 
 #define PROFILER_IOCTL_GET_BW_INFO_BC \
 	_IOWR(PROFILER_IOC_MAGIC, 4, struct profiler_bw_cntrs_req_m)
