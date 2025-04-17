@@ -46,6 +46,20 @@
 #endif
 #include "vfio.h"
 
+#ifdef CONFIG_SAFELINUX_KERNEL
+#define kiumd_set_dma_max_seg_size(_dev, _size)				\
+({									\
+	dma_set_max_seg_size(_dev, _size);				\
+})
+#else
+#define kiumd_set_dma_max_seg_size(_dev, _size)				\
+({									\
+	ret = dma_set_max_seg_size(_dev, _size);			\
+	if (ret)							\
+		pr_warn("%s: max_segment size not set.\n", __func__);	\
+})
+#endif
+
 static struct kobject *smmu_obj;
 static struct kobject *device_obj;
 
@@ -803,7 +817,7 @@ static unsigned long align_iova(struct device *dev, unsigned long start_iova, un
 	return start_iova;
 }
 
-static unsigned int alloc_iova_range(struct vfio_device *vfio_dev, struct pgtable_map *ptable_ctx, unsigned long size, unsigned long max_shift)
+static unsigned long alloc_iova_range(struct vfio_device *vfio_dev, struct pgtable_map *ptable_ctx, unsigned long size, unsigned long max_shift)
 {
 	struct rb_node *node = rb_first(&ptable_ctx->rbtree);
 	unsigned long start_iova = ptable_ctx->start_iova;
@@ -834,10 +848,8 @@ static unsigned int alloc_iova_range(struct vfio_device *vfio_dev, struct pgtabl
 
 	if (start_iova + size <= ptable_ctx->end_iova) {
 		struct iommu_addr_entry *new_entry = alloc_iommu_addr_entry(start_iova, size);
-
 		if (!new_entry)
 			return 0;
-
 
 		insert_iova(ptable_ctx, new_entry);
 		return start_iova;
@@ -1116,6 +1128,11 @@ static int kiumd_set_pgtble_ttbr0_context(struct iommu_domain *iommu_dom, struct
 	}
 
 	pgtable = kiumd_ctx->pgtable;
+	if (!pgtable) {
+		pr_err("%s: pgtable is null\n", __func__);
+		return -EINVAL;
+	}
+
 	memcpy(&cfg, &pgtable->cfg, sizeof(struct io_pgtable_cfg));
 	cfg.quirks &= ~IO_PGTABLE_QUIRK_ARM_TTBR1;
 	cfg.tlb = &kgsl_iopgtbl_tlb_ops;
@@ -1217,7 +1234,6 @@ static int kiumd_set_pgtbl_context(char __user *arg, struct file *fp)
 int kiumd_perprocess_pt_alloc(char __user *arg, struct file *fp)
 {
 	struct kiumd_user kiusr;
-	struct file *file;
 	struct vfio_device *vfio_dev;
 	struct vfio_device_file *df;
 	struct io_pgtable_cfg cfg;
@@ -1252,7 +1268,6 @@ int kiumd_perprocess_pt_alloc(char __user *arg, struct file *fp)
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
 	if (!kiumd_ctx) {
 		pr_err("%s:%d kiumd ctx is NULL \n", __func__, __LINE__);
-		fput(file);
 		return -EINVAL;
 	}
 
@@ -1269,6 +1284,11 @@ int kiumd_perprocess_pt_alloc(char __user *arg, struct file *fp)
 	}
 
 	pgtable = kiumd_ctx->pgtable;
+	if (!pgtable) {
+		pr_err("%s: pgtable is null\n", __func__);
+		return -EINVAL;
+	}
+
 	memcpy(&cfg, &pgtable->cfg, sizeof(struct io_pgtable_cfg));
 	cfg.quirks &= ~IO_PGTABLE_QUIRK_ARM_TTBR1;
 	cfg.tlb = &kgsl_iopgtbl_tlb_ops;
@@ -1553,6 +1573,41 @@ int kiumd_perprocess_pgtble_free(char __user *arg, struct file *fp)
 	return 0;
 }
 
+int kiumd_set_dma_addr_ranges(struct kiumd_ctx *kiumd_ctx, struct device *dev)
+{
+	const __be32 *addr_range;
+	u64 start_addr, end_addr;
+	struct device_node *np;
+	int len;
+
+	np = dev->of_node;
+	if (!np) {
+		dev_err(dev, "Device tree node not found\n");
+		return -EINVAL;
+	}
+
+	addr_range = of_get_property(np, "qcom,iommu-dma-addr-range", &len);
+	if (!addr_range)
+		return 0; /*This is not an error, not every device need to have this property set*/
+
+	if (len < (2 * sizeof(u32))) {
+		dev_err(dev, "qcom,iommu-dma-addr-range property length is invalid\n");
+		return -EINVAL;
+	}
+
+	start_addr = of_read_number(addr_range, 2);
+	end_addr = of_read_number(addr_range + 2, 2);
+	if (end_addr < start_addr) {
+		dev_err(dev, "invalid address specified in the device tree\n");
+		return -EINVAL;
+	}
+
+	kiumd_ctx->pt_start_iova = start_addr;
+	kiumd_ctx->pt_end_iova = end_addr;
+
+	return 0;
+}
+
 /**
 * @Brief: This function is to map the IOVAs in a predefined address range. The
 * IOVA address range should be specified in the device tree using the attribute
@@ -1606,6 +1661,7 @@ int kiumd_dmabuf_custom_iova_init(char __user *arg, struct file *fp)
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
 	if (!kiumd_ctx) {
 		pr_err("%s:kiumd ctx is NULL \n", __func__);
+		fput(file);
 		return -EINVAL;
 	}
 
@@ -1614,10 +1670,14 @@ int kiumd_dmabuf_custom_iova_init(char __user *arg, struct file *fp)
 	 */
 	kiumd_ctx->max_shift = get_shift_from_dt(vfio_dev->dev);
 
-	ret = dma_set_max_seg_size(vfio_dev->dev, (unsigned int) DMA_BIT_MASK(32));
-	//Print a warning and continue.
-	if (ret)
-		pr_err("%s:WARNING: max_segment size not set.\n", __func__);
+	kiumd_set_dma_max_seg_size(vfio_dev->dev, (unsigned int) DMA_BIT_MASK(32));
+
+	ret = kiumd_set_dma_addr_ranges(kiumd_ctx, vfio_dev->dev);
+	if (ret) {
+		pr_err("%s:set dma addr ranges failed for %s\n", __func__, dev_name(vfio_dev->dev));
+		fput(file);
+		return -EINVAL;
+	}
 
 	domain = kiumd_iommu_get_dma_domain(vfio_dev->dev);
 	if (!domain) {
@@ -2062,8 +2122,7 @@ int kiumd_dmabuf_managed_iova_map(char __user *arg, struct file *fp)
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
 	if (!kiumd_ctx) {
 		pr_err("%s:kiumd ctx is NULL \n", __func__);
-		ret = -EINVAL;
-		goto fail_detach;
+		return -EINVAL;
 	}
 
 	vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
@@ -2247,6 +2306,11 @@ int kiumd_dmabuf_managed_iova_unmap(char __user *arg, struct file *fp)
 									kiumd_dma_direction);
 
 	iommu_dom = kiumd_get_iommu_domain(kiusr.vfio_fd);
+	if (!iommu_dom) {
+		pr_err("%s: iommu_dom is NULL\n", __func__);
+		return -EINVAL;
+	}
+
 	iommu_flush_iotlb_all(iommu_dom);
 
 	spin_lock(&kiumd_ctx->smmu_lock);
@@ -4214,6 +4278,7 @@ static int kiumd_mmio_smmu_map(char __user *arg, struct file *fp)
 
 	if (!dev_is_platform(vfio_dev->dev)) {
 		pr_err("%s:%d not platform device\n", __func__, __LINE__);
+		ret = -EINVAL;
 		goto reg_free;
 	}
 
@@ -4232,6 +4297,7 @@ static int kiumd_mmio_smmu_map(char __user *arg, struct file *fp)
 		ret = kiumd_set_dma_cookie(cookie, IOMMU_DMA_MSI_COOKIE, kiusr.iova);
 		if (ret) {
 			mutex_unlock(&cookie->mutex);
+			ret = -EFAULT;
 			goto reg_free;
 		}
 	}
@@ -4245,6 +4311,7 @@ static int kiumd_mmio_smmu_map(char __user *arg, struct file *fp)
 
 	if (ret || retval) {
 		pr_err("%s:Failed to map with error: %d\n", __func__, ret);
+		ret = -EINVAL;
 		goto reg_free;
 	}
 
