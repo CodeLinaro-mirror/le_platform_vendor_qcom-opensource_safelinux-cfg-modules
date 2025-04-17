@@ -502,7 +502,9 @@ static int kiumd_set_dma_cookie(struct kiumd_iommu_dma_cookie *cookie,
 	}
 
 	cookie->type = type;
-	cookie->msi_iova = iova;
+	if (type == IOMMU_DMA_MSI_COOKIE) {
+		cookie->msi_iova = iova;
+	}
 
 	return 0;
 }
