@@ -2,7 +2,7 @@
 /*
  * Copyright (c) 2018 Synopsys, Inc. and/or its affiliates.
  * stmmac XGMAC support.
- * Copyright (c) 2025 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 */
 
 #include <linux/module.h>
@@ -10,6 +10,10 @@
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/slab.h>
+#include <linux/fs.h>
+#include <linux/uaccess.h>
+#include <linux/device.h>
+#include <linux/cdev.h>
 
 #define BASE_ADDR 	0x23000000
 #define MEM_SIZE  	0x1000
@@ -84,6 +88,11 @@
 		} \
 	} while (0)
 
+#define DEVICE_NAME "qcom_ethqos_filter_dev"
+#define CLASS_NAME "qcom_ethqos_filter_class"
+#define BUF_LEN 120
+#define EMAC_LINK_DOWN 2
+
 /* Command Line params */
 static unsigned long mac_base_addr = BASE_ADDR;
 module_param(mac_base_addr, ulong, 0444);
@@ -93,6 +102,10 @@ static int dma_ch = DMA_CH;
 module_param(dma_ch, int, 0444);
 MODULE_PARM_DESC(dma_ch, "DMA channel to which packets are routed");
 
+static int dma_dynamic_ch = MTL_QUEUE_TO_DMA;
+module_param(dma_dynamic_ch, int, 0444);
+MODULE_PARM_DESC(dma_dynamic_ch, "DMA channel to which dynamic channel enable");
+
 static int vlan_num;
 module_param(vlan_num, int, 0444);
 MODULE_PARM_DESC(vlan_num, "Number of VLAN IDs");
@@ -101,14 +114,30 @@ static int vlan_ids[32] = {0};
 module_param_array(vlan_ids, int, NULL, 0444);
 MODULE_PARM_DESC(vlan_ids, "Array of VLAN IDs");
 
+enum {
+	DEL_GVM_THIN_VLAN = 2,
+	ADD_GVM_THIN_VLAN = 3,
+	ADD_ALL_VLAN = 4,
+	GVM_REMOVE = 5
+};
+
 struct mac_device_info {
 	int num_vlan;
 	int vlan_filter[32];
 	int pvm_vlan_filter[32];
 };
 
+struct char_device_info {
+	struct class *char_class;
+	struct cdev *my_cdev;
+	dev_t dev;
+	char message[BUF_LEN];
+};
+
 struct mac_device_info *hw;
+static struct char_device_info char_dev_info;
 void __iomem *mac_base;
+static int vlan_added;
 
 static void enable_mac_packet_filter_config(void)
 {
@@ -299,36 +328,249 @@ static int get_hw_num_vlan(void)
 	return num_vlan;
 }
 
-static int __init filter_init(void)
+static void remove_char_device(void)
+{
+	if (char_dev_info.char_class && char_dev_info.dev)
+		device_destroy(char_dev_info.char_class, char_dev_info.dev);
+	if (char_dev_info.char_class) {
+		class_destroy(char_dev_info.char_class);
+		char_dev_info.char_class = NULL;
+	}
+	if (char_dev_info.my_cdev) {
+		cdev_del(char_dev_info.my_cdev);
+		char_dev_info.my_cdev = NULL;
+	}
+	unregister_chrdev_region(char_dev_info.dev, 1);
+	pr_debug("chrdev: Device removed successfully\n");
+}
+
+static void add_all_vlan_gvm(void)
+{
+	int i, ret;
+
+	if (vlan_num > 0 && vlan_added == 0) {
+		vlan_added = 1;
+		hw = kzalloc(sizeof(struct mac_device_info), GFP_KERNEL);
+		if (!hw) {
+			pr_err("Failed to allocate memory to mac_device_info\n");
+			iounmap(mac_base);
+			remove_char_device();
+			return;
+		}
+		hw->num_vlan = get_hw_num_vlan();
+		enable_mac_packet_filter_config();
+		enable_dynamic_dma_ch_selection(dma_dynamic_ch);
+		read_available_vlan_tags();
+
+		for (i = 0; i < vlan_num; i++) {
+			ret = add_hw_vlan_rx_fltr_with_route(vlan_ids[i], dma_ch);
+			if (ret)
+				pr_err("Failed to add VLAN filter for ID %d: %d\n",
+				       vlan_ids[i], ret);
+		}
+	}
+}
+
+static void add_last_vlan_gvm(int vid)
+{
+	if (vlan_num >= 32) {
+		pr_err("Maximum number of VLANs (32) already configured\n");
+		return;
+	}
+
+	vlan_num++;
+	vlan_ids[vlan_num-1] = vid;
+	if (vlan_num > 0) {
+		if (vlan_added == 0) {
+			hw = kzalloc(sizeof(struct mac_device_info), GFP_KERNEL);
+			if (!hw) {
+				iounmap(mac_base);
+				remove_char_device();
+				vlan_num--;
+				return;
+			}
+			hw->num_vlan = get_hw_num_vlan();
+			enable_mac_packet_filter_config();
+			enable_dynamic_dma_ch_selection(dma_dynamic_ch);
+			read_available_vlan_tags();
+		}
+		vlan_added = 1;
+		add_hw_vlan_rx_fltr_with_route(vlan_ids[vlan_num-1], dma_ch);
+	}
+}
+
+static void remove_all_vlan_gvm(void)
 {
 	int i;
 
-	pr_debug("qcom_ethqos_filter probe start\n");
+	if (vlan_num > 0 && vlan_added == 1) {
+		for (i = 0; i < vlan_num; i++)
+			del_hw_vlan_rx_fltr(vlan_ids[i]);
 
+		disable_dynamic_dma_ch_selection(dma_dynamic_ch);
+		disable_mac_packet_filter_config();
+		kfree(hw);
+		vlan_added = 0;
+	}
+}
+
+static void remove_one_vlan_gvm(int vid)
+{
+	int i, index = -1;
+
+	if (vlan_num > 0 && vlan_added == 1) {
+		for (i = 0; i < vlan_num; i++) {
+			if (vlan_ids[i] == vid) {
+				del_hw_vlan_rx_fltr(vlan_ids[i]);
+				index = i;
+				break;
+			}
+		}
+		if (index != -1) {
+			for (i = index; i < vlan_num - 1; i++)
+				vlan_ids[i] = vlan_ids[i + 1];
+			vlan_ids[vlan_num - 1] = 0;
+			vlan_num--;
+
+			if (vlan_num == 0) {
+				vlan_added = 0;
+				disable_dynamic_dma_ch_selection(dma_dynamic_ch);
+				disable_mac_packet_filter_config();
+				kfree(hw);
+			}
+		}
+	}
+}
+
+
+static ssize_t device_write(struct file *device_file, const char *buffer,
+			    size_t len, loff_t *file_position)
+{
+	int vlan_status = -1;
+	int vid = -1;
+	int pvm_link_state = -1;
+	int gvm_link_state = -1;
+
+	if (len >= BUF_LEN) {
+		pr_err("chrdev: Input too large, maximum allowed is %d bytes\n", BUF_LEN - 1);
+		return -EINVAL;
+	}
+
+	if (copy_from_user(char_dev_info.message, buffer, len)) {
+		pr_err("chrdev: Failed to copy data from user\n");
+		return -EFAULT;
+	}
+
+	char_dev_info.message[len] = '\0';
+	pr_debug("chrdev: Received %zu characters from netlink: %s\n", len, char_dev_info.message);
+
+	if (sscanf(char_dev_info.message, "VLAN Status: %d, VID: %d, PVM: %d, GVM: %d",
+		 &vlan_status, &vid, &pvm_link_state, &gvm_link_state) == 4) {
+		pr_debug("chrdev: Parsed VLAN status = %d, VID = %d, PVM = %d, GVM = %d\n",
+			 vlan_status, vid, pvm_link_state, gvm_link_state);
+		if (vlan_status == GVM_REMOVE) {
+			remove_all_vlan_gvm();
+			vlan_num = 0;
+			pr_info("chrdev: VLAN config deleted successfully\n");
+		} else if (gvm_link_state == EMAC_LINK_DOWN) {
+			remove_all_vlan_gvm();
+			pr_info("chrdev: all VLAN filters removed successfully\n");
+		} else if (pvm_link_state == EMAC_LINK_DOWN) {
+			remove_all_vlan_gvm();
+			pr_info("chrdev: all VLAN filters removed successfully\n");
+		} else if (vlan_status == ADD_GVM_THIN_VLAN) {
+			add_last_vlan_gvm(vid);
+			pr_info("chrdev: qcom_ethqos_filter vlan %d added successfully\n", vid);
+		} else if (vlan_status == DEL_GVM_THIN_VLAN) {
+			remove_one_vlan_gvm(vid);
+			pr_info("chrdev: qcom_ethqos_filter vlan %d deleted successfully\n", vid);
+		} else if (vlan_status == ADD_ALL_VLAN) {
+			add_all_vlan_gvm();
+			pr_info("chrdev: qcom_ethqos_filter all vlan filters present added successfully\n");
+		}
+	} else {
+		pr_err("chrdev: Failed to parse VLAN info from input\n");
+	}
+	return len;
+}
+
+
+static const struct file_operations fops = {
+	.write = device_write,
+};
+
+static int create_char_device(void)
+{
+	int ret;
+
+	ret = alloc_chrdev_region(&char_dev_info.dev, 0, 1, DEVICE_NAME);
+	if (ret) {
+		pr_err("chrdev: Failed to allocate a major number\n");
+		goto err_alloc;
+	}
+
+	char_dev_info.my_cdev = cdev_alloc();
+	if (!char_dev_info.my_cdev) {
+		pr_err("chrdev: Failed to allocate cdev\n");
+		ret = -ENOMEM;
+		goto err_cdev_alloc;
+	}
+
+	cdev_init(char_dev_info.my_cdev, &fops);
+	ret = cdev_add(char_dev_info.my_cdev, char_dev_info.dev, 1);
+	if (ret < 0) {
+		pr_err("chrdev: Failed to add the cdev\n");
+		kfree(char_dev_info.my_cdev);
+		char_dev_info.my_cdev = NULL;
+		goto err_cdev_alloc;
+	}
+
+	char_dev_info.char_class = class_create(CLASS_NAME);
+	if (IS_ERR(char_dev_info.char_class)) {
+		pr_err("chrdev: Failed to register device class\n");
+		ret = PTR_ERR(char_dev_info.char_class);
+		goto err_class_create;
+	}
+
+	if (IS_ERR(device_create(char_dev_info.char_class, NULL,
+		   char_dev_info.dev, NULL, DEVICE_NAME))) {
+		pr_err("chrdev: Failed to create the device\n");
+		ret = -EFAULT;
+		goto err_device_create;
+	}
+	pr_debug("chrdev: Device created successfully\n");
+	return 0;
+
+err_device_create:
+	class_destroy(char_dev_info.char_class);
+err_class_create:
+	cdev_del(char_dev_info.my_cdev);
+	char_dev_info.my_cdev = NULL;
+err_cdev_alloc:
+	unregister_chrdev_region(char_dev_info.dev, 1);
+err_alloc:
+	return ret;
+}
+
+static int __init filter_init(void)
+{
+	pr_debug("qcom_ethqos_filter probe start\n");
+	if (create_char_device()) {
+		pr_err("Failed to create char device\n");
+		return -ENOMEM;
+	}
 	mac_base = ioremap(mac_base_addr, MEM_SIZE);
 	if (!mac_base) {
 		pr_err("Failed to map memory region\n");
+		remove_char_device();
 		return -ENOMEM;
 	}
-
-	/*VLAN filtering */
-	if (vlan_num > 0) {
-		hw = kmalloc(sizeof(struct mac_device_info), GFP_KERNEL);
-		if (!hw) {
-			pr_err("Failed to allocate memory to mac_device_info");
-			return -ENOMEM;
-		}
-		memset(hw, 0, sizeof(struct mac_device_info));
-		hw->num_vlan = get_hw_num_vlan();
-
-		enable_mac_packet_filter_config();
-		enable_dynamic_dma_ch_selection(MTL_QUEUE_TO_DMA);
-		read_available_vlan_tags();
-
-		for (i = 0; i < vlan_num; i++)
-			add_hw_vlan_rx_fltr_with_route(vlan_ids[i], dma_ch);
-
-		pr_info("qcom_ethqos_filter vlan added successfully\n");
+	add_all_vlan_gvm();
+	if (vlan_num > 0 && !hw) {
+		pr_err("Failed to initialize VLAN filtering\n");
+		iounmap(mac_base);
+		remove_char_device();
+		return -ENOMEM;
 	}
 	pr_debug("qcom_ethqos_filter probe end\n");
 	return 0;
@@ -336,18 +578,9 @@ static int __init filter_init(void)
 
 static void __exit filter_exit(void)
 {
-	int i;
-
-	if (vlan_num > 0) {
-		for (i = 0; i < vlan_num; i++)
-			del_hw_vlan_rx_fltr(vlan_ids[i]);
-
-		disable_dynamic_dma_ch_selection(MTL_QUEUE_TO_DMA);
-		disable_mac_packet_filter_config();
-		kfree(hw);
-		pr_debug("VLAN config removed successfully\n");
-	}
-
+	remove_all_vlan_gvm();
+	pr_debug("VLAN config removed successfully\n");
+	remove_char_device();
 	if (mac_base) {
 		iounmap(mac_base);
 		pr_debug("Memory region unmapped successfully\n");
