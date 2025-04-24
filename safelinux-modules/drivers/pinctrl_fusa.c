@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2025, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/debugfs.h>
@@ -33,12 +33,27 @@ struct tlmm_fusa {
 	u32 ahb_hreset_err_cnt;
 	/* Power-on-reset Asynchronous Reset Count */
 	u32 por_ares_err_cnt;
+	/* Spurious Error Count */
+	u32 spurious_err_cnt;
 	u32 por_ares_bitmask;
 	bool ahb_hreset_ready;
 	bool por_ares_ready;
+	bool spurious_ready;
 #ifdef CONFIG_DEBUG_FS
 	wait_queue_head_t wq;
 #endif
+};
+
+enum tlmm_fusa_event_type {
+	AHB_HRESET,
+	POR_ARES,
+	SPURIOUS
+};
+
+struct tlmm_fusa_event {
+	enum tlmm_fusa_event_type type;
+	u32 count;
+	void __iomem *reset_reg;
 };
 
 #ifdef CONFIG_DEBUG_FS
@@ -64,6 +79,18 @@ static ssize_t por_ares_err_read(struct file *file, char __user *user_buf,
 
 	len = scnprintf(buf, sizeof(buf), "%u\n",
 			pinctrl_fusa->por_ares_err_cnt);
+	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
+}
+
+static ssize_t spurious_err_read(struct file *file, char __user *user_buf,
+				 size_t count, loff_t *ppos)
+{
+	struct tlmm_fusa *pinctrl_fusa = file->private_data;
+	char buf[BUF_SZ];
+	int len;
+
+	len = scnprintf(buf, sizeof(buf), "%u\n",
+			pinctrl_fusa->spurious_err_cnt);
 	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
 }
 
@@ -101,6 +128,23 @@ static __poll_t por_ares_err_notify(struct file *filep, poll_table *wait)
 	return mask;
 }
 
+static __poll_t spurious_err_notify(struct file *filep, poll_table *wait)
+{
+	struct tlmm_fusa *pinctrl_fusa = filep->private_data;
+	unsigned long flags;
+	__poll_t mask = 0;
+
+	poll_wait(filep, &pinctrl_fusa->wq, wait);
+	spin_lock_irqsave(&pinctrl_fusa->lock, flags);
+	if (pinctrl_fusa->spurious_ready) {
+		pinctrl_fusa->spurious_ready = false;
+		mask = EPOLLIN;
+	}
+
+	spin_unlock_irqrestore(&pinctrl_fusa->lock, flags);
+	return mask;
+}
+
 static const struct file_operations ahb_hreset_err_fops = {
 	.owner = THIS_MODULE,
 	.read = ahb_hreset_err_read,
@@ -115,6 +159,13 @@ static const struct file_operations por_ares_err_fops = {
 	.poll = por_ares_err_notify,
 };
 
+static const struct file_operations spurious_err_fops = {
+	.owner = THIS_MODULE,
+	.read = spurious_err_read,
+	.open = simple_open,
+	.poll = spurious_err_notify,
+};
+
 static int tlmm_fusa_create_debugfs_entries(struct tlmm_fusa *pinctrl_fusa)
 {
 	debugfs_dir = debugfs_lookup("tlmm_hw_safety", NULL);
@@ -122,7 +173,7 @@ static int tlmm_fusa_create_debugfs_entries(struct tlmm_fusa *pinctrl_fusa)
 		debugfs_dir = debugfs_create_dir("tlmm_hw_safety", NULL);
 		if (IS_ERR_OR_NULL(debugfs_dir)) {
 			dev_err(pinctrl_fusa->dev,
-				"Failed to create new debugfs dir\n!!");
+				"Failed to create new debugfs directory\n");
 			return IS_ERR(debugfs_dir);
 		}
 	}
@@ -131,6 +182,8 @@ static int tlmm_fusa_create_debugfs_entries(struct tlmm_fusa *pinctrl_fusa)
 				pinctrl_fusa, &ahb_hreset_err_fops);
 	debugfs_create_file("por_ares_errors", 0444, debugfs_dir,
 				pinctrl_fusa, &por_ares_err_fops);
+	debugfs_create_file("spurious_errors", 0444, debugfs_dir,
+				pinctrl_fusa, &spurious_err_fops);
 	return 0;
 }
 #endif
@@ -138,31 +191,47 @@ static int tlmm_fusa_create_debugfs_entries(struct tlmm_fusa *pinctrl_fusa)
 static irqreturn_t pinctrl_fusa_irq(int irq, void *data)
 {
 	struct tlmm_fusa *pinctrl_fusa = data;
-	void __iomem *reg_address;
+	int ret = IRQ_HANDLED;
 	unsigned long flags;
 	u32 err_status = readl_relaxed(pinctrl_fusa->err_status);
+	struct tlmm_fusa_event event;
 
 	spin_lock_irqsave(&pinctrl_fusa->lock, flags);
-	if ((err_status & pinctrl_fusa->por_ares_bitmask)) {
-		reg_address = pinctrl_fusa->por_ares_status;
+	if (!err_status) {
+		/* Spurious Error Case */
+		pinctrl_fusa->spurious_ready = true;
+		pinctrl_fusa->spurious_err_cnt++;
+		event.type = SPURIOUS;
+		event.count = pinctrl_fusa->spurious_err_cnt;
+		ret = IRQ_NONE;
+	} else if ((err_status & pinctrl_fusa->por_ares_bitmask)) {
+		/* POR_ARES Error Case */
 		pinctrl_fusa->por_ares_ready = true;
 		pinctrl_fusa->por_ares_err_cnt++;
-		trace_tlmm_hw_safety_event("POR_ARES",
-				pinctrl_fusa->por_ares_err_cnt);
+		event.type = POR_ARES;
+		event.count = pinctrl_fusa->por_ares_err_cnt;
+		event.reset_reg = pinctrl_fusa->por_ares_status;
 	} else {
-		reg_address = pinctrl_fusa->ahb_hreset_status;
+		/* AHB_HRESET Error Case */
 		pinctrl_fusa->ahb_hreset_ready = true;
 		pinctrl_fusa->ahb_hreset_err_cnt++;
-		trace_tlmm_hw_safety_event("AHB_HRESET",
-				pinctrl_fusa->ahb_hreset_err_cnt);
+		event.type = AHB_HRESET;
+		event.count = pinctrl_fusa->ahb_hreset_err_cnt;
+		event.reset_reg = pinctrl_fusa->ahb_hreset_status;
 	}
 
 	spin_unlock_irqrestore(&pinctrl_fusa->lock, flags);
+	if (event.type != SPURIOUS)
+		writel_relaxed(FUSA_ERR_RESET_VALUE, event.reset_reg);
+
+	trace_tlmm_hw_safety_event(event.type == SPURIOUS ? "SPURIOUS" :
+			event.type == POR_ARES ? "POR_ARES" :
+			"AHB_HRESET", event.count);
+
 #ifdef CONFIG_DEBUG_FS
 	wake_up_interruptible(&pinctrl_fusa->wq);
 #endif
-	writel_relaxed(FUSA_ERR_RESET_VALUE, reg_address);
-	return IRQ_HANDLED;
+	return ret;
 }
 
 static int tlmm_fusa_probe(struct platform_device *pdev)
@@ -224,7 +293,8 @@ static int tlmm_fusa_probe(struct platform_device *pdev)
 	ret = of_property_read_u32(dev->of_node, "qcom,por-ares-reset-bit",
 							&por_ares_bit);
 	if (ret) {
-		dev_err(dev, "Failed to read qcom,por-ares-reset-bit property\n");
+		dev_err(dev,
+			"Failed to read qcom,por-ares-reset-bit property\n");
 		return ret;
 	}
 
@@ -266,9 +336,9 @@ static const struct of_device_id tlmm_fusa_of_match[] = {
 
 static struct platform_driver pinctrl_fusa_driver = {
 	.driver = {
-		   .name = "tlmm-fusa",
-		   .of_match_table = tlmm_fusa_of_match,
-		  },
+		.name = "tlmm-fusa",
+		.of_match_table = tlmm_fusa_of_match,
+	},
 	.probe = tlmm_fusa_probe,
 	.remove_new = tlmm_fusa_remove,
 };
