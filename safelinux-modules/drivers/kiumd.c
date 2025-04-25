@@ -2285,6 +2285,13 @@ int kiumd_dmabuf_managed_iova_unmap(char __user *arg, struct file *fp)
 	return ret;
 }
 
+static bool check_ptselect(struct kiumd_user *kiusr)
+{
+	return ((kiusr->ptselect == KGSL_GLOBAL_PT)
+		|| (kiusr->ptselect == KGSL_PER_PROCESS_PT)
+		|| (kiusr->ptselect == KGSL_DEFAULT_PT));
+}
+
 /**
  * kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
  *
@@ -2707,14 +2714,13 @@ int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 		}
 	}
 
-	if (kiusr.ptselect == KGSL_GLOBAL_PT ||
-	    kiusr.ptselect == KGSL_PER_PROCESS_PT ||
-	    kiusr.ptselect == KGSL_DEFAULT_PT) {
+	if (check_ptselect(&kiusr) || smap->is_fixed_map) {
 		iommu_dom = kiumd_get_iommu_domain(kiusr.vfio_fd);
 		if (!iommu_dom) {
 			pr_err("%s:iommu_dom is NULL\n", __func__);
 			return -EINVAL;
 		}
+
 		iommu_flush_iotlb_all(iommu_dom);
 	}
 
