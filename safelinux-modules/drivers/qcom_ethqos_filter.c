@@ -93,6 +93,10 @@ static int dma_ch = DMA_CH;
 module_param(dma_ch, int, 0444);
 MODULE_PARM_DESC(dma_ch, "DMA channel to which packets are routed");
 
+static int dma_dynamic_ch = MTL_QUEUE_TO_DMA;
+module_param(dma_dynamic_ch, int, 0444);
+MODULE_PARM_DESC(dma_dynamic_ch, "DMA channel to which dynamic channel enable");
+
 static int vlan_num;
 module_param(vlan_num, int, 0444);
 MODULE_PARM_DESC(vlan_num, "Number of VLAN IDs");
@@ -322,7 +326,7 @@ static int __init filter_init(void)
 		hw->num_vlan = get_hw_num_vlan();
 
 		enable_mac_packet_filter_config();
-		enable_dynamic_dma_ch_selection(MTL_QUEUE_TO_DMA);
+		enable_dynamic_dma_ch_selection(dma_dynamic_ch);
 		read_available_vlan_tags();
 
 		for (i = 0; i < vlan_num; i++)
@@ -342,7 +346,7 @@ static void __exit filter_exit(void)
 		for (i = 0; i < vlan_num; i++)
 			del_hw_vlan_rx_fltr(vlan_ids[i]);
 
-		disable_dynamic_dma_ch_selection(MTL_QUEUE_TO_DMA);
+		disable_dynamic_dma_ch_selection(dma_dynamic_ch);
 		disable_mac_packet_filter_config();
 		kfree(hw);
 		pr_debug("VLAN config removed successfully\n");
