@@ -2,40 +2,18 @@
 /*
  * Copyright (c) 2022-2025 Qualcomm Innovation Center, Inc. All rights reserved.
  */
-#include <linux/device.h>
-#include <linux/dma-buf.h>
-#include <linux/list.h>
-#include <linux/miscdevice.h>
-#include <linux/module.h>
-#include <linux/of_address.h>
-#include <linux/of.h>
-#include <linux/of_platform.h>
-#include <linux/of_reserved_mem.h>
-#include <linux/scatterlist.h>
-#include <linux/slab.h>
-#include <linux/vfio.h>
-#include <linux/hashtable.h>
-#include <uapi/misc/kiumd.h>
-#include <linux/iommu.h>
-#include <linux/types.h>
-#include <linux/iova.h>
 #include <linux/adreno-smmu-priv.h>
-#include <linux/io-pgtable.h>
-#include <linux/kernel.h>
-#include <linux/cdev.h>
+#include <linux/dma-buf.h>
 #include <linux/firmware/qcom/qcom_scm.h>
+#include <linux/hashtable.h>
 #include <linux/iommu_iova_map.h>
-#include <linux/sizes.h>
-#include <linux/xarray.h>
-#include <uapi/misc/scm_user_intf.h>
-#include <linux/dma-direction.h>
-#include <linux/kobject.h>
-#include <linux/sysfs.h>
-#include <linux/init.h>
-#include <linux/fs.h>
+#include <linux/iova.h>
+#include <linux/kernel.h>
+#include <linux/miscdevice.h>
+#include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
-#include <linux/string.h>
-#include <linux/version.h>
+#include <uapi/misc/kiumd.h>
+#include <uapi/misc/scm_user_intf.h>
 
 #define CREATE_TRACE_POINTS
 #include "safelinux_modules_trace.h"
