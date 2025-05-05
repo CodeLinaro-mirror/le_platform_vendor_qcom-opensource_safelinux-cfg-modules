@@ -363,27 +363,6 @@ struct iommu_domain *kiumd_iommu_get_dma_domain(struct device *dev)
 }
 
 /**
- * @Brief: This function find the
- * iommu domain for given group
- *
- * Parameters:
- * @group: iommu group pointer
- *
- * Returns void *(iommu domain) upon success
- * and NULL on failure
- */
-void *kiumd_iommu_group_default_domain(void *group)
-{
-	struct kiumd_iommu_group *iommu_group = (struct kiumd_iommu_group *) group;
-
-	if (!iommu_group)
-		return NULL;
-
-	return (void *)iommu_group->default_domain;
-}
-EXPORT_SYMBOL_GPL(kiumd_iommu_group_default_domain);
-
-/**
  * @Brief: This function provide the vfio device
  * pointer for the given file descriptor
  *
