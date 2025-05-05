@@ -1171,11 +1171,6 @@ static int kiumd_set_pgtbl_context(char __user *arg, struct file *fp)
 	if (copy_from_user(&pgtbl_ctx, arg, sizeof(struct kiumd_user)))
 		return -EFAULT;
 
-	if (pgtbl_ctx.vfio_fd < 0) {
-		pr_err("%s: Invalid fd from user\n", __func__);
-		return -EBADF;
-	}
-
 	vfio_dev = kiumd_get_vfio_device(pgtbl_ctx.vfio_fd);
 	if (!vfio_dev) {
 		pr_err("%s: vfio_dev is NULL\n", __func__);
@@ -1189,11 +1184,6 @@ static int kiumd_set_pgtbl_context(char __user *arg, struct file *fp)
 	}
 
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-	if (!kiumd_ctx) {
-		pr_err("%s:kiumd ctx is NULL\n", __func__);
-		return -EINVAL;
-	}
-
 	switch (pgtbl_ctx.flags) {
 	case KIUMD_SMMU_SET_TTBR0_CONFIG:
 		ret = kiumd_set_pgtble_ttbr0_context(iommu_dom, kiumd_ctx);
@@ -1234,18 +1224,9 @@ int kiumd_perprocess_pt_alloc(char __user *arg, struct file *fp)
 
 	trace_kiumd_perprocess_pt_alloc_start(kiusr.vfio_fd);
 
-	if (!fp) {
-		pr_err("%s:%d file ptr returns NULL\n", __func__, __LINE__);
-		return -EINVAL;
-	}
 
 	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user)))
 		return -EFAULT;
-
-	if (kiusr.vfio_fd < 0) {
-		pr_err("%s:%d Invalid fd from user\n", __func__, __LINE__);
-		return -EBADF;
-	}
 
 	vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
 	if (!vfio_dev) {
@@ -1254,11 +1235,6 @@ int kiumd_perprocess_pt_alloc(char __user *arg, struct file *fp)
 	}
 
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-	if (!kiumd_ctx) {
-		pr_err("%s:%d kiumd ctx is NULL\n", __func__, __LINE__);
-		return -EINVAL;
-	}
-
 	iommu_dom = kiumd_iommu_get_dma_domain(vfio_dev->dev);
 	if (!iommu_dom) {
 		pr_err("%s:%d iommu domain is NULL\n", __func__, __LINE__);
@@ -1290,11 +1266,6 @@ int kiumd_perprocess_pt_alloc(char __user *arg, struct file *fp)
 	kiusr.ttbr0 = cfg.arm_lpae_s1_cfg.ttbr;
 
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-	if (!kiumd_ctx) {
-		pr_err("%s:%d kiumd ctx is NULL\n", __func__, __LINE__);
-		return -EINVAL;
-	}
-
 	kgsl_context = kiumd_ctx->kgsl_context;
 	if (kgsl_context->kgsl_pt_id == UINT_MAX) {
 		pr_err("%s:%d integer overflow in pt_id.\n", __func__, __LINE__);
@@ -1377,11 +1348,6 @@ int kiumd_global_pgtble_set(char __user *arg, struct file *fp)
 	}
 
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-	if (!kiumd_ctx) {
-		fput(file);
-		return -EINVAL;
-	}
-
 	iommu_dom = kiumd_iommu_get_dma_domain(vfio_dev->dev);
 	if (!iommu_dom) {
 		pr_err("%s:IOMMU domain is NULL\n", __func__);
@@ -1523,11 +1489,6 @@ int kiumd_perprocess_pgtble_free(char __user *arg, struct file *fp)
 						 kiusr.ttbr0, kiusr.asid);
 
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-	if (!kiumd_ctx) {
-		pr_err("%s:%d kiumd ctx is NULL\n", __func__, __LINE__);
-		return -EINVAL;
-	}
-
 	vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
 	if (!vfio_dev) {
 		pr_err("%s:%d vfio_dev is NULL\n", __func__, __LINE__);
@@ -1649,11 +1610,6 @@ int kiumd_dmabuf_custom_iova_init(char __user *arg, struct file *fp)
 	}
 
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-	if (!kiumd_ctx) {
-		pr_err("%s:kiumd ctx is NULL\n", __func__);
-		fput(file);
-		return -EINVAL;
-	}
 
 	/*Get the maximum shift from DT for managed_iova_map api to
 	 * determine alignment for large buffers
@@ -2122,17 +2078,7 @@ int kiumd_dmabuf_managed_iova_map(char __user *arg, struct file *fp)
 	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user)))
 		return -EFAULT;
 
-	if (!fp) {
-		pr_err("%s:invalid file ptr\n", __func__);
-		return -EINVAL;
-	}
-
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-	if (!kiumd_ctx) {
-		pr_err("%s:kiumd ctx is NULL\n", __func__);
-		return -EINVAL;
-	}
-
 	vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
 	if (!vfio_dev) {
 		pr_err("%s: invalid vfio device fd\n", __func__);
@@ -2246,16 +2192,7 @@ int kiumd_dmabuf_managed_iova_unmap(char __user *arg, struct file *fp)
 	unsigned long hash_id;
 	bool found = false;
 
-	if (!fp) {
-		pr_err("%s:file ptr returns NULL\n", __func__);
-		return -EINVAL;
-	}
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-
-	if (!kiumd_ctx) {
-		pr_err("%s:kiumd ctx is NULL\n", __func__);
-		return -EINVAL;
-	}
 
 	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user)))
 		return -EFAULT;
@@ -2367,17 +2304,7 @@ int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 	s64 offset;
 	u64 size;
 
-	if (!fp) {
-		pr_err("%s:file ptr returns NULL\n", __func__);
-		return -EINVAL;
-	}
-
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-	if (!kiumd_ctx) {
-		pr_err("%s:kiumd ctx is NULL\n", __func__);
-		return -EINVAL;
-	}
-
 	smap = kzalloc(sizeof(*smap), GFP_KERNEL);
 	if (!smap)
 		return -ENOMEM;
@@ -2403,18 +2330,7 @@ int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 		goto fail_fput;
 	}
 
-	if (!fp) {
-		pr_err("%s:file ptr returns NULL\n", __func__);
-		ret = -EINVAL;
-		goto fail_fput;
-	}
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-	if (!kiumd_ctx) {
-		pr_err("%s:kiumd ctx is NULL\n", __func__);
-		ret = -EINVAL;
-		goto fail_fput;
-	}
-
 	kiumd_dmabuf = dma_buf_get(kiusr.dma_buf_fd);
 	if (IS_ERR_OR_NULL(kiumd_dmabuf)) {
 		pr_err("%s:dma_buf_get failed with error: %ld, for device: %s\n",
@@ -2648,16 +2564,7 @@ int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 	bool found = false;
 	u64 size;
 
-	if (!fp) {
-		pr_err("%s:file ptr returns NULL\n", __func__);
-		return -EINVAL;
-	}
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-
-	if (!kiumd_ctx) {
-		pr_err("%s:kiumd ctx is NULL\n", __func__);
-		return -EINVAL;
-	}
 
 	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user)))
 		return -EFAULT;
@@ -2921,10 +2828,6 @@ int kiumd_fd_dmabuf_handler(char __user *arg, struct file *fp)
 	int err;
 
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-	if (!kiumd_ctx) {
-		pr_err("%s:kiumd ctx is NULL\n", __func__);
-		return -EINVAL;
-	}
 
 	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user))) {
 		pr_err("%s: copy_from_user failed\n", __func__);
@@ -3436,16 +3339,7 @@ int kiumd_dmabuf_assign_buf(char __user *arg, struct file *fp)
 	int *vmids, *perms;
 	int ret;
 
-	if (!fp) {
-		pr_err("%s:file ptr returns NULL\n", __func__);
-		return -EINVAL;
-	}
-
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-	if (!kiumd_ctx) {
-		pr_err("%s:kiumd ctx is NULL\n", __func__);
-		return -EINVAL;
-	}
 
 	if (copy_from_user(&kiusr, arg, sizeof(kiusr))) {
 		pr_err("%s:%d invalid args from user\n", __func__, __LINE__);
@@ -3583,16 +3477,7 @@ int kiumd_dmabuf_unassign_buf(char __user *arg, struct file *fp)
 	bool found = false;
 	int ret;
 
-	if (!fp) {
-		pr_err("%s:file ptr returns NULL\n", __func__);
-		return -EINVAL;
-	}
-
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-	if (!kiumd_ctx) {
-		pr_err("%s:kiumd ctx is NULL\n", __func__);
-		return -EINVAL;
-	}
 
 	if (copy_from_user(&kiusr, arg, sizeof(kiusr))) {
 		pr_err("%s:%d invalid args from user\n", __func__, __LINE__);
@@ -3802,17 +3687,7 @@ int kiumd_dmabuf_vfio_secure_map(char __user *arg, struct file *fp)
 		goto hyp_unassign_sg;
 	}
 
-	if (!fp) {
-		pr_err("%s:file ptr returns NULL\n", __func__);
-		ret = -EINVAL;
-		goto close_file;
-	}
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-	if (!kiumd_ctx) {
-		pr_err("%s:kiumd ctx is NULL\n", __func__);
-		ret = -EINVAL;
-		goto close_file;
-	}
 
 	smap = kzalloc(sizeof(*smap), GFP_KERNEL);
 	if (!smap) {
@@ -3891,18 +3766,8 @@ int kiumd_dmabuf_vfio_secure_unmap(char __user *arg, struct file *fp)
 	u64 pgd;
 	int ret;
 
-	if (!fp) {
-		pr_err("%s:file ptr returns NULL\n", __func__);
-		return -EINVAL;
-	}
-	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-
-	if (!kiumd_ctx) {
-		pr_err("%s:kiumd ctx is NULL\n", __func__);
-		return -EINVAL;
-	}
-
 	pr_debug("%s entering\n", __func__);
+	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
 
 	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user))) {
 		pr_err("%s:%d invalid args from user\n", __func__, __LINE__);
@@ -4267,16 +4132,7 @@ static int kiumd_mmio_smmu_map(char __user *arg, struct file *fp)
 	char *reg_name;
 	u64 addr, size;
 
-	if (!fp) {
-		pr_err("%s:file ptr returns NULL\n", __func__);
-		return -EINVAL;
-	}
-
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-	if (!kiumd_ctx) {
-		pr_err("%s:kiumd ctx is NULL\n", __func__);
-		return -EINVAL;
-	}
 
 	if (copy_from_user(&kiusr, arg, sizeof(kiusr))) {
 		pr_err("%s:%d invalid args from user\n", __func__, __LINE__);
@@ -4430,16 +4286,7 @@ static int kiumd_mmio_smmu_unmap(char __user *arg, struct file *fp)
 	struct smmu_map_data *smap;
 	bool found = false;
 
-	if (!fp) {
-		pr_err("%s:file ptr returns NULL\n", __func__);
-		return -EINVAL;
-	}
-
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-	if (!kiumd_ctx) {
-		pr_err("%s:kiumd ctx is NULL\n", __func__);
-		return -EINVAL;
-	}
 
 	if (copy_from_user(&kiusr, arg, sizeof(kiusr))) {
 		pr_err("%s:%d invalid args from user\n", __func__, __LINE__);
@@ -4668,16 +4515,7 @@ static int kiumd_vfio_ctx_init(char __user *arg, struct file *fp)
 	struct reserved_mem *rmem;
 	struct device_node *np;
 
-	if (!fp) {
-		pr_err("%s:file ptr returns NULL\n", __func__);
-		return -EINVAL;
-	}
-
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-	if (!kiumd_ctx) {
-		pr_err("%s:kiumd ctx is NULL\n", __func__);
-		return -EINVAL;
-	}
 
 	if (copy_from_user(&kiusr, arg, sizeof(kiusr))) {
 		pr_err("%s:%d invalid args from user\n", __func__, __LINE__);
