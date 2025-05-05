@@ -529,19 +529,16 @@ struct iommu_domain *kiumd_get_iommu_domain(int vfio_fd)
 	struct vfio_device *vfio_dev;
 	struct iommu_domain *domain;
 
-	do {
-		vfio_dev = kiumd_get_vfio_device(vfio_fd);
-		if (!vfio_dev) {
-			pr_err("%s:vfio_dev is NULL\n", __func__);
-			return NULL;
-		}
-		domain = kiumd_iommu_get_dma_domain(vfio_dev->dev);
-		if (!domain) {
-			pr_err("%s:iommu domain is NULL\n", __func__);
-			return NULL;
-		}
-
-	} while (0);
+	vfio_dev = kiumd_get_vfio_device(vfio_fd);
+	if (!vfio_dev) {
+		pr_err("%s:vfio_dev is NULL\n", __func__);
+		return NULL;
+	}
+	domain = kiumd_iommu_get_dma_domain(vfio_dev->dev);
+	if (!domain) {
+		pr_err("%s:iommu domain is NULL\n", __func__);
+		return NULL;
+	}
 
 	return domain;
 }
@@ -561,19 +558,16 @@ struct arm_smmu_domain *kiumd_get_smmu_domain(int vfio_fd)
 	struct arm_smmu_domain *smmu_domain;
 	struct iommu_domain *iommu_dom;
 
-	do {
-		iommu_dom = kiumd_get_iommu_domain(vfio_fd);
-		if (!iommu_dom) {
-			pr_err("%s:IOMMU domain is NULL\n", __func__);
-			return NULL;
-		}
-		smmu_domain = container_of(iommu_dom, struct arm_smmu_domain, domain);
-		if (!smmu_domain) {
-			pr_err("%s:SMMU domain is NULL\n", __func__);
-			return NULL;
-		}
-
-	} while (0);
+	iommu_dom = kiumd_get_iommu_domain(vfio_fd);
+	if (!iommu_dom) {
+		pr_err("%s:IOMMU domain is NULL\n", __func__);
+		return NULL;
+	}
+	smmu_domain = container_of(iommu_dom, struct arm_smmu_domain, domain);
+	if (!smmu_domain) {
+		pr_err("%s:SMMU domain is NULL\n", __func__);
+		return NULL;
+	}
 
 	return smmu_domain;
 }
@@ -4100,31 +4094,27 @@ static int kiumd_smmu_fault_handler(struct iommu_domain *iomm_domain,
 	struct arm_smmu_cfg *cfg;
 	int retval = 0;
 
-	do {
-		smmu_domain = container_of(iomm_domain, struct arm_smmu_domain, domain);
-		if ((!smmu_domain) || (!(smmu_domain->pgtbl_ops))) {
-			pr_err("%s:smmu domain/pagetable ops is invalid\n", __func__);
-			retval = -EINVAL;
-			break;
+	smmu_domain = container_of(iomm_domain, struct arm_smmu_domain, domain);
+	if ((!smmu_domain) || (!(smmu_domain->pgtbl_ops))) {
+		pr_err("%s:smmu domain/pagetable ops is invalid\n", __func__);
+		return -EINVAL;
+	}
+
+	cfg = &smmu_domain->cfg;
+	while (temp != NULL) {
+		if (!strcmp(temp->kobj->name, name) && !(temp->flag)) {
+			temp->smmu_fsr = arm_smmu_cb_read(smmu_domain->smmu,
+							  cfg->cbndx,
+							  ARM_SMMU_CB_FSR);
+			temp->smmu_iova = iova;
+			temp->flag = 1;
+			sysfs_notify(temp->kobj, NULL, "fsr_iova");
+			return 0;
 		}
-		cfg = &smmu_domain->cfg;
+		temp = temp->next;
+	}
 
-		while (temp != NULL) {
-			if (!strcmp(temp->kobj->name, name) && !(temp->flag)) {
-				temp->smmu_fsr = arm_smmu_cb_read(smmu_domain->smmu,
-								  cfg->cbndx,
-								  ARM_SMMU_CB_FSR);
-				temp->smmu_iova = iova;
-				temp->flag = 1;
-				sysfs_notify(temp->kobj, NULL, "fsr_iova");
-				break;
-			}
-			temp = temp->next;
-		}
-
-	} while (0);
-
-	return retval;
+	return 0;
 }
 
 /**
@@ -4142,49 +4132,41 @@ static int kiumd_smmu_fault_handler_deregister(char __user *arg)
 	struct smmu_device_obj *prev = NULL, *temp = head;
 	struct vfio_device *vfio_dev;
 	struct kiumd_user kiusr;
-	int retval = 0;
 
-	do {
-		if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user))) {
-			retval = -EFAULT;
-			break;
+	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user)))
+		return -EFAULT;
+
+	vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
+	if (!vfio_dev) {
+		pr_err("%s:vfio_dev is NULL\n", __func__);
+		return -ENOTTY;
+	}
+
+	if (temp != NULL &&
+	    !strcmp(temp->kobj->name, vfio_dev->dev->kobj.name)) {
+		head = head->next;
+		temp->next = NULL;
+		kobject_put(temp->kobj);
+		kfree(temp);
+	} else {
+		while (temp != NULL &&
+		       strcmp(temp->kobj->name,
+			      vfio_dev->dev->kobj.name)) {
+			prev = temp;
+			temp = temp->next;
 		}
-
-		vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
-		if (!vfio_dev) {
-			pr_err("%s:vfio_dev is NULL\n", __func__);
-			retval = -ENOTTY;
-			break;
+		if (temp == NULL) {
+			pr_err("%s:vfio device is not present in list to deregister\n");
+			return -ENOENT;
 		}
+		if (prev)
+			prev->next = temp->next;
+		temp->next = NULL;
+		kobject_put(temp->kobj);
+		kfree(temp);
+	}
 
-		if (temp != NULL &&
-		    !strcmp(temp->kobj->name, vfio_dev->dev->kobj.name)) {
-			head = head->next;
-			temp->next = NULL;
-			kobject_put(temp->kobj);
-			kfree(temp);
-		} else {
-			while (temp != NULL &&
-			       strcmp(temp->kobj->name,
-				      vfio_dev->dev->kobj.name)) {
-				prev = temp;
-				temp = temp->next;
-			}
-			if (temp == NULL) {
-				pr_err("%s:vfio device is not present in list to deregister\n");
-				retval = -1;
-				break;
-			}
-			if (prev)
-				prev->next = temp->next;
-			temp->next = NULL;
-			kobject_put(temp->kobj);
-			kfree(temp);
-		}
-
-	} while (0);
-
-	return retval;
+	return 0;
 }
 
 /**
@@ -4204,66 +4186,56 @@ static int kiumd_smmu_fault_handler_register(char __user *arg)
 	struct iommu_domain *domain;
 	struct smmu_device_obj *ptr;
 	struct kiumd_user kiusr;
-	int retval = 0, err;
+	int ret;
 
-	do {
-		if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user))) {
-			retval = -EFAULT;
-			break;
-		}
+	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user)))
+		return -EFAULT;
 
-		vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
-		if (!vfio_dev) {
-			pr_err("%s:vfio_dev is NULL\n", __func__);
-			retval = -ENOTTY;
-			break;
-		}
+	vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
+	if (!vfio_dev) {
+		pr_err("%s:vfio_dev is NULL\n", __func__);
+		return -ENOTTY;
+	}
 
-		domain = kiumd_iommu_get_dma_domain(vfio_dev->dev);
-		if (!domain) {
-			pr_err("%s:iommu domain is NULL\n", __func__);
-			retval = -EINVAL;
-			break;
-		}
+	domain = kiumd_iommu_get_dma_domain(vfio_dev->dev);
+	if (!domain) {
+		pr_err("%s:iommu domain is NULL\n", __func__);
+		return -EINVAL;
+	}
 
-		device_obj = kobject_create_and_add(vfio_dev->dev->kobj.name, smmu_obj);
-		if (!device_obj) {
-			pr_err("/sys/kernel/smmu_fault/%s creation failed\n",
-			       vfio_dev->dev->kobj.name);
-			retval = -ENOMEM;
-			break;
-		}
+	device_obj = kobject_create_and_add(vfio_dev->dev->kobj.name, smmu_obj);
+	if (!device_obj) {
+		pr_err("/sys/kernel/smmu_fault/%s creation failed\n",
+		       vfio_dev->dev->kobj.name);
+		return -ENOMEM;
+	}
 
-		err = sysfs_create_file(device_obj, &(fsr_iova_attribute.attr));
-		if (err) {
-			pr_err("failed to create sysfs file in /sys/kernel/\n");
-			retval = err;
-			break;
-		}
+	ret = sysfs_create_file(device_obj, &(fsr_iova_attribute.attr));
+	if (ret) {
+		pr_err("failed to create sysfs file in /sys/kernel/\n");
+		return ret;
+	}
 
-		ptr = kzalloc(sizeof(*ptr), GFP_KERNEL);
-		if (ptr == NULL) {
-			retval = -ENOMEM;
-			break;
-		}
-		ptr->kobj = device_obj;
-		ptr->flag = 0;
-		ptr->next = NULL;
+	ptr = kzalloc(sizeof(*ptr), GFP_KERNEL);
+	if (ptr == NULL)
+		return -ENOMEM;
 
-		if (head == NULL) {
-			head = ptr;
-		} else {
-			temp = head;
-			while (temp->next != NULL)
-				temp = temp->next;
-			temp->next = ptr;
-		}
+	ptr->kobj = device_obj;
+	ptr->flag = 0;
+	ptr->next = NULL;
 
-		iommu_set_fault_handler(domain, kiumd_smmu_fault_handler, device_obj->name);
+	if (head == NULL) {
+		head = ptr;
+	} else {
+		temp = head;
+		while (temp->next != NULL)
+			temp = temp->next;
+		temp->next = ptr;
+	}
 
-	} while (0);
+	iommu_set_fault_handler(domain, kiumd_smmu_fault_handler, device_obj->name);
 
-	return retval;
+	return 0;
 }
 
 
