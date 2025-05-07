@@ -2958,8 +2958,8 @@ int kiumd_fd_dmabuf_handler(char __user *arg, struct file *fp)
 			mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
 			return -EINVAL;
 		}
-
 		if (!IS_ERR_OR_NULL((struct dma_buf *) dmabuf_handle->dmabuf)) {
+			get_dma_buf((struct dma_buf *) dmabuf_handle->dmabuf);
 			kiusr.dma_buf_fd = dma_buf_fd((struct dma_buf *) dmabuf_handle->dmabuf, (O_CLOEXEC));
 		}
 		if (kiusr.dma_buf_fd < 0) {
@@ -2967,7 +2967,7 @@ int kiumd_fd_dmabuf_handler(char __user *arg, struct file *fp)
 			mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
 			return -EBADF;
 		}
-		get_dma_buf((struct dma_buf *) dmabuf_handle->dmabuf);
+
 		mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
 		trace_kiumd_fd_dmabuf_handler_handle_to_fd(kiusr.dma_buf_fd, kiusr.handle, atomic_read(&dmabuf_handle->handle_refcount));
 
