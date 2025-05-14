@@ -234,16 +234,16 @@ static int translate_fd_to_pa(unsigned  int *dmabuf_fd,
                         return -EFAULT;
                 }
 
-                if (get_pa_from_dmabuf_fd(dma_buf, &pa) < 0)
-                        return -EINVAL;
+		if (get_pa_from_dmabuf_fd(dma_buf, &pa) < 0) {
+			dma_buf_put(dma_buf);
+			return -EINVAL;
+		}
 
-                scm_args[dmabuf_fd[i]] = pa;
-        }
-
-	if (!IS_ERR_OR_NULL(dma_buf))
+		scm_args[dmabuf_fd[i]] = pa;
 		dma_buf_put(dma_buf);
+	}
 
-        return 0;
+	return 0;
 }
 
 static bool validate_svc_cmd(unsigned int svc_id, unsigned int cmd_id)
