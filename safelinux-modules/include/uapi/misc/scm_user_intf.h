@@ -33,6 +33,11 @@
 #define MAX_QCOM_SCM_RESULT                     3
 #define MAX_QCOM_SCM_IN                         10
 
+struct uscm_vm_perm {
+	__u32 vmid;
+	__u32 perm;
+};
+
 struct scm_hand_shake {
 	__u32 svc;
 	__u32 cmd;
@@ -72,4 +77,5 @@ int qcom_scm_kgsl_set_smmu_aperture(unsigned int num_context_bank);
 
 extern int qcom_scm_ddrbw_profiler(uint64_t in_buf,
     size_t in_buf_size, uint64_t out_buf, size_t out_buf_size);
+
 #endif
