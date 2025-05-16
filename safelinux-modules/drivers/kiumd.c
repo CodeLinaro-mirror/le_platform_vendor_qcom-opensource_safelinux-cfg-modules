@@ -2378,6 +2378,7 @@ int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 			offset = get_pgtble_and_alloc_iova(kiusr.vfio_fd, kiumd_ctx, size, kiusr.pt_id);
 			if (!offset) {
 				pr_err("%s:%d get_pgtble_and_alloc_iova failed\n", __func__, __LINE__);
+				ret = -EINVAL;
 				goto fail_put;
 			}
 			ret = set_map_iova(offset, vfio_dev, kiusr.ptselect);
