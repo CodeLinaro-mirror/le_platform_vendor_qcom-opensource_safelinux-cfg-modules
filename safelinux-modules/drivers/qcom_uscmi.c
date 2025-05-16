@@ -78,6 +78,9 @@ static int do_power_operation(scmi_oper_ioctl_t *req,
 	if (req->proto != SCMI_PROTO_POWER)
 		return -EINVAL;
 
+	if (!dev->pm_domain)
+		return -EINVAL;
+
 	switch(req->oper) {
 	  case SCMI_PWR_OFF:
 		  if (is_genpd_on(dev)) {

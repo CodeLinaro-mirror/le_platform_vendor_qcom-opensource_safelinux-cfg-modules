@@ -101,6 +101,11 @@ struct kiumd_user {
 	int id;
 	unsigned int hyp_id;
 	int pid;
+	__u32 pt_id;
+	__u64 pgtbl_ops_ptr;
+	__u64 ttbr0;
+	__u16 asid;
+	__u32 flags;
 };
 
 struct kiumd_smmu_mmio_map {

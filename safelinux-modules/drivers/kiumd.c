@@ -67,6 +67,8 @@ static DECLARE_BITMAP(perprocess_map, KGSL_PT_MEM_PAGES);
 
 #define KGSL_GLOBAL_PT_BASE_IOVA 0xFFFFFF8000000000
 #define KGSL_PER_PROCESS_PT_BASE_IOVA 0x60000000
+#define KGSL_PER_PROCESS_PT_END_IOVA 0x240000000
+
 #define SMMU_MAPTABLE_SIZE (10)
 
 #define MAX_KIUMD_ACL_ENTRIES 64
@@ -96,32 +98,10 @@ enum iommu_dma_cookie_type {
 	IOMMU_DMA_MSI_COOKIE,
 };
 
-/*
- * This structure represents a handle to a DMA buffer.
- * - dmabuf: The DMA buffer identifier.
- * - handle_refcount: Reference count for the DMA buffer.
- * - process_xarray: An xarray to manage processes associated with the buffer.
- * - process_xarray_mutex: Mutex to protect access to the process_xarray.
- */
 struct dma_buf_handle {
 	unsigned long dmabuf;
 	atomic_t handle_refcount;
-	struct xarray process_xarray;
-	struct mutex process_xarray_mutex;
 };
-
-/*
- * This structure represents a reference to a process.
- * - pid: The process identifier.
- * - ref_count: The reference count for the process.
- */
-struct process_ref {
-	int pid;
-	int ref_count;
-};
-
-static DEFINE_XARRAY_ALLOC(fd_handle_xaray);
-static DEFINE_MUTEX(fd_handle_mutex);
 
 /*
  * This is a redefinition of kernel struct - struct dma_heap_attachment
@@ -233,6 +213,47 @@ struct kiumd_reserved_mem_area {
 };
 
 /**
+ * struct kiumd_kgsl_context: to store GPU context
+ * @kgsl_pt_id: pagetable id
+ * @kgsl_pt_lock: lock for pagetable add/retrieve
+ * @kgsl_start_iova: Starting iova for GPU
+ * @kgsl_end_iova Ending iova for GPU
+ */
+
+struct kiumd_kgsl_context {
+	u32 kgsl_pt_id;
+	spinlock_t kgsl_pt_lock;
+	unsigned long kgsl_start_iova;
+	unsigned long kgsl_end_iova;
+};
+
+/**
+ * struct pgtable_map: to store each pagetable iova details for GPU
+ * @idx: pagetable id for each GPU process
+ * @start_iova: Starting iova for GPU
+ * @end_iova: Ending iova for GPU
+ * @rbtree: Red-black tree root for managing iova ranges
+ * @node: Node for linking in a hash list
+ * @ttbr0_addr: TTBR0 address for GPU
+ * @pgtbl_ops_ptr: Pointer to pagetable operations for GPU
+ * @last_allocated_end: Last allocated end address for GPU
+ * @is_contiguous: Flag indicating if the iova range is contiguous
+ */
+struct pgtable_map {
+	unsigned long idx;
+	unsigned long start_iova;
+	unsigned long end_iova;
+	struct rb_root rbtree;
+	struct hlist_node node;
+//Used only by GPU
+	unsigned long ttbr0_addr;
+	unsigned long pgtbl_ops_ptr;
+	unsigned long last_allocated_end;
+	bool is_contiguous;
+};
+
+
+/**
  * struct kiumd_ctx: Structure for kiumd_ctx .
  * @id: id to map/unmap entries in hashtable
  * @smmu_map_data: structurefor hashtable data
@@ -259,21 +280,16 @@ struct kiumd_ctx {
 	DECLARE_HASHTABLE(hyp_table, SMMU_MAPTABLE_SIZE);
 	struct kiumd_reserved_mem_area *res_mem_area;
 	int num_reserved_regions;
+	struct xarray kiumd_xa;
+	struct mutex kiumd_xa_mutex;
 	struct mutex hyp_lock;
 	unsigned long pt_start_iova;
 	unsigned long pt_end_iova;
 	DECLARE_HASHTABLE(page_table, SMMU_MAPTABLE_SIZE);
+	DECLARE_HASHTABLE(kgsl_page_table, SMMU_MAPTABLE_SIZE);
+	struct kiumd_kgsl_context *kgsl_context;
 	unsigned long max_shift;
 	struct io_pgtable *pgtable;
-	int pid;
-};
-
-struct pgtable_map {
-	unsigned long idx;
-	unsigned long start_iova;
-	unsigned long end_iova;
-	struct rb_root rbtree;
-	struct hlist_node node;
 };
 
 struct iommu_addr_entry {
@@ -564,23 +580,56 @@ struct arm_smmu_domain *kiumd_get_smmu_domain(int vfio_fd)
 	return smmu_domain;
 }
 
-struct pgtable_map *kiumd_get_pgtable_entry(struct kiumd_ctx *kiumd_ctx, unsigned long idx)
+/**
+ * kiumd_get_pgtable_entry - Retrieve a pagetable entry from the context
+ * @kiumd_ctx: Pointer to the kiumd context
+ * @idx: Index of the pagetable entry to retrieve
+ * @is_process: Flag indicating if the context is process-specific
+ *
+ * This function searches for a pagetable entry in the given context's
+ * hash table based on the provided index. If the context is process-specific,
+ * it locks the process-specific pagetable lock, searches the hash table, and
+ * unlocks the lock. If the context is not process-specific, it performs the
+ * same operations on the general pagetable lock and hash table.
+ *
+ * Return: Pointer to the found pagetable entry, or NULL if not found.
+ */
+
+struct pgtable_map *kiumd_get_pgtable_entry(struct kiumd_ctx *kiumd_ctx, unsigned long idx, bool is_process)
 {
 	struct pgtable_map *pgtble_ctx;
+	struct kiumd_kgsl_context *kgsl_context;
 	bool found = false;
 
-	spin_lock(&kiumd_ctx->pt_lock);
-	hash_for_each_possible(kiumd_ctx->page_table, pgtble_ctx, node, idx) {
-		if (pgtble_ctx->idx == idx) {
-			found = true;
-			break;
+	if (is_process) {
+		kgsl_context = kiumd_ctx->kgsl_context;
+		spin_lock(&kgsl_context->kgsl_pt_lock);
+		hash_for_each_possible(kiumd_ctx->kgsl_page_table, pgtble_ctx, node, idx) {
+			if (pgtble_ctx->idx == idx) {
+				found = true;
+				break;
+			}
 		}
-	}
 
-	spin_unlock(&kiumd_ctx->pt_lock);
-	if (!found) {
-		pr_err("%s:id not found in hash table\n", __func__);
-		return NULL;
+		spin_unlock(&kgsl_context->kgsl_pt_lock);
+		if (!found) {
+			pr_err("%s:%d id not found in hash table\n", __func__, __LINE__);
+			return NULL;
+		}
+	} else {
+		spin_lock(&kiumd_ctx->pt_lock);
+		hash_for_each_possible(kiumd_ctx->page_table, pgtble_ctx, node, idx) {
+			if (pgtble_ctx->idx == idx) {
+				found = true;
+				break;
+			}
+		}
+
+		spin_unlock(&kiumd_ctx->pt_lock);
+		if (!found) {
+			pr_err("%s:%d id not found in hash table\n", __func__, __LINE__);
+			return NULL;
+		}
 	}
 
 	return pgtble_ctx;
@@ -612,11 +661,26 @@ static int free_iova_range(struct pgtable_map *map, unsigned long iova)
 	return -EINVAL; // IOVA not found
 }
 
-int free_allocated_iova(struct kiumd_ctx *kiumd_ctx, unsigned long iova, unsigned long idx)
+/**
+ * free_allocated_iova - Free an allocated IOVA range
+ * @kiumd_ctx: Pointer to the kiumd context
+ * @iova: IOVA address to free
+ * @idx: Index of the pagetable entry
+ * @is_process: Flag indicating if the context is process-specific
+ *
+ * This function retrieves a pagetable entry from the kiumd context based on the
+ * provided index and process flag. If the pagetable entry is found, it frees the
+ * specified IOVA range. If the pagetable entry is not found, it logs an error and
+ * returns -EINVAL.
+ *
+ * Return: 0 on success, -EINVAL if the pagetable entry is not found.
+ */
+
+int free_allocated_iova(struct kiumd_ctx *kiumd_ctx, unsigned long iova, unsigned long idx, bool is_process)
 {
 	struct pgtable_map *pgtble_ctx;
 
-	pgtble_ctx = kiumd_get_pgtable_entry(kiumd_ctx, idx);
+	pgtble_ctx = kiumd_get_pgtable_entry(kiumd_ctx, idx, is_process);
 	if (!pgtble_ctx) {
 		pr_err("%s:invalid id for hash table: id: %d\n", __func__, idx);
 		return -EINVAL;
@@ -629,8 +693,10 @@ static struct iommu_addr_entry *alloc_iommu_addr_entry(unsigned long base_addr, 
 {
 	struct iommu_addr_entry *entry = kmem_cache_alloc(iommu_addr_cache, GFP_KERNEL);
 
-	if (!entry)
+	if (!entry) {
+		pr_err("%s:%d failed to create entry for addr: %lx, size: %lu)\n", __func__, __LINE__, base_addr, size);
 		return NULL;
+	}
 
 	entry->base_addr = base_addr;
 	entry->size = size;
@@ -656,6 +722,26 @@ static int insert_iova(struct pgtable_map *pgtable_ctx, struct iommu_addr_entry 
 
 	rb_link_node(&entry->rbnode, parent, new);
 	rb_insert_color(&entry->rbnode, &pgtable_ctx->rbtree);
+
+	return 0;
+}
+
+int kiumd_configure_dma_cookie(struct vfio_device *vfio_dev, enum iommu_dma_cookie_type cookie_type, dma_addr_t dma_addr)
+{
+	struct kiumd_iommu_dma_cookie *cookie;
+	int ret;
+
+	cookie = kiumd_get_dma_cookie(vfio_dev);
+	if (!cookie) {
+		pr_err("%s failed to get cookie\n", __func__);
+		return -EINVAL;
+	}
+
+	ret = kiumd_set_dma_cookie_unlocked(cookie, cookie_type, dma_addr);
+	if (ret) {
+		pr_err("%s %d failed to set cookie\n", __func__, __LINE__);
+		return -EINVAL;
+	}
 
 	return 0;
 }
@@ -717,7 +803,7 @@ static unsigned long align_iova(struct device *dev, unsigned long start_iova, un
 	return start_iova;
 }
 
-static unsigned int alloc_iova_range(struct vfio_device *vfio_dev, struct pgtable_map *ptable_ctx, unsigned long size, unsigned long max_shift)
+static unsigned long alloc_iova_range(struct vfio_device *vfio_dev, struct pgtable_map *ptable_ctx, unsigned long size, unsigned long max_shift)
 {
 	struct rb_node *node = rb_first(&ptable_ctx->rbtree);
 	unsigned long start_iova = ptable_ctx->start_iova;
@@ -748,16 +834,56 @@ static unsigned int alloc_iova_range(struct vfio_device *vfio_dev, struct pgtabl
 
 	if (start_iova + size <= ptable_ctx->end_iova) {
 		struct iommu_addr_entry *new_entry = alloc_iommu_addr_entry(start_iova, size);
-
 		if (!new_entry)
 			return 0;
-
 
 		insert_iova(ptable_ctx, new_entry);
 		return start_iova;
 	}
 
 	return 0;
+}
+
+/**
+ * check_pgtable_context - Validate the pagetable context.
+ * @vfio_fd: File descriptor for the VFIO device
+ * @pgtable_ctx: Pointer to the pagetable context to validate
+ *
+ * This function retrieves the SMMU domain associated with the given VFIO file
+ * descriptor and checks if the pagetable context matches the TTBR0 address
+ * in the SMMU domain's pagetable configuration. If the SMMU domain or pagetable
+ * is invalid, or if there is a mismatch in the TTBR0 address, the function
+ * logs an error and returns false.
+ *
+ * Return: true if the pagetable context is valid, false otherwise.
+ */
+
+bool check_pgtable_context(int vfio_fd, struct pgtable_map *pgtable_ctx)
+{
+	struct io_pgtable *pgtable;
+	struct arm_smmu_domain *smmu_dom;
+	unsigned long ttbr0;
+
+	smmu_dom = kiumd_get_smmu_domain(vfio_fd);
+	if (!smmu_dom) {
+		pr_err("%s:%d invalid smmu_dom\n", __func__, __LINE__);
+		return false;
+	}
+
+	pgtable = io_pgtable_ops_to_pgtable(smmu_dom->pgtbl_ops);
+	if (!pgtable) {
+		pr_err("%s:%d invalid pagetable\n", __func__, __LINE__);
+		return false;
+	}
+
+	ttbr0 = pgtable->cfg.arm_lpae_s1_cfg.ttbr;
+
+	if (ttbr0 != pgtable_ctx->ttbr0_addr) {
+		pr_err("%s:%d mismatch pt_id and pgtable context, probably wrong id from UMD\n", __func__, __LINE__);
+		return false;
+	}
+
+	return true;
 }
 
 /**
@@ -881,10 +1007,8 @@ static int kiumd_smmuv2_set_ttbr1_cfg(struct arm_smmu_domain *smmu_domain,
 	struct arm_smmu_cb *cb = &smmu_domain->smmu->cbs[cfg->cbndx];
 	u32 tcr = cb->tcr[0];
 
-	if (!(cb->tcr[0] & ARM_SMMU_TCR_EPD1)) {
-		pr_err("TTBR1 translation is already enabled");
+	if (!(cb->tcr[0] & ARM_SMMU_TCR_EPD1))
 		return -EINVAL;
-	}
 
 	tcr |= arm_smmu_lpae_tcr(pgtbl_cfg);
 	tcr &= ~(ARM_SMMU_TCR_EPD0 | ARM_SMMU_TCR_EPD1);
@@ -948,11 +1072,8 @@ static int kiumd_set_pgtble_ttbr1_context(struct iommu_domain *iommu_dom)
 	}
 
 	smmu_dom->pgtbl_ops = pgtable_ops;
-	if (kiumd_smmuv2_set_ttbr1_cfg(smmu_dom, &cfg) < 0) {
-		pr_err("%s: failed to set TTBR1 cfg\n", __func__);
-		free_io_pgtable_ops(pgtable_ops);
-		return -EINVAL;
-	}
+	if (kiumd_smmuv2_set_ttbr1_cfg(smmu_dom, &cfg) < 0)
+		pr_err("%s: TTBR1 is already enabled for the device\n", __func__);
 
 	return 0;
 }
@@ -993,6 +1114,11 @@ static int kiumd_set_pgtble_ttbr0_context(struct iommu_domain *iommu_dom, struct
 	}
 
 	pgtable = kiumd_ctx->pgtable;
+	if (!pgtable) {
+		pr_err("%s: pgtable is null\n", __func__);
+		return -EINVAL;
+	}
+
 	memcpy(&cfg, &pgtable->cfg, sizeof(struct io_pgtable_cfg));
 	cfg.quirks &= ~IO_PGTABLE_QUIRK_ARM_TTBR1;
 	cfg.tlb = &kgsl_iopgtbl_tlb_ops;
@@ -1019,7 +1145,7 @@ static int kiumd_set_pgtble_ttbr0_context(struct iommu_domain *iommu_dom, struct
 
 /**
  * kiumd_set_pgtbl_context - Set the page table context for an SMMU device.
- * @arg: User-provided pointer to a struct kiumd_smmu_user containing context information
+ * @arg: User-provided pointer to a struct kiumd_user containing context information
  *
  * This function sets the page table context for an SMMU device based on user-provided
  * information. It validates the VFIO file descriptor, retrieves the VFIO device,
@@ -1032,14 +1158,14 @@ static int kiumd_set_pgtble_ttbr0_context(struct iommu_domain *iommu_dom, struct
 
 static int kiumd_set_pgtbl_context(char __user *arg, struct file *fp)
 {
-	struct kiumd_smmu_user pgtbl_ctx;
+	struct kiumd_user pgtbl_ctx;
 	struct vfio_device *vfio_dev;
 	struct iommu_domain *iommu_dom;
 	struct kiumd_ctx *kiumd_ctx;
 
 	int ret;
 
-	if (copy_from_user(&pgtbl_ctx, arg, sizeof(struct kiumd_smmu_user)))
+	if (copy_from_user(&pgtbl_ctx, arg, sizeof(struct kiumd_user)))
 		return -EFAULT;
 
 	if (pgtbl_ctx.vfio_fd < 0) {
@@ -1090,9 +1216,10 @@ static int kiumd_set_pgtbl_context(char __user *arg, struct file *fp)
 *
 * Returns  0 upon success and -EINVAL on failure
 */
+
 int kiumd_perprocess_pt_alloc(char __user *arg, struct file *fp)
 {
-	struct kiumd_smmu_user kismmu_pproc;
+	struct kiumd_user kiusr;
 	struct file *file;
 	struct vfio_device *vfio_dev;
 	struct vfio_device_file *df;
@@ -1101,73 +1228,105 @@ int kiumd_perprocess_pt_alloc(char __user *arg, struct file *fp)
 	struct iommu_domain *iommu_dom;
 	struct kiumd_ctx *kiumd_ctx;
 	struct io_pgtable *pgtable;
+	struct pgtable_map *pgtbl_ctx;
+	struct kiumd_kgsl_context *kgsl_context;
 
-	if (copy_from_user(&kismmu_pproc, arg, sizeof(struct kiumd_smmu_user)))
+	trace_kiumd_perprocess_pt_alloc_start(kiusr.vfio_fd);
+
+	if (!fp) {
+		pr_err("%s:%d file ptr returns NULL\n", __func__, __LINE__);
+		return -EINVAL;
+	}
+
+	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user)))
 		return -EFAULT;
 
-	trace_kiumd_perprocess_pt_alloc_start(kismmu_pproc.vfio_fd);
-
-	if (kismmu_pproc.vfio_fd < 0) {
-		pr_err("%s: Invalid fd from user\n", __func__);
+	if (kiusr.vfio_fd < 0) {
+		pr_err("%s:%d Invalid fd from user\n", __func__, __LINE__);
 		return -EBADF;
 	}
 
-	file = fget(kismmu_pproc.vfio_fd);
-	if (!file) {
-		pr_err("%s:failed to get file from vfio fd\n", __func__);
-		return -EBADF;
-	}
-
-	df = (struct vfio_device_file *)file->private_data;
-	vfio_dev = (struct vfio_device *)df->device;
+	vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
 	if (!vfio_dev) {
-		pr_err("%s:vfio_dev is NULL\n", __func__);
-		fput(file);
+		pr_err("%s:%d vfio_dev is NULL\n", __func__, __LINE__);
 		return -EINVAL;
 	}
 
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
 	if (!kiumd_ctx) {
-		pr_err("%s:kiumd ctx is NULL \n", __func__);
+		pr_err("%s:%d kiumd ctx is NULL \n", __func__, __LINE__);
 		fput(file);
 		return -EINVAL;
 	}
 
 	iommu_dom = kiumd_iommu_get_dma_domain(vfio_dev->dev);
 	if (!iommu_dom) {
-		pr_err("%s:iommu domain is NULL\n", __func__);
-		fput(file);
+		pr_err("%s:%d iommu domain is NULL\n", __func__, __LINE__);
 		return -EINVAL;
 	}
 
 	smmu_dom = container_of(iommu_dom, struct arm_smmu_domain, domain);
 	if ((!smmu_dom) || (!(smmu_dom->pgtbl_ops))) {
-		pr_err("%s:smmu domain/pagetable ops is invalid\n", __func__);
-		fput(file);
+		pr_err("%s:%d smmu domain/pagetable ops is invalid\n", __func__, __LINE__);
 		return -EINVAL;
 	}
 
 	pgtable = kiumd_ctx->pgtable;
-	memcpy(&cfg, &pgtable->cfg, sizeof(struct io_pgtable_cfg));
-	cfg.quirks &= ~IO_PGTABLE_QUIRK_ARM_TTBR1;
-	cfg.tlb = &kgsl_iopgtbl_tlb_ops;
-	kismmu_pproc.asid = smmu_dom->cfg.asid;
-	kismmu_pproc.pgtbl_ops_ptr = (long)alloc_io_pgtable_ops(ARM_64_LPAE_S1, &cfg, NULL);
-	if (!(kismmu_pproc.pgtbl_ops_ptr)) {
-		pr_err("%s:failed to allocate pagetable ops\n", __func__);
-		fput(file);
+	if (!pgtable) {
+		pr_err("%s: pgtable is null\n", __func__);
 		return -EINVAL;
 	}
 
-	kismmu_pproc.ttbr0 = cfg.arm_lpae_s1_cfg.ttbr;
-	fput(file);
+	memcpy(&cfg, &pgtable->cfg, sizeof(struct io_pgtable_cfg));
+	cfg.quirks &= ~IO_PGTABLE_QUIRK_ARM_TTBR1;
+	cfg.tlb = &kgsl_iopgtbl_tlb_ops;
+	kiusr.asid = smmu_dom->cfg.asid;
+	kiusr.pgtbl_ops_ptr = (long)alloc_io_pgtable_ops(ARM_64_LPAE_S1, &cfg, NULL);
+	if (!(kiusr.pgtbl_ops_ptr)) {
+		pr_err("%s:%d failed to allocate pagetable ops\n", __func__, __LINE__);
+		return -EINVAL;
+	}
 
-	if (copy_to_user(arg, &kismmu_pproc, sizeof(kismmu_pproc))) {
-		pr_err("%s: copy_to_user failed...\n", __func__);
+	kiusr.ttbr0 = cfg.arm_lpae_s1_cfg.ttbr;
+
+	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
+	if (!kiumd_ctx) {
+		pr_err("%s:%d kiumd ctx is NULL \n", __func__, __LINE__);
+		return -EINVAL;
+	}
+
+	kgsl_context = kiumd_ctx->kgsl_context;
+	if (kgsl_context->kgsl_pt_id == UINT_MAX) {
+		pr_err("%s:%d integer overflow in pt_id.\n", __func__, __LINE__);
+		return -EINVAL;
+	}
+
+	pgtbl_ctx = (struct pgtable_map *)kzalloc(sizeof(struct pgtable_map), GFP_KERNEL);
+	if (!pgtbl_ctx) {
+		pr_err("%s:%d No memory for smap \n", __func__, __LINE__);
+		return -EINVAL;
+	}
+
+	pgtbl_ctx->rbtree = RB_ROOT;
+	pgtbl_ctx->ttbr0_addr = kiusr.ttbr0;
+	pgtbl_ctx->start_iova = kiumd_ctx->kgsl_context->kgsl_start_iova;
+	pgtbl_ctx->end_iova = kiumd_ctx->kgsl_context->kgsl_end_iova;
+	pgtbl_ctx->pgtbl_ops_ptr = kiusr.pgtbl_ops_ptr;
+	pgtbl_ctx->last_allocated_end = 0;
+	pgtbl_ctx->is_contiguous = true;
+	spin_lock(&kgsl_context->kgsl_pt_lock);
+	pgtbl_ctx->idx = kgsl_context->kgsl_pt_id++;
+	hash_add(kiumd_ctx->kgsl_page_table, &pgtbl_ctx->node, pgtbl_ctx->idx);
+	spin_unlock(&kgsl_context->kgsl_pt_lock);
+
+	kiusr.pt_id = pgtbl_ctx->idx;
+
+	if (copy_to_user(arg, &kiusr, sizeof(kiusr))) {
+		pr_err("%s:%d copy_to_user failed...\n", __func__, __LINE__);
 		return -EFAULT;
 	}
-	trace_kiumd_perprocess_pt_alloc_end(kismmu_pproc.vfio_fd, kismmu_pproc.pgtbl_ops_ptr,
-						kismmu_pproc.ttbr0, kismmu_pproc.asid);
+	trace_kiumd_perprocess_pt_alloc_end(kiusr.vfio_fd, kiusr.pgtbl_ops_ptr,
+						kiusr.ttbr0, kiusr.asid);
 
 	return 0;
 }
@@ -1185,7 +1344,7 @@ int kiumd_perprocess_pt_alloc(char __user *arg, struct file *fp)
 int kiumd_global_pgtble_set(char __user *arg, struct file *fp)
 {
 
-	struct kiumd_smmu_user kismmu_pproc;
+	struct kiumd_user kismmu_pproc;
 	struct file *file;
 	struct vfio_device *vfio_dev;
 	struct vfio_device_file *df;
@@ -1195,7 +1354,7 @@ int kiumd_global_pgtble_set(char __user *arg, struct file *fp)
 	struct kiumd_ctx *kiumd_ctx;
 	struct io_pgtable *pgtable;
 
-	if (copy_from_user(&kismmu_pproc, arg, sizeof(struct kiumd_smmu_user)))
+	if (copy_from_user(&kismmu_pproc, arg, sizeof(struct kiumd_user)))
 		return -EFAULT;
 
 	trace_kiumd_global_pgtble_set_start(kismmu_pproc.vfio_fd);
@@ -1277,7 +1436,7 @@ int kiumd_global_pgtble_set(char __user *arg, struct file *fp)
 */
 int kiumd_perprocess_pgtble_set(char __user *arg)
 {
-	struct kiumd_smmu_user kismmu_pproc;
+	struct kiumd_user kismmu_pproc;
 	struct file *file;
 	struct vfio_device *vfio_dev;
 	struct vfio_device_file *df;
@@ -1285,7 +1444,7 @@ int kiumd_perprocess_pgtble_set(char __user *arg)
 	struct arm_smmu_domain *smmu_dom;
 	struct io_pgtable_ops *ki_pgtbl_ops;
 
-	if (copy_from_user(&kismmu_pproc, arg, sizeof(struct kiumd_smmu_user)))
+	if (copy_from_user(&kismmu_pproc, arg, sizeof(struct kiumd_user)))
 		return -EFAULT;
 
 	trace_kiumd_perprocess_pgtble_set_start(kismmu_pproc.vfio_fd, kismmu_pproc.pgtbl_ops_ptr,
@@ -1325,6 +1484,11 @@ int kiumd_perprocess_pgtble_set(char __user *arg)
 	}
 
 	ki_pgtbl_ops = (struct io_pgtable_ops *)kismmu_pproc.pgtbl_ops_ptr;
+	if (!ki_pgtbl_ops) {
+		pr_err("%s:pagetable ops is NULL\n", __func__);
+		return -EINVAL;
+	}
+
 	smmu_dom->pgtbl_ops = ki_pgtbl_ops;
 	fput(file);
 
@@ -1343,50 +1507,91 @@ int kiumd_perprocess_pgtble_set(char __user *arg)
 * Returns  0 upon success and error codes
 * on failure
 */
-int kiumd_perprocess_pgtble_free(char __user *arg)
+int kiumd_perprocess_pgtble_free(char __user *arg, struct file *fp)
 {
-	struct kiumd_smmu_user kismmu_pproc;
-	struct file *file;
+	struct kiumd_user kiusr;
 	struct vfio_device *vfio_dev;
 	struct vfio_device_file *df;
-	struct io_pgtable_ops *ki_pgtbl_ops;
+	struct io_pgtable_ops *pgtable_ops;
+	struct pgtable_map *pgtble_ctx;
+	struct kiumd_ctx *kiumd_ctx;
 
-	if (copy_from_user(&kismmu_pproc, arg, sizeof(struct kiumd_smmu_user)))
+	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user)))
 		return -EFAULT;
 
-	trace_kiumd_perprocess_pgtble_free_start(kismmu_pproc.vfio_fd, kismmu_pproc.pgtbl_ops_ptr,
-						kismmu_pproc.ttbr0, kismmu_pproc.asid);
+	trace_kiumd_perprocess_pgtble_free_start(kiusr.vfio_fd, kiusr.pgtbl_ops_ptr,
+						kiusr.ttbr0, kiusr.asid);
 
-	if (kismmu_pproc.vfio_fd < 0) {
-		pr_err("%s: Invalid fd from user\n", __func__);
-		return -EBADF;
+	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
+	if (!kiumd_ctx) {
+		pr_err("%s:%d kiumd ctx is NULL\n", __func__, __LINE__);
+		return -EINVAL;
 	}
 
-	file = fget(kismmu_pproc.vfio_fd);
-	if (!file) {
-		pr_err("%s:failed to get file from vfio fd\n", __func__);
-		return -EBADF;
-	}
-
-	df = (struct vfio_device_file *)file->private_data;
-	vfio_dev = (struct vfio_device *)df->device;
+	vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
 	if (!vfio_dev) {
-		pr_err("%s:vfio_dev is NULL\n", __func__);
-		fput(file);
+		pr_err("%s:%d vfio_dev is NULL\n", __func__, __LINE__);
 		return -EINVAL;
 	}
 
-	ki_pgtbl_ops = (struct io_pgtable_ops *)kismmu_pproc.pgtbl_ops_ptr;
-	if (!ki_pgtbl_ops) {
-		pr_err("%s:pagegetable ops is NULL\n", __func__);
-		fput(file);
+	pgtble_ctx = kiumd_get_pgtable_entry(kiumd_ctx, kiusr.pt_id, true);
+	if (!pgtble_ctx) {
+		pr_err("%s:%d Invalid id for hash table: id: %d\n", __func__, __LINE__, kiusr.pt_id);
 		return -EINVAL;
 	}
 
-	free_io_pgtable_ops(ki_pgtbl_ops);
-	fput(file);
+	if (!check_pgtable_context(kiusr.vfio_fd, pgtble_ctx)) {
+		pr_err("%s:%d check_pgtable_context failed\n", __func__, __LINE__);
+		return -EINVAL;
+	}
 
-	trace_kiumd_perprocess_pgtble_free_end(kismmu_pproc.vfio_fd);
+	/*TODO: unmap the remaining iovas and buffers in rbtree, if any,
+	 * for that ttbr should be pointing to this pagetable
+	 * */
+	pgtable_ops = (struct io_pgtable_ops *)pgtble_ctx->pgtbl_ops_ptr;
+	if (!pgtable_ops) {
+		pr_err("%s:%d pagegetable ops is NULL\n", __func__, __LINE__);
+		return -EINVAL;
+	}
+
+	free_io_pgtable_ops(pgtable_ops);
+
+	trace_kiumd_perprocess_pgtble_free_end(kiusr.vfio_fd);
+
+	return 0;
+}
+
+int kiumd_set_dma_addr_ranges(struct kiumd_ctx *kiumd_ctx, struct device *dev)
+{
+	const __be32 *addr_range;
+	u64 start_addr, end_addr;
+	struct device_node *np;
+	int len;
+
+	np = dev->of_node;
+	if (!np) {
+		dev_err(dev, "Device tree node not found\n");
+		return -EINVAL;
+	}
+
+	addr_range = of_get_property(np, "qcom,iommu-dma-addr-range", &len);
+	if (!addr_range)
+		return 0; /*This is not an error, not every device need to have this property set*/
+
+	if (len < (2 * sizeof(u32))) {
+		dev_err(dev, "qcom,iommu-dma-addr-range property length is invalid\n");
+		return -EINVAL;
+	}
+
+	start_addr = of_read_number(addr_range, 2);
+	end_addr = of_read_number(addr_range + 2, 2);
+	if (end_addr < start_addr) {
+		dev_err(dev, "invalid address specified in the device tree\n");
+		return -EINVAL;
+	}
+
+	kiumd_ctx->pt_start_iova = start_addr;
+	kiumd_ctx->pt_end_iova = end_addr;
 
 	return 0;
 }
@@ -1444,6 +1649,7 @@ int kiumd_dmabuf_custom_iova_init(char __user *arg, struct file *fp)
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
 	if (!kiumd_ctx) {
 		pr_err("%s:kiumd ctx is NULL \n", __func__);
+		fput(file);
 		return -EINVAL;
 	}
 
@@ -1456,6 +1662,13 @@ int kiumd_dmabuf_custom_iova_init(char __user *arg, struct file *fp)
 	//Print a warning and continue.
 	if (ret)
 		pr_err("%s:WARNING: max_segment size not set.\n", __func__);
+
+	ret = kiumd_set_dma_addr_ranges(kiumd_ctx, vfio_dev->dev);
+	if (ret) {
+		pr_err("%s:set dma addr ranges failed for %s\n", __func__, dev_name(vfio_dev->dev));
+		fput(file);
+		return -EINVAL;
+	}
 
 	domain = kiumd_iommu_get_dma_domain(vfio_dev->dev);
 	if (!domain) {
@@ -1492,17 +1705,23 @@ int kiumd_dmabuf_custom_iova_init(char __user *arg, struct file *fp)
 *
 * Returns nothing
 */
-void clear_map_iova(u64 iova, u64 size, int ptselect)
+int clear_map_iova(struct kiumd_ctx *kiumd_ctx, u64 iova, u64 size, int ptselect, unsigned int idx)
 {
 	u64 bit;
+	int ret = 0;
 
 	if (ptselect == KGSL_GLOBAL_PT) {
 		bit = (iova & ~KGSL_GLOBAL_PT_BASE_IOVA) >> PAGE_SHIFT;
 		bitmap_clear(global_map, bit, size >> PAGE_SHIFT);
 	} else if (ptselect == KGSL_PER_PROCESS_PT) {
-		bit = (iova - KGSL_PER_PROCESS_PT_BASE_IOVA) >> PAGE_SHIFT;
-		bitmap_clear(perprocess_map, bit, size >> PAGE_SHIFT);
+		ret = free_allocated_iova(kiumd_ctx, iova, idx, true);
+		if (ret) {
+			pr_err("%s:%d unable to free iova\n", __func__, __LINE__);
+			return ret;
+		}
 	}
+
+	return ret;
 }
 
 /**
@@ -1574,16 +1793,18 @@ s64 get_map_offset(u64 size, int ptselect)
 */
 int set_map_iova(u64 offset, struct vfio_device *vfio_dev, int ptselect)
 {
-	dma_addr_t iova;
+	dma_addr_t iova = offset;
 	int ret;
 	struct kiumd_iommu_dma_cookie *cookie;
 
 	if (ptselect == KGSL_GLOBAL_PT)
 		iova = KGSL_GLOBAL_PT_BASE_IOVA + offset;
 	else if (ptselect == KGSL_PER_PROCESS_PT)
-		iova = KGSL_PER_PROCESS_PT_BASE_IOVA + offset;
-	else
+		iova = offset;
+	else {
 		pr_err("%s invalid ptselect\n", __func__);
+		return -EINVAL;
+	}
 
 	cookie = kiumd_get_dma_cookie(vfio_dev);
 	if (!cookie) {
@@ -1613,8 +1834,10 @@ static void kiumd_mangle_sg_table(struct sg_table *sg_table)
 	int i;
 	struct scatterlist *sg;
 
-	for_each_sgtable_sg(sg_table, sg, i)
-		sg->page_link ^= ~0xffUL;
+	for_each_sgtable_sg(sg_table, sg, i) {
+		if (sg)
+			sg->page_link ^= ~0xffUL;
+	}
 }
 
 /**
@@ -1631,10 +1854,140 @@ bool is_fixed_mapping(struct vfio_device *vfio_dev)
 	struct kiumd_iommu_dma_cookie *cookie;
 
 	cookie = kiumd_get_dma_cookie(vfio_dev);
-	if (cookie->type == IOMMU_DMA_MSI_COOKIE)
-		return true;
+	if (cookie) {
+		if (cookie->type == IOMMU_DMA_MSI_COOKIE)
+			return true;
+	}
 
 	return false;
+}
+/**
+ * alloc_iova_range_contiguous - Allocate a contiguous IOVA range
+ * @ptable_ctx: Pointer to the pagetable context
+ * @size: Size of the IOVA range to allocate
+ *
+ * This function attempts to allocate a contiguous IOVA range of the specified
+ * size within the given pagetable context. It first tries to allocate from the
+ * end of the last allocated block if the context is marked as contiguous. If
+ * that fails, it resets the last allocated end and searches for available holes
+ * in the IOVA space. If a suitable range is found, it allocates and inserts the
+ * new IOVA entry into the pagetable context.
+ *
+ * Return: The starting address of the allocated IOVA range, or 0 if no suitable
+ * range is found.
+ */
+
+static unsigned long alloc_iova_range_contiguous(struct pgtable_map *ptable_ctx, unsigned long size)
+{
+	struct iommu_addr_entry *new_entry, *entry;
+	unsigned long available_start;
+	bool found_hole;
+
+	struct rb_node *node = rb_first(&ptable_ctx->rbtree);
+	unsigned long last_allocated_end = ptable_ctx->last_allocated_end;
+
+	if (last_allocated_end == 0)
+		last_allocated_end = ptable_ctx->start_iova;
+
+	// Try to allocate from the end of the last allocated block
+	if ((last_allocated_end + size <= ptable_ctx->end_iova) && ptable_ctx->is_contiguous) {
+		new_entry = alloc_iommu_addr_entry(last_allocated_end, size);
+
+		if (!new_entry) {
+			pr_err("%s:%d failed to create new entry for iova: %lx with size: %lu\n", __func__, __LINE__, last_allocated_end, size);
+			return 0;
+		}
+
+
+		insert_iova(ptable_ctx, new_entry);
+		ptable_ctx->last_allocated_end = last_allocated_end + size;
+		return last_allocated_end;
+	}
+
+	// Reset alloacted end
+	if (last_allocated_end + size > ptable_ctx->end_iova) {
+		ptable_ctx->last_allocated_end = ptable_ctx->start_iova;
+		ptable_ctx->is_contiguous = false;
+		last_allocated_end = ptable_ctx->start_iova;
+	}
+
+	available_start = last_allocated_end;
+	found_hole = false;
+
+	// If no contiguous space is available, systematically search for holes
+	while (node) {
+		entry = rb_entry(node, struct iommu_addr_entry, rbnode);
+
+		if ((available_start + size <= entry->base_addr) && (available_start >= ptable_ctx->start_iova)) {
+			if (available_start >= last_allocated_end) {
+				found_hole = true;
+				break;
+			}
+		}
+
+		available_start = entry->base_addr + entry->size;
+		node = rb_next(node);
+	}
+
+	if (!found_hole && (available_start + size <= ptable_ctx->end_iova) && (available_start >= ptable_ctx->start_iova))
+		found_hole = true;
+
+	// Finally, check for space after the last allocated block
+	if (found_hole) {
+		new_entry = alloc_iommu_addr_entry(available_start, size);
+
+		if (!new_entry) {
+			pr_err("%s:%d failed to create entry for addr: %lx with size: %lu\n", __func__, __LINE__, last_allocated_end, size);
+			return 0;
+		}
+
+		insert_iova(ptable_ctx, new_entry);
+		ptable_ctx->last_allocated_end = available_start + size;
+		return available_start;
+	}
+
+	return 0; // No suitable IOVA found
+}
+
+/**
+ * get_pgtble_and_alloc_iova - Retrieve pagetable entry and allocate IOVA range
+ * @vfio_fd: File descriptor for the VFIO device
+ * @kiumd_ctx: Pointer to the kiumd context
+ * @size: Size of the IOVA range to allocate
+ * @idx: Index of the pagetable entry to retrieve
+ *
+ * This function retrieves a pagetable entry from the kiumd context based on the
+ * provided index. It then checks the validity of the pagetable context against
+ * the SMMU domain associated with the VFIO file descriptor. If the context is
+ * valid, it attempts to allocate a contiguous IOVA range of the specified size.
+ * If any step fails, it logs an error and returns 0.
+ *
+ * Return: The starting address of the allocated IOVA range, or 0 if any step fails.
+ */
+
+static uint64_t get_pgtble_and_alloc_iova(int vfio_fd, struct kiumd_ctx *kiumd_ctx, u64 size, unsigned int idx)
+{
+	struct pgtable_map *pgtble_ctx;
+	uint64_t addr;
+
+	pgtble_ctx = kiumd_get_pgtable_entry(kiumd_ctx, idx, true);
+	if (!pgtble_ctx) {
+		pr_err("%s:%d Invalid id for hash table: id: %d\n", __func__, __LINE__, idx);
+		return 0;
+	}
+
+	if (!check_pgtable_context(vfio_fd, pgtble_ctx)) {
+		pr_err("%s:%d check_pgtable_context failed\n", __func__, __LINE__);
+		return 0;
+	}
+
+	addr = alloc_iova_range_contiguous(pgtble_ctx, size);
+	if (!addr) {
+		pr_err("%s:%d IOVA memory limit reached\n", __func__, __LINE__);
+		return 0;
+	}
+
+	return addr;
 }
 
 void add_to_smmu_table(struct kiumd_ctx *ctx, struct smmu_map_data *map_data)
@@ -1688,7 +2041,7 @@ static int init_and_allocate_iova(struct vfio_device *vfio_dev, struct kiumd_ctx
 
 		kiumd_ctx->is_initialized = true;
 	} else {
-		pgtable_ctx = kiumd_get_pgtable_entry(kiumd_ctx, idx);
+		pgtable_ctx = kiumd_get_pgtable_entry(kiumd_ctx, idx, false);
 		if (!pgtable_ctx) {
 			pr_err("%s: Failed to find pgtable_map for device: %d", __func__, idx);
 			return -EINVAL;
@@ -1918,7 +2271,7 @@ int kiumd_dmabuf_managed_iova_unmap(char __user *arg, struct file *fp)
 	}
 
 	if (kiumd_ctx->max_shift) {
-		ret = free_allocated_iova(kiumd_ctx, kiusr.dma_addr, hash_id);
+		ret = free_allocated_iova(kiumd_ctx, kiusr.dma_addr, hash_id, false);
 		if (ret) {
 			pr_err("%s:unable to free iova\n", __func__);
 			return ret;
@@ -1945,6 +2298,11 @@ int kiumd_dmabuf_managed_iova_unmap(char __user *arg, struct file *fp)
 									kiumd_dma_direction);
 
 	iommu_dom = kiumd_get_iommu_domain(kiusr.vfio_fd);
+	if (!iommu_dom) {
+		pr_err("%s: iommu_dom is NULL\n", __func__);
+		return -EINVAL;
+	}
+
 	iommu_flush_iotlb_all(iommu_dom);
 
 	spin_lock(&kiumd_ctx->smmu_lock);
@@ -1968,7 +2326,6 @@ int kiumd_dmabuf_managed_iova_unmap(char __user *arg, struct file *fp)
  *
  * return value is errno or 0 in case of successful mapping
  */
-
 int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 {
 	struct kiumd_user kiusr;
@@ -2050,17 +2407,30 @@ int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 
 	if ((kiusr.ptselect == KGSL_GLOBAL_PT) || (kiusr.ptselect == KGSL_PER_PROCESS_PT)) {
 		size = kiumd_dmabuf->size;
-		offset = get_map_offset(size, kiusr.ptselect);
-		if (offset < 0) {
-			pr_err("%s:failed to get offset\n", __func__);
-			ret = offset;
-			goto fail_put;
-		}
+		if (kiusr.ptselect == KGSL_GLOBAL_PT) {
+			offset = get_map_offset(size, kiusr.ptselect);
+			if (offset < 0) {
+				pr_err("%s:%d failed to get offset\n", __func__, __LINE__);
+				ret = offset;
+				goto fail_put;
+			}
 
-		ret = set_map_iova((u64)offset, vfio_dev, kiusr.ptselect);
-		if (ret < 0) {
-			pr_err("%s:failed to set offset\n", __func__);
-			goto fail_put;
+			ret = set_map_iova((u64)offset, vfio_dev, kiusr.ptselect);
+			if (ret < 0) {
+				pr_err("%s:%d failed to set offset\n", __func__, __LINE__);
+				goto fail_put;
+			}
+		} else {
+			offset = get_pgtble_and_alloc_iova(kiusr.vfio_fd, kiumd_ctx, size, kiusr.pt_id);
+			if (!offset) {
+				pr_err("%s:%d get_pgtble_and_alloc_iova failed\n", __func__, __LINE__);
+				goto fail_put;
+			}
+			ret = set_map_iova(offset, vfio_dev, kiusr.ptselect);
+			if (ret < 0) {
+				pr_err("%s:%d failed to set offset\n", __func__, __LINE__);
+				goto fail_put;
+			}
 		}
 	}
 
@@ -2304,8 +2674,19 @@ int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 		return -EINVAL;
 	}
 
-	if (kiusr.ptselect == KGSL_GLOBAL_PT || kiusr.ptselect == KGSL_PER_PROCESS_PT)
-		clear_map_iova(kiusr.dma_addr, kiumd_dmabuf->size, kiusr.ptselect);
+	if (kiusr.ptselect == KGSL_GLOBAL_PT || kiusr.ptselect == KGSL_PER_PROCESS_PT) {
+		ret = kiumd_configure_dma_cookie(vfio_dev, IOMMU_DMA_MSI_COOKIE, kiusr.dma_addr);
+		if (ret) {
+			pr_err("%s %d failed to configure cookie\n", __func__, __LINE__);
+			return -EINVAL;
+		}
+
+		ret = clear_map_iova(kiumd_ctx, kiusr.dma_addr, kiumd_dmabuf->size, kiusr.ptselect, kiusr.pt_id);
+		if (ret) {
+			pr_err("%s:clear_map_iova failed\n", __func__);
+			return -EINVAL;
+		}
+	}
 
 	if (kiusr.dma_direction == 1)
 		kiumd_dma_direction = kiusr.dma_direction;
@@ -2313,15 +2694,9 @@ int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 		kiumd_dma_direction = 0;
 
 	if (smap->is_fixed_map) {
-		cookie = kiumd_get_dma_cookie(vfio_dev);
-		if (!cookie) {
-			pr_err("%s failed to get cookie\n", __func__);
-			return -EINVAL;
-		}
-
-		ret = kiumd_set_dma_cookie_unlocked(cookie, 0, kiusr.dma_addr);
+		ret = kiumd_configure_dma_cookie(vfio_dev, IOMMU_DMA_MSI_COOKIE, kiusr.dma_addr);
 		if (ret) {
-			pr_err("%s %d failed to set cookie\n", __func__, __LINE__);
+			pr_err("%s %d failed to configure cookie\n", __func__, __LINE__);
 			return -EINVAL;
 		}
 	}
@@ -2367,6 +2742,14 @@ int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 				pr_err("%s:iommu_unmap failed\n", __func__);
 				return -EINVAL;
 			}
+		}
+	}
+
+	if (smap->is_fixed_map) {
+		ret = kiumd_configure_dma_cookie(vfio_dev, IOMMU_DMA_IOVA_COOKIE, kiusr.dma_addr);
+		if (ret) {
+			pr_err("%s %d failed to configure cookie\n", __func__, __LINE__);
+			return -EINVAL;
 		}
 	}
 
@@ -2471,28 +2854,24 @@ int kiumd_fd_dmabuf_handler(char __user *arg, struct file *fp)
 	struct kiumd_user kiusr;
 	struct dma_buf *kiumd_dmabuf = NULL;
 	uint32_t local_id = 0;
-	uint32_t temp_id = 0;
 	void *ret;
 	int err;
 	void *xa_entry;
 	unsigned long dmabuf;
 	unsigned long xa_index;
-	bool global_handle_available = false;
-	bool pid_available = false;
+	bool handle_available = false;
 	struct dma_buf_handle *dmabuf_handle = NULL;
 	struct dma_buf_handle *dmabuf_xarray_entry = NULL;
 	struct kiumd_ctx *kiumd_ctx = NULL;
-	struct process_ref *pid_ptr, *pid_xry;
 
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-
 	if (!kiumd_ctx) {
-		pr_err("%s:%d kiumd ctx is NULL \n", __func__,__LINE__);
+		pr_err("%s:kiumd ctx is NULL \n", __func__);
 		return -EINVAL;
 	}
 
 	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user))) {
-		pr_err("%s:%d copy_from_user failed\n", __func__,__LINE__);
+		pr_err("%s: copy_from_user failed\n", __func__);
 		return -EFAULT;
 	}
 
@@ -2500,271 +2879,128 @@ int kiumd_fd_dmabuf_handler(char __user *arg, struct file *fp)
 
 	/* FD to Handle */
 	if (kiusr.handle == FD_TO_HANDLE) {
+
 		if (kiusr.dma_buf_fd < 0) {
-			pr_err("%s:%d dma_buf_fd is invalid\n", __func__,__LINE__);
+			pr_err("%s: dma_buf_fd is invalid\n", __func__);
 			return -EBADF;
 		}
 
+		mutex_lock(&kiumd_ctx->kiumd_xa_mutex);
 		/* Retrieve struct dma_buf from FD*/
-		mutex_lock(&fd_handle_mutex);
 		dmabuf  = (unsigned long) dma_buf_get(kiusr.dma_buf_fd);
-
 		if (((struct dma_buf *) dmabuf) == NULL) {
-			pr_err("%s:%d dma_buf_get returns NULL\n", __func__,__LINE__);
-			mutex_unlock(&fd_handle_mutex);
+			pr_err("%s: dma_buf_get returns NULL\n", __func__);
+			mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
 			return -EINVAL;
 		}
 
-		/* Check if handle for buffer already exists in global xarray, RCU lock acquired*/
-		xa_for_each(&fd_handle_xaray, xa_index, xa_entry) {
+		/* Check if handle for buffer already exists, RCU lock acquired*/
+		xa_for_each(&kiumd_ctx->kiumd_xa, xa_index, xa_entry) {
 			dmabuf_xarray_entry = (struct dma_buf_handle *) xa_entry;
-
 			if (dmabuf_xarray_entry->dmabuf == dmabuf) {
-				global_handle_available = true;
+				handle_available = true;
 				local_id = xa_index;
+				atomic_inc(&dmabuf_xarray_entry->handle_refcount);
 				break; //Handle found, exit the loop
 			}
 		}
 
 		/* If Handle does not exist, allocate xa_array entry*/
-		if (!global_handle_available) {
+		if (!handle_available) {
 			dmabuf_handle = kzalloc(sizeof(struct dma_buf_handle), GFP_KERNEL);
-
 			if (!dmabuf_handle) {
-				pr_err("%s:%d kzalloc failed.\n", __func__,__LINE__);
+				pr_err("%s: kzalloc failed.\n", __func__);
 				dma_buf_put((struct dma_buf *) dmabuf);
-				mutex_unlock(&fd_handle_mutex);
+				mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
 				return -ENOMEM;
 			}
-			/*populating values in dmabuf as it is created for first time*/
 			dmabuf_handle->dmabuf = dmabuf;
-			xa_init(&dmabuf_handle->process_xarray);
-			xa_init_flags(&dmabuf_handle->process_xarray, XA_FLAGS_ALLOC);
-			mutex_init(&dmabuf_handle->process_xarray_mutex);
-			/*allocating pid to xarray*/
-			mutex_lock(&dmabuf_handle->process_xarray_mutex);
-			pid_ptr = kzalloc(sizeof(struct process_ref), GFP_KERNEL);
-
-			if (!pid_ptr) {
-				pr_err("%s:%d pid kzalloc failed.\n", __func__,__LINE__);
-				dma_buf_put((struct dma_buf *) dmabuf);
-				mutex_unlock(&dmabuf_handle->process_xarray_mutex);
-				mutex_unlock(&fd_handle_mutex);
-				return -ENOMEM;
-			}
-
-			pid_ptr->pid = kiusr.pid;
-			kiumd_ctx->pid = kiusr.pid;
-			err = xa_alloc(&dmabuf_handle->process_xarray, &temp_id, (void *)pid_ptr,
-			               xa_limit_32b, GFP_KERNEL);
-
-			if (err < 0) {
-				pr_err("%s:%d local xarray alloc failure %d\n", __func__,__LINE__, err);
-				kfree(pid_ptr);
-				dma_buf_put((struct dma_buf *) dmabuf);
-				mutex_unlock(&dmabuf_handle->process_xarray_mutex);
-				mutex_unlock(&fd_handle_mutex);
-				return err;
-			}
-
-			mutex_unlock(&dmabuf_handle->process_xarray_mutex);
 			atomic_set(&dmabuf_handle->handle_refcount, 1);
-			err = xa_alloc(&fd_handle_xaray, &local_id, (void *)dmabuf_handle, xa_limit_32b,
-			               GFP_KERNEL);
-
+			err = xa_alloc(&kiumd_ctx->kiumd_xa, &local_id, (void *)dmabuf_handle, xa_limit_32b, GFP_KERNEL);
 			if (err < 0) {
-				pr_err("%s:%d xarray alloc failure %d\n", __func__,__LINE__, err);
+				pr_err("%s:xarray alloc failure %d\n", __func__, err);
 				dma_buf_put((struct dma_buf *) dmabuf);
 				kfree(dmabuf_handle);
-				mutex_unlock(&fd_handle_mutex);
+				mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
 				return err;
 			}
 		} else {
-			dmabuf_handle = xa_load(&fd_handle_xaray, local_id);
-
+			dmabuf_handle = xa_load(&kiumd_ctx->kiumd_xa, local_id);
 			if (!dmabuf_handle) {
-				pr_err("%s:%d dmabuf_handle is NULL\n", __func__,__LINE__);
-				dma_buf_put((struct dma_buf *) dmabuf);
-				mutex_unlock(&fd_handle_mutex);
+				pr_err("%s: dmabuf_handle is NULL\n", __func__);
+				mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
 				return -EINVAL;
 			}
-
-			/*look for pid in xarray*/
-			mutex_lock(&dmabuf_handle->process_xarray_mutex);
-			pid_available = false;
-			xa_for_each(&dmabuf_handle->process_xarray, xa_index, xa_entry) {
-				pid_xry = (struct process_ref*) xa_entry;
-
-				if (pid_xry->pid == kiusr.pid) {
-					pid_available = true;
-					break;
-				}
-			}
-			/*if fd to handle is called for an existing dmabuf from a process for first time.*/
-			if (!pid_available) {
-				pid_ptr = kzalloc(sizeof(struct process_ref), GFP_KERNEL);
-
-				if (!pid_ptr) {
-					pr_err("%s:%d pid kzalloc failed.\n", __func__,__LINE__);
-					dma_buf_put((struct dma_buf *) dmabuf);
-					mutex_unlock(&dmabuf_handle->process_xarray_mutex);
-					mutex_unlock(&fd_handle_mutex);
-					return -ENOMEM;
-				}
-
-				pid_ptr->pid = kiusr.pid;
-				kiumd_ctx->pid = kiusr.pid;
-				err = xa_alloc(&dmabuf_handle->process_xarray, &temp_id, (void *)pid_ptr,
-				               xa_limit_32b, GFP_KERNEL);
-
-				if (err < 0) {
-					pr_err("%s:%d xarray alloc failure %d\n", __func__,__LINE__, err);
-					kfree(pid_ptr);
-					dma_buf_put((struct dma_buf *) dmabuf);
-					mutex_unlock(&dmabuf_handle->process_xarray_mutex);
-					mutex_unlock(&fd_handle_mutex);
-					return err;
-				}
-
-				atomic_inc(&dmabuf_handle->handle_refcount);
-			}
-
-			mutex_unlock(&dmabuf_handle->process_xarray_mutex);
 		}
 
 		kiumd_dmabuf = (struct dma_buf *) dmabuf;
 		kiusr.handle = local_id;
-		mutex_unlock(&fd_handle_mutex);
-		trace_kiumd_fd_dmabuf_handler_fd_to_handle(kiusr.dma_buf_fd, kiusr.handle,
-		        atomic_read(&dmabuf_handle->handle_refcount));
+		mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
+		trace_kiumd_fd_dmabuf_handler_fd_to_handle(kiusr.dma_buf_fd, kiusr.handle, atomic_read(&dmabuf_handle->handle_refcount));
 	} else if (kiusr.dma_buf_fd == HANDLE_TO_FD) { /* Handle to FD */
 		if (kiusr.handle < 0) {
-			pr_err("%s:%d dmabuf handle is invalid\n", __func__,__LINE__);
+			pr_err("%s: dmabuf handle is invalid\n", __func__);
 			return -EINVAL;
 		}
-
-		mutex_lock(&fd_handle_mutex);
+		mutex_lock(&kiumd_ctx->kiumd_xa_mutex);
 		local_id = kiusr.handle;
-		dmabuf_handle = xa_load(&fd_handle_xaray, local_id);
-
+		dmabuf_handle = xa_load(&kiumd_ctx->kiumd_xa, local_id);
 		if (!dmabuf_handle) {
-			pr_err("%s:%d dmabuf_handle is NULL\n", __func__,__LINE__);
-			mutex_unlock(&fd_handle_mutex);
+			pr_err("%s: dmabuf_handle is NULL\n", __func__);
+			mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
 			return -EINVAL;
 		}
 
 		if (!IS_ERR_OR_NULL((struct dma_buf *) dmabuf_handle->dmabuf)) {
-			kiusr.dma_buf_fd = dma_buf_fd((struct dma_buf *) dmabuf_handle->dmabuf,
-			                              (O_CLOEXEC));
+			kiusr.dma_buf_fd = dma_buf_fd((struct dma_buf *) dmabuf_handle->dmabuf, (O_CLOEXEC));
 		}
-
 		if (kiusr.dma_buf_fd < 0) {
-			pr_err("%s:%d dma_buf_fd failed\n", __func__,__LINE__);
-			mutex_unlock(&fd_handle_mutex);
+			pr_err("%s:dma_buf_fd failed\n", __func__);
+			mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
 			return -EBADF;
 		}
-
-		pid_available = false;
-		/*look for pid in xarray*/
-		mutex_lock(&dmabuf_handle->process_xarray_mutex);
-		xa_for_each(&dmabuf_handle->process_xarray, xa_index, xa_entry) {
-			pid_xry = (struct process_ref*) xa_entry;
-
-			if (pid_xry->pid == kiusr.pid) {
-				pid_available = true;
-				break;
-			}
-		}
-
-		if (!pid_available) {
-			pid_ptr = kzalloc(sizeof(struct process_ref), GFP_KERNEL);
-
-			if (!pid_ptr) {
-				pr_err("%s:%d pid kzalloc failed.\n", __func__,__LINE__);
-				mutex_unlock(&dmabuf_handle->process_xarray_mutex);
-				mutex_unlock(&fd_handle_mutex);
-				return -ENOMEM;
-			}
-
-			pid_ptr->pid = kiusr.pid;
-			kiumd_ctx->pid = kiusr.pid;
-			err = xa_alloc(&dmabuf_handle->process_xarray, &temp_id, (void *)pid_ptr,
-			               xa_limit_32b, GFP_KERNEL);
-
-			if (err < 0) {
-				pr_err("%s:%d xarray alloc failure %d\n", __func__,__LINE__, err);
-				kfree(pid_ptr);
-				mutex_unlock(&dmabuf_handle->process_xarray_mutex);
-				mutex_unlock(&fd_handle_mutex);
-				return err;
-			}
-
-			atomic_inc(&dmabuf_handle->handle_refcount);
-		}
-
-		mutex_unlock(&dmabuf_handle->process_xarray_mutex);
 		get_dma_buf((struct dma_buf *) dmabuf_handle->dmabuf);
-		mutex_unlock(&fd_handle_mutex);
-		trace_kiumd_fd_dmabuf_handler_handle_to_fd(kiusr.dma_buf_fd, kiusr.handle,
-		        atomic_read(&dmabuf_handle->handle_refcount));
+		mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
+		trace_kiumd_fd_dmabuf_handler_handle_to_fd(kiusr.dma_buf_fd, kiusr.handle, atomic_read(&dmabuf_handle->handle_refcount));
+
 	} else if (kiusr.dma_buf_fd == CLOSE_HANDLE) {  /* Close Handle */
 		if (kiusr.handle < 0) {
-			pr_err("%s:%d Invalid dma buf handle.\n", __func__,__LINE__);
+			pr_err("%s: Invalid dma buf handle.\n", __func__);
 			return -EINVAL;
 		}
 
-		mutex_lock(&fd_handle_mutex);
+		mutex_lock(&kiumd_ctx->kiumd_xa_mutex);
 		local_id = (int32_t)kiusr.handle;
-		dmabuf_handle = xa_load(&fd_handle_xaray, local_id);
 
+		dmabuf_handle = xa_load(&kiumd_ctx->kiumd_xa, local_id);
 		if (!dmabuf_handle) {
-			pr_err("%s:%d Entry not available in xarray\n", __func__,__LINE__);
-			mutex_unlock(&fd_handle_mutex);
+			pr_err("%s:Entry not available in xarray\n", __func__);
+			mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
 			return -EINVAL;
 		}
 
-		pid_available = false;
-		/*look for pid in xarray*/
-		mutex_lock(&dmabuf_handle->process_xarray_mutex);
-		xa_for_each(&dmabuf_handle->process_xarray, xa_index, xa_entry) {
-			pid_xry = (struct process_ref*) xa_entry;
+		kiumd_dmabuf = ((struct dma_buf *)dmabuf_handle->dmabuf);
+		if (atomic_dec_and_test(&dmabuf_handle->handle_refcount)) {
 
-			if (pid_xry->pid == kiusr.pid) {
-				pid_available = true;
-				kfree(xa_entry);
-				xa_erase(&dmabuf_handle->process_xarray, xa_index);
-				break;
+			if (!IS_ERR_OR_NULL(kiumd_dmabuf))
+				dma_buf_put(kiumd_dmabuf);
+			xa_erase(&kiumd_ctx->kiumd_xa, local_id);
+			if (!dmabuf_handle) {
+				kfree(dmabuf_handle);
+				dmabuf_handle = NULL;
 			}
+		} else {
+			if (!IS_ERR_OR_NULL(kiumd_dmabuf))
+				dma_buf_put(kiumd_dmabuf);
 		}
-		mutex_unlock(&dmabuf_handle->process_xarray_mutex);
-
-		if (pid_available) {
-			kiumd_dmabuf = ((struct dma_buf *)dmabuf_handle->dmabuf);
-
-			if (atomic_dec_and_test(&dmabuf_handle->handle_refcount)) {
-				if (!IS_ERR_OR_NULL(kiumd_dmabuf)) {
-					dma_buf_put(kiumd_dmabuf);
-				}
-				xa_erase(&fd_handle_xaray, local_id);
-				if (!dmabuf_handle) {
-					kfree(dmabuf_handle);
-					dmabuf_handle = NULL;
-				}
-			} else {
-				if (!IS_ERR_OR_NULL(kiumd_dmabuf)) {
-					dma_buf_put(kiumd_dmabuf);
-				}
-			}
-		}
-
 		kiusr.dma_buf_fd = 0;
-		mutex_unlock(&fd_handle_mutex);
+		mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
 	}
 
 	trace_kiumd_fd_dmabuf_handler_end(kiusr.handle, kiusr.dma_buf_fd);
 
 	if (copy_to_user(arg, &kiusr, sizeof(kiusr))) {
-		pr_err("%s:%d copy_to_user failed...\n", __func__,__LINE__);
+		pr_err("%s: copy_to_user failed...\n", __func__);
 		return -EFAULT;
 	}
 
@@ -2909,8 +3145,10 @@ static int kiumd_hyp_unassign_sg(struct sg_table *sgt, int *source_vm_list,
 	} while (sg);
 
 	if (clear_page_private)
-		for_each_sg(sgt->sgl, sg, sgt->nents, i)
-			ClearPagePrivate(sg_page(sg));
+		for_each_sg(sgt->sgl, sg, sgt->nents, i) {
+			if (sg)
+				ClearPagePrivate(sg_page(sg));
+		}
 
 	trace_kiumd_hyp_unassign_sg_end(sgt);
 out:
@@ -3842,8 +4080,8 @@ static int kiumd_smmu_fault_handler_deregister(char __user *arg)
 				retval = -1;
 				break;
 			}
-
-			prev->next = temp->next;
+			if (prev)
+				prev->next = temp->next;
 			temp->next = NULL;
 			kobject_put(temp->kobj);
 			kfree(temp);
@@ -3954,7 +4192,7 @@ static int kiumd_smmu_fault_handler_register(char __user *arg)
 static int kiumd_mmio_smmu_map(char __user *arg, struct file *fp)
 {
 	struct kiumd_smmu_mmio_map kiusr;
-	int ret;
+	int ret = 0;
 	struct vfio_device *vfio_dev;
 	struct kiumd_iommu_dma_cookie *cookie;
 	char *reg_name;
@@ -4204,15 +4442,25 @@ static int kiumd_open(struct inode *inode, struct file *filp)
 	kictx = kzalloc(sizeof(struct kiumd_ctx), GFP_KERNEL);
 	if (!kictx)
 		return -ENOMEM;
+
+	kictx->kgsl_context = kzalloc(sizeof(struct kiumd_kgsl_context), GFP_KERNEL);
+	if (!kictx->kgsl_context)
+		return -ENOMEM;
+
 	kictx->id = 0;
 	kictx->pt_start_iova = KIUMD_32BIT_START_IOVA;
 	kictx->pt_end_iova = KIUMD_32BIT_END_IOVA;
 	kictx->is_initialized = false;
 	kictx->hyp_idx = 0;
+	kictx->kgsl_context->kgsl_start_iova = KGSL_PER_PROCESS_PT_BASE_IOVA;
+	kictx->kgsl_context->kgsl_end_iova = KGSL_PER_PROCESS_PT_END_IOVA;
 	hash_init(kictx->smmu_table);
 	hash_init(kictx->hyp_table);
 	spin_lock_init(&kictx->smmu_lock);
+	xa_init(&kictx->kiumd_xa);
+	mutex_init(&kictx->kiumd_xa_mutex);
 	mutex_init(&kictx->hyp_lock);
+	xa_init_flags(&kictx->kiumd_xa, XA_FLAGS_ALLOC);
 	filp->private_data = kictx;
 
 	return 0;
@@ -4235,13 +4483,11 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 	struct kiumd_ctx *ki_ctx = (struct kiumd_ctx *)filp->private_data;
 	struct smmu_map_data *smap;
 	int iter;
-	void *xa_entry, *gxa_entry;
-	unsigned long xa_index, gxa_index;
+	void *xa_entry;
+	unsigned long xa_index;
 	struct dma_buf_handle *dmabuf_handle = NULL;
 	struct dma_buf *kiumd_dmabuf = NULL;
 	int count, ret;
-	bool pid_available = false;
-	struct process_ref* pid_xry;
 	struct iommu_domain *iommu_dom;
 	struct hlist_node *tmp;
 
@@ -4297,66 +4543,31 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 	}
 	spin_unlock(&ki_ctx->smmu_lock);
 
-	if (ki_ctx->res_mem_area) {
+	if (ki_ctx->res_mem_area)
 		kfree(ki_ctx->res_mem_area);
-	}
-
-	mutex_lock(&fd_handle_mutex);
-
-	if (!xa_empty(&fd_handle_xaray)) {
-		xa_for_each(&fd_handle_xaray, gxa_index, gxa_entry) {
-			dmabuf_handle = (struct dma_buf_handle *) gxa_entry;
-
+	mutex_lock(&ki_ctx->kiumd_xa_mutex);
+	if (!xa_empty(&ki_ctx->kiumd_xa)) {
+		xa_for_each(&ki_ctx->kiumd_xa, xa_index, xa_entry) {
+			dmabuf_handle = (struct dma_buf_handle *) xa_entry;
 			if (!dmabuf_handle) {
-				pr_err("%s:Entry not available in xarray\n", __func__);
 				continue;
 			}
-
-			pid_available = false;
-			/*look for pid in xarray*/
-			mutex_lock(&dmabuf_handle->process_xarray_mutex);
-			xa_for_each(&dmabuf_handle->process_xarray, xa_index, xa_entry) {
-				pid_xry = (struct process_ref*) xa_entry;
-
-				if (pid_xry->pid == ki_ctx->pid) {
-					pid_available = true;
-					xa_erase(&dmabuf_handle->process_xarray, xa_index);
-
-					if (pid_xry) {
-						kfree(pid_xry);
-					}
-
-					break;
+			kiumd_dmabuf = ((struct dma_buf *)dmabuf_handle->dmabuf);
+			count = atomic_read(&dmabuf_handle->handle_refcount);
+			if (!IS_ERR_OR_NULL(kiumd_dmabuf)) {
+				while (count > 0) {
+					dma_buf_put(kiumd_dmabuf);
+					count--;
 				}
 			}
-			mutex_unlock(&dmabuf_handle->process_xarray_mutex);
-
-			if (pid_available) {
-				kiumd_dmabuf = ((struct dma_buf *)dmabuf_handle->dmabuf);
-
-				if (atomic_dec_and_test(&dmabuf_handle->handle_refcount)) {
-					if (!IS_ERR_OR_NULL(kiumd_dmabuf)) {
-						dma_buf_put(kiumd_dmabuf);
-					}
-
-					xa_destroy(&dmabuf_handle->process_xarray);
-					xa_erase(&fd_handle_xaray, gxa_index);
-
-					if (dmabuf_handle) {
-						kfree(dmabuf_handle);
-						dmabuf_handle = NULL;
-					}
-				} else {
-					if (!IS_ERR_OR_NULL(kiumd_dmabuf)) {
-						dma_buf_put(kiumd_dmabuf);
-					}
-				}
-			}
+			kfree(dmabuf_handle);
 		}
+		xa_destroy(&ki_ctx->kiumd_xa);
 	}
+	mutex_unlock(&ki_ctx->kiumd_xa_mutex);
 
-	mutex_unlock(&fd_handle_mutex);
 	kfree(ki_ctx);
+
 	return 0;
 }
 
@@ -4421,7 +4632,6 @@ static int kiumd_vfio_ctx_init(char __user *arg, struct file *fp)
 									  "memory-region",
 									  sizeof(phandle));
 	if (kiumd_ctx->num_reserved_regions <= 0) {
-		pr_err(":%s:no reserved mem areas\n", __func__);
 		return -EINVAL;
 	}
 
@@ -4505,7 +4715,7 @@ static long kiumd_ioctl(struct file *file, unsigned int cmd,
 		err = kiumd_perprocess_pgtble_set(argp);
 		break;
 	case KIUMD_PER_PROCESS_FREE:
-		err = kiumd_perprocess_pgtble_free(argp);
+		err = kiumd_perprocess_pgtble_free(argp, file);
 		break;
 	case KIUMD_FD_DMABUF_HANDLE:
 		err = kiumd_fd_dmabuf_handler(argp, file);
@@ -4535,7 +4745,6 @@ static long kiumd_ioctl(struct file *file, unsigned int cmd,
 		err = kiumd_smmu_fault_handler_deregister(argp);
 		break;
 	case KIUMD_VFIO_CTX_INIT:
-		pr_debug("kiumd vfio ctx init\n");
 		err = kiumd_vfio_ctx_init(argp, file);
 		break;
 	case KIUMD_SMMU_MANAGED_IOVA_MAP:
@@ -4646,6 +4855,7 @@ static const struct file_operations kiumd_fops = {
 * return value is errno in failure cases
 * or 0 in case of success
 */
+
 static int kiumd_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
