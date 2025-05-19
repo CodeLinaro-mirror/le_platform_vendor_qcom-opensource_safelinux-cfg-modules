@@ -2683,17 +2683,6 @@ int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 		}
 	}
 
-	if (smap->is_fixed_map) {
-		ret = kiumd_configure_dma_cookie(vfio_dev,
-						 IOMMU_DMA_IOVA_COOKIE,
-						 kiusr.dma_addr);
-		if (ret) {
-			pr_err("%s %d failed to configure cookie\n",
-			       __func__, __LINE__);
-			return -EINVAL;
-		}
-	}
-
 	if (kiusr.ptselect == KGSL_GLOBAL_PT ||
 	    kiusr.ptselect == KGSL_PER_PROCESS_PT ||
 	    kiusr.ptselect == KGSL_DEFAULT_PT) {
