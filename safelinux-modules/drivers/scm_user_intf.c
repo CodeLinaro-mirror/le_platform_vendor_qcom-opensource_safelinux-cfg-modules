@@ -374,7 +374,7 @@ static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	// Validate number of args
 	no_of_args = scm_data.arginfo & 0x0F;
 	if (no_of_args > MAX_QCOM_SCM_ARGS)
-		ret = -EINVAL;
+		return -EINVAL;
 
         no_dma_fds = get_dmafd_args(scm_data.svc, scm_data.cmd, dma_fd_args);
         if (no_dma_fds > 0) {
