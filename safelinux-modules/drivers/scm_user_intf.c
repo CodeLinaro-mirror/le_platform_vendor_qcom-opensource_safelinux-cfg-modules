@@ -344,10 +344,10 @@ static int qcom_scm_open(struct inode *inode, struct file *filp)
 static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct scm_dev_data *dev_data = (struct scm_dev_data *)file->private_data;
-	struct platform_device *scm_pdev = dev_data->scm_pdev;
 	void __user *ip = (void __user *)arg;
 	struct scm_hand_shake scm_data;
 #if (LINUX_VERSION_CODE == KERNEL_VERSION(5, 14, 0))
+	struct platform_device *scm_pdev = dev_data->scm_pdev;
 	struct qcom_scm_desc desc;
 	struct qcom_scm_res res;
 #else
@@ -355,7 +355,7 @@ static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	u64 res1 = 0;
 #endif
 
-	int id, i, no_of_args, no_dma_fds, ret = 0;
+	int i, no_of_args, no_dma_fds, ret = 0;
 	u32 dma_fd_args[MAX_QCOM_SCM_ARGS];
 
 	if (cmd != SCM_HAND_SHAKE_IOCTL)
@@ -402,7 +402,7 @@ static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			void *data;
 			__u32 meta_len = scm_data.args_buffer[2];
 
-			data = memremap((void *)scm_data.args_buffer[1], meta_len, MEMREMAP_WB);
+			data = memremap(scm_data.args_buffer[1], meta_len, MEMREMAP_WB);
 			if(!data)
 				return -ENOMEM;
 
