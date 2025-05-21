@@ -60,28 +60,12 @@ rm -rf "$RPM_BUILD_ROOT/lib/modules/%{kversion_with_debug}/modules."*
 rm -rf $RPM_BUILD_ROOT
 
 %files uapi-headers
-%{_includedir}/linux/qtee_shmbridge.h
-%{_includedir}/linux/iommu_iova_map.h
-%{_includedir}/uapi/misc/iommu_iova_map_user.h
-%{_includedir}/uapi/misc/kiumd.h
-%{_includedir}/uapi/misc/scm_user_intf.h
-%{_includedir}/uapi/misc/qcom_uscmi.h
-%{_includedir}/uapi/misc/vendor_uscmi.h
+%{_includedir}/linux/*.h
+%{_includedir}/uapi/misc/*.h
 
 %files
 %define kernel_module_path /lib/modules/%{kversion_with_debug}
-%{kernel_module_path}/extra/profiler.ko
-%{kernel_module_path}/extra/qcom_ethqos_filter.ko
-%{kernel_module_path}/extra/apps_pinctrl.ko
-%{kernel_module_path}/extra/scm_user_intf.ko
-%{kernel_module_path}/extra/vfio_iommu_qcom.ko
-%{kernel_module_path}/extra/iommu_iova_map.ko
-%{kernel_module_path}/extra/kiumd.ko
-%{kernel_module_path}/extra/qcom_uscmi.ko
-%{kernel_module_path}/extra/kryo_arm64_edac.ko
-%{kernel_module_path}/extra/kiumd_kgsl.ko
-%{kernel_module_path}/extra/qcom_dload_mode.ko
-%{kernel_module_path}/extra/qcom_uscmi.ko
+%{kernel_module_path}/extra/*.ko
 
 %changelog
 * Sun Apr 28 2024 Sankalp Negi <quic_snegi@quicinc.com> 1.2
