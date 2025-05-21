@@ -405,7 +405,6 @@ static long profiler_ioctl(struct file *file,
 
 	default:
 		pr_err("Invalid IOCTL: 0x%x\n", cmd);
-		pr_err("PROFILER_IOCTL_GET_BW_INFO: 0x%x\n", PROFILER_IOCTL_GET_BW_INFO);
 		return -EINVAL;
 	}
 	return ret;
