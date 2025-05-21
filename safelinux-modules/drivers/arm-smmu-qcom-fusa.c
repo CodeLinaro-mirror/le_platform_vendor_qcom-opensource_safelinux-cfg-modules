@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2025, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/dev_printk.h>
@@ -388,7 +388,7 @@ static int qsmmu_fusa_probe(struct platform_device *pdev)
 		if (!qsmmu_fusa->client_fusa_base)
 			return -ENOMEM;
 
-		qsmmu_fusa->client_fusa_reg = (u32)of_device_get_match_data(dev);
+		qsmmu_fusa->client_fusa_reg = (u32)(uintptr_t)of_device_get_match_data(dev);
 	}
 
 	qsmmu_fusa->hw_fault.fault_source = devm_kzalloc(qsmmu_fusa->dev,
