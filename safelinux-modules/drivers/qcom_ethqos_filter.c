@@ -262,7 +262,7 @@ void read_available_vlan_tags(void)
 		read_data_reg = readl(ioaddr + MAC_VLAN_DATA_TAG);
 		hw->vlan_filter[i] = read_data_reg;
 		hw->pvm_vlan_filter[i] = read_data_reg;
-		pr_debug("vlan added at index %d is %d\n",
+		pr_debug("vlan added at index %d is %lu\n",
 			 i, (hw->vlan_filter[i] & MAC_VLAN_TAG_DATA_VID));
 		/* Wait for done */
 		readl_poll_timeout(ioaddr + MAC_VLAN_CTRL_TAG,
