@@ -2707,22 +2707,15 @@ int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 		}
 	}
 
-	if (smap->is_fixed_map && (kiusr.ptselect != KGSL_GLOBAL_PT && kiusr.ptselect != KGSL_PER_PROCESS_PT)) {
-		ret = kiumd_configure_dma_cookie(vfio_dev, IOMMU_DMA_IOVA_COOKIE, kiusr.dma_addr);
-		if (ret) {
-			pr_err("%s %d failed to configure cookie\n", __func__, __LINE__);
+	if (kiusr.ptselect == KGSL_GLOBAL_PT ||
+	    kiusr.ptselect == KGSL_PER_PROCESS_PT ||
+	    kiusr.ptselect == KGSL_DEFAULT_PT) {
+		iommu_dom = kiumd_get_iommu_domain(kiusr.vfio_fd);
+		if (!iommu_dom) {
+			pr_err("%s:iommu_dom is NULL\n", __func__);
 			return -EINVAL;
 		}
-	}
-
-	if (kiusr.ptselect == KGSL_GLOBAL_PT || kiusr.ptselect == KGSL_PER_PROCESS_PT
-							|| kiusr.ptselect == KGSL_DEFAULT_PT) {
-			iommu_dom = kiumd_get_iommu_domain(kiusr.vfio_fd);
-			if (!iommu_dom) {
-				pr_err("%s:iommu_dom is NULL\n", __func__);
-				return -EINVAL;
-			}
-			iommu_flush_iotlb_all(iommu_dom);
+		iommu_flush_iotlb_all(iommu_dom);
 	}
 
 	spin_lock(&kiumd_ctx->smmu_lock);
