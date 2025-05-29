@@ -64,19 +64,7 @@ struct arm_lpae_io_pgtable {
 	void			*pgd;
 };
 
-static struct kobject *smmu_obj;
-static struct kobject *device_obj;
-
-struct smmu_device_obj {
-	struct kobject *kobj;
-	int smmu_fsr;
-	int smmu_iova;
-	int flag;
-	struct smmu_device_obj *next;
-};
-
-struct smmu_device_obj *head = NULL;
-
+#define IOVA_ZERO	((dma_addr_t)0)
 
 /*No.of pages for 6GB IOVA space with 4K page size*/
 #define KGSL_PT_MEM_PAGES 0x180000
@@ -4009,254 +3997,19 @@ close_file:
 }
 
 /**
-* @Brief: This function facilitates to get the faulty iova FSR value
-* when user reads the sysfs node as a result of smmu faults.
-*
-* Parameters:
-* @kobj: kernel object pointer of device
-* @attr: kernel object attribute
-* @buf: user space buffer
-*
-* return value is number of bytes successfully written
-*/
-
-static ssize_t fsr_iova_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
-{
-	int local_fsr = 0;
-	int local_iova = 0;
-	struct smmu_device_obj *temp = head;
-
-	while(temp!=NULL && kobj!=NULL){
-		if (0 == strcmp(temp->kobj->name,kobj->name))
-		{
-			local_fsr = temp->smmu_fsr;
-			local_iova = temp->smmu_iova;
-			temp->smmu_fsr = 0;
-			temp->smmu_iova = 0;
-			temp->flag = 0;
-			break;
-		}
-		temp = temp->next;
-	}
-
-	return snprintf(buf, PAGE_SIZE, "0x%x:0x%x\n", local_fsr,local_iova);
-}
-
-static struct kobj_attribute fsr_iova_attribute = {
-	.attr = {
-		.name = "fsr_iova",
-		.mode = S_IWUSR | S_IRUGO,
-	},
-	.show = fsr_iova_show,
-};
-
-/**
- * @Brief: This function should be used by IOMMU users which want to be notified
- * whenever an IOMMU fault happens.
+ * @Brief: This function facilitates to
+ * map mmio region into smmu at fixed
+ * IOVA.The function is called via IOCTL
+ * interface and input is provided via struct
+ * kiumd_user from the user space.
  *
  * Parameters:
- * @iommu_domain: iommu domain
- * @dev: device structure
- * @iova: fault address
- * @flags: flags 
- * @token: user data
+ * @arg: User space argument ptr
+ * @fp: file ptr for device context
  *
- * The fault handler itself should return 0 on success, and an appropriate
- * error code otherwise.
+ * return value is errno in failure cases
+ * or 0 in case of successful mapping
  */
-static int kiumd_smmu_fault_handler(struct iommu_domain *iomm_domain,
-		struct device *dev, unsigned long iova, int flags, void *token)
-{
-	struct arm_smmu_domain *smmu_domain = NULL;
-	struct arm_smmu_cfg *cfg = NULL;
-	struct smmu_device_obj *temp = head;
-	char *name = (char *)token;
-	int retval = 0;
-
-	do {
-		smmu_domain = container_of(iomm_domain, struct arm_smmu_domain, domain);
-		if ((!smmu_domain) || (!(smmu_domain->pgtbl_ops))) {
-			pr_err("%s:smmu domain/pagetable ops is invalid\n", __func__);
-			retval = -EINVAL;
-			break;
-		}
-		cfg = &smmu_domain->cfg;
-
-		while (temp!=NULL){
-			if (0 == strcmp(temp->kobj->name,name) && !(temp->flag))
-			{
-				temp->smmu_fsr = arm_smmu_cb_read(smmu_domain->smmu,cfg->cbndx,ARM_SMMU_CB_FSR);
-				temp->smmu_iova = iova;
-				temp->flag = 1;
-				sysfs_notify(temp->kobj,NULL,"fsr_iova");
-				break;
-			}
-			temp = temp->next;
-		}
-
-	} while(0);
-
-	return retval;
-}
-
-/**
- * @Brief: This function should be used by IOMMU users which want to deregister
- * an IOMMU fault handler.
- *
- * Parameters:
- * @arg: user data
- *
- * return 0 on success, or an appropriate
- * error code otherwise.
- */
-static int kiumd_smmu_fault_handler_deregister(char __user *arg)
-{
-	struct vfio_device *vfio_dev = NULL;
-	struct kiumd_user kiusr;
-	struct smmu_device_obj *temp = head;
-	struct smmu_device_obj *prev = NULL;
-
-	int retval = 0;
-
-	do {
-		if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user))) {
-			retval = -EFAULT;
-			break;
-		}
-
-		vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
-		if (!vfio_dev) {
-			pr_err("%s:vfio_dev is NULL \n",__func__);
-			retval = -ENOTTY;
-			break;
-		}
-
-		if (temp != NULL && !strcmp(temp->kobj->name,vfio_dev->dev->kobj.name))
-		{
-			head = head->next;
-			temp->next = NULL;
-			kobject_put(temp->kobj);
-			kfree(temp);
-		} else {
-			while(temp != NULL && strcmp(temp->kobj->name,vfio_dev->dev->kobj.name))
-			{
-				prev = temp;
-				temp = temp->next;
-			}
-			if (temp == NULL) {
-				pr_err("%s:vfio device is not present in list to deregister\n");
-				retval = -1;
-				break;
-			}
-			if (prev)
-				prev->next = temp->next;
-			temp->next = NULL;
-			kobject_put(temp->kobj);
-			kfree(temp);
-		}
-
-	} while(0);
-
-	return retval;
-}
-
-/**
- * @Brief: This function should be used by IOMMU users which want to register
- * an IOMMU fault handler.
- *
- * Parameters:
- * @arg: user data
- *
- * return 0 on success, or an appropriate
- * error code otherwise.
- */
-static int kiumd_smmu_fault_handler_register(char __user *arg)
-{
-	struct iommu_domain *domain = NULL;
-	struct vfio_device *vfio_dev = NULL;
-	struct smmu_device_obj *ptr = NULL;
-	struct smmu_device_obj *temp = NULL;
-
-	struct kiumd_user kiusr;
-	int retval = 0;
-	int err = 0;
-
-	do {
-		if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user))) {
-			retval = -EFAULT;
-			break;
-		}
-
-		vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
-		if (!vfio_dev) {
-			pr_err("%s:vfio_dev is NULL \n",__func__);
-			retval = -ENOTTY;
-			break;
-		}
-
-		domain = kiumd_iommu_get_dma_domain(vfio_dev->dev);
-		if (!domain) {
-			pr_err("%s:iommu domain is NULL\n", __func__);
-			retval = -EINVAL;
-			break;
-		}
-
-		device_obj = kobject_create_and_add(vfio_dev->dev->kobj.name,smmu_obj);
-		if (!device_obj){
-			pr_err("/sys/kernel/smmu_fault/%s creation failed\n",vfio_dev->dev->kobj.name);
-			retval = -ENOMEM;
-			break;
-		}
-
-		err = sysfs_create_file(device_obj,&(fsr_iova_attribute.attr));
-		if (err) {
-			pr_err("failed to create sysfs file in /sys/kernel/\n");
-			retval = err;
-			break;
-		}
-
-		ptr = (struct smmu_device_obj *)kzalloc(sizeof(struct smmu_device_obj),GFP_KERNEL);
-		if (NULL == ptr){
-			pr_err("allocation of smmu_device_obj failed\n");
-			retval = -ENOMEM;
-			break;
-		}
-		ptr->kobj = device_obj;
-		ptr->flag = 0;
-		ptr->next = NULL;
-
-		if (NULL == head){
-			head = ptr;
-		} else{
-			temp = head;
-			while(temp->next!=NULL){
-				temp = temp->next;
-			}
-			temp->next = ptr;
-		}
-
-		iommu_set_fault_handler(domain, kiumd_smmu_fault_handler, device_obj->name);
-
-	} while(0);
-
-	return retval;
-}
-
-
-/**
-* @Brief: This function facilitates to
-* map mmio region into smmu at fixed
-* IOVA.The function is called via IOCTL
-* interface and input is provided via struct
-* kiumd_user from the user space.
-*
-* Parameters:
-* @arg: User space argument ptr
-* @fp: file ptr for device context
-*
-* return value is errno in failure cases
-* or 0 in case of successful mapping
-*/
 static int kiumd_mmio_smmu_map(char __user *arg, struct file *fp)
 {
 	struct kiumd_smmu_mmio_ctx *mmio_ctx;
@@ -4773,7 +4526,7 @@ static long kiumd_ioctl(struct file *file, unsigned int cmd,
 				 unsigned long arg)
 {
 	char __user *argp = (char __user *)arg;
-	int err;
+	int err = 0;
 
 	switch (cmd) {
 	case KIUMD_SMMU_MAP_BUF:
@@ -4818,11 +4571,12 @@ static long kiumd_ioctl(struct file *file, unsigned int cmd,
 	case KIUMD_SMMU_MMIO_UNMAP:
 		err = kiumd_mmio_smmu_unmap(argp, file);
 		break;
+/* Will remove below 2 ioctls, once tech teams update the code */
 	case KIUMD_SMMU_FAULT_HANDLE_REGISTER:
-		err = kiumd_smmu_fault_handler_register(argp);
+//		err = kiumd_smmu_fault_handler_register(argp);
 		break;
 	case KIUMD_SMMU_FAULT_HANDLE_DEREGISTER:
-		err = kiumd_smmu_fault_handler_deregister(argp);
+//		err = kiumd_smmu_fault_handler_deregister(argp);
 		break;
 	case KIUMD_VFIO_CTX_INIT:
 		err = kiumd_vfio_ctx_init(argp, file);
@@ -4969,11 +4723,6 @@ static int kiumd_probe(struct platform_device *pdev)
 	if (err) {
 		pr_err("kiumd misc device %s creation failure\n", devname);
 		return err;
-	}
-	smmu_obj = kobject_create_and_add("smmu_faults",kernel_kobj);
-	if(!smmu_obj){
-		pr_err("smmu_faults kernel object creation failure\n");
-		return -ENOMEM;
 	}
 	return 0;
 }
