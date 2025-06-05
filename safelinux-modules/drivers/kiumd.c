@@ -3032,10 +3032,11 @@ int kiumd_fd_dmabuf_handler(char __user *arg, struct file *fp)
 static int kiumd_io_pgtable_hyp_assign_page(u32 *vmid, u64 page,
 					    u32 nr_acl_entries)
 {
-	u64 src_vmid_list = BIT(QCOM_SCM_VMID_HLOS);
 	struct qcom_scm_vmperm *dst_vmids;
 	int ret, i;
+	u64 src_vmid_list[2] = {0};
 
+	src_vmid_list[0] = BIT(QCOM_SCM_VMID_HLOS);
 	trace_kiumd_io_pgtable_hyp_assign_page_start(vmid, page, nr_acl_entries);
 
 	dst_vmids = kcalloc((nr_acl_entries + 1), sizeof(*dst_vmids),
@@ -3056,8 +3057,8 @@ static int kiumd_io_pgtable_hyp_assign_page(u32 *vmid, u64 page,
 			 i, dst_vmids[i].vmid, dst_vmids[i].perm);
 	}
 
-	ret = qcom_scm_assign_mem(page, PAGE_SIZE, &src_vmid_list, dst_vmids,
-				  nr_acl_entries + 1);
+	ret = qcom_scm_assign_mem(page, PAGE_SIZE, &src_vmid_list[0],
+		dst_vmids, nr_acl_entries + 1);
 	if (ret)
 		pr_err("hyp assign for %llu address of size %lx rc:%d\n",
 		       page, PAGE_SIZE, ret);
@@ -3081,8 +3082,10 @@ static int kiumd_io_pgtable_hyp_assign_page(u32 *vmid, u64 page,
 static int kiumd_io_pgtable_hyp_unassign_page(u32 *vmid, u64 page,
 		u32 nr_acl_entries)
 {
-	u64 src_vmid_list = BIT(QCOM_SCM_VMID_HLOS);
 	int ret;
+	u64 src_vmid_list[2] = {0};
+
+	src_vmid_list[0] = BIT(QCOM_SCM_VMID_HLOS);
 
 	trace_kiumd_io_pgtable_hyp_unassign_page_start(vmid, page, nr_acl_entries);
 
@@ -3092,12 +3095,12 @@ static int kiumd_io_pgtable_hyp_unassign_page(u32 *vmid, u64 page,
 		}
 	};
 	for (int i = 0; i < nr_acl_entries ; i++) {
-		src_vmid_list |= BIT(vmid[i]);
+		qcom_scm_set_vmid_by_word(&src_vmid_list[0], vmid[i]);
 		pr_debug("Hyp unassign page for dst:%d vmid:%d\n",
 			 i, vmid[i]);
 	}
 
-	ret = qcom_scm_assign_mem(page, PAGE_SIZE, &src_vmid_list,
+	ret = qcom_scm_assign_mem(page, PAGE_SIZE, &src_vmid_list[0],
 				  dst_vmids, ARRAY_SIZE(dst_vmids));
 	if (ret)
 		pr_err("hyp unassign failed %llu address of size %lx rc:%d\n",
@@ -3124,13 +3127,14 @@ static int kiumd_io_pgtable_hyp_unassign_page(u32 *vmid, u64 page,
 static int kiumd_hyp_unassign_sg(struct sg_table *sgt, int *source_vm_list,
 								 int source_nelems, bool clear_page_private)
 {
-	u64 src_vmid_list = 0, src_vmid_list_copy;
 	struct qcom_scm_vmperm dst_vmids[] = { {
 			QCOM_SCM_VMID_HLOS,
 			QCOM_SCM_PERM_RWX
 		}
 	};
 	struct scatterlist *sg;
+	u64 src_vmid_list[2] = {0};
+	u64 src_vmid_list_copy[2] = {0};
 	int ret, i;
 
 	if (source_nelems <= 0)
@@ -3146,18 +3150,18 @@ static int kiumd_hyp_unassign_sg(struct sg_table *sgt, int *source_vm_list,
 	sg = sgt->sgl;
 
 	for (int j = 0; j < source_nelems ; j++) {
-		src_vmid_list |= BIT(source_vm_list[j]);
+		qcom_scm_set_vmid_by_word(&src_vmid_list[0], source_vm_list[j]);
 		pr_debug("Hyp unassign sg for dst:%d vmid:%d\n",
 			 j, source_vm_list[j]);
 	}
-	src_vmid_list_copy = src_vmid_list;
+	src_vmid_list_copy[0] = src_vmid_list[0];
 	do {
-		src_vmid_list = src_vmid_list_copy;
+		src_vmid_list[0] = src_vmid_list_copy[0];
 		pr_debug("%s: memory ownership transfer start src vmid:%llx\n",
-			 __func__, src_vmid_list);
+			__func__, src_vmid_list[0]);
 		ret = qcom_scm_assign_mem(page_to_phys(sg_page(sg)), sg->length,
-					  &src_vmid_list, dst_vmids,
-					  ARRAY_SIZE(dst_vmids));
+		&src_vmid_list[0], dst_vmids,
+		ARRAY_SIZE(dst_vmids));
 		if (ret) {
 			pr_err("Hyp unassign failed %llu address of size %x rc:%d\n",
 			       page_to_phys(sg_page(sg)), sg->length, ret);
@@ -3197,9 +3201,10 @@ static int kiumd_hyp_assign_sg(struct sg_table *sgt, int *dest_vm_list,
 {
 	struct qcom_scm_vmperm *dst_vmids;
 	struct scatterlist *sg;
-	u64 src_vmid_list;
+	u64 src_vmid_list[2] = {0};
 	int ret;
 
+	src_vmid_list[0] = BIT(QCOM_SCM_VMID_HLOS);
 	if (dest_nelems <= 0) {
 		pr_err("%s: dest_nelems invalid\n", __func__);
 		return -EINVAL;
@@ -3225,9 +3230,9 @@ static int kiumd_hyp_assign_sg(struct sg_table *sgt, int *dest_vm_list,
 	}
 
 	do {
-		src_vmid_list = BIT(QCOM_SCM_VMID_HLOS);
-		pr_debug("Assign call initiated :%llx\n", src_vmid_list);
-		ret = qcom_scm_assign_mem(page_to_phys(sg_page(sg)), sg->length, &src_vmid_list,
+		src_vmid_list[0] = BIT(QCOM_SCM_VMID_HLOS);
+		pr_debug("Assign call initiated :%llx\n", src_vmid_list[0]);
+		ret = qcom_scm_assign_mem(page_to_phys(sg_page(sg)), sg->length, &src_vmid_list[0],
 					  dst_vmids, dest_nelems);
 		if (ret) {
 			pr_err("failed qcom_assign for assigning %llx address of size %x rc:%d\n",
