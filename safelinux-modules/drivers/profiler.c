@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2017-2018, 2020-2021 The Linux Foundation. All rights reserved.
-Copyright (c) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2023-2024 Qualcomm Technologies, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 */
 
 #define pr_fmt(fmt) "PROFILER: %s: " fmt, __func__
@@ -43,9 +44,21 @@ struct profiler_control {
 	struct device *pdev;
 	struct cdev cdev;
 	struct mutex lock;
-	void __iomem *llcc_base;
-	void __iomem *gemnoc_base;
 	void __iomem *mmnoc_base;
+	void __iomem *llcc_mmap_base[LLCC_CHANNELS];
+	void __iomem *gemnoc_mmap_base[GEMNOC_CHANNELS_NUM];
+};
+
+struct conf_data {
+	int num_llcc_channels;
+	int num_gemnoc_metrics;
+	int num_hf_metrics;
+	int num_sf_metrics;
+	uint32_t llcc_offset;
+	uint32_t cabo_offset;
+	uint32_t mmnoc_hf_offset;
+	uint32_t mmnoc_sf_offset;
+	int gemnoc_channels;
 };
 
 static struct profiler_control *profiler;
@@ -124,136 +137,116 @@ static int bw_profiling_get(void __user *argp, struct tz_bw_svc_buf *bwbuf)
 {
 	int ret = 0;
 	struct qtee_shm buf_shm = {0};
-	if (bw_profiling_disabled) {
-		const int bufsize = sizeof(struct profiler_bw_cntrs_req_m)
-								- sizeof(uint32_t);
-		struct profiler_bw_cntrs_req_m cnt_buf;
+	const int bufsize = sizeof(struct profiler_bw_cntrs_req_m)
+							- sizeof(uint32_t);
+	struct profiler_bw_cntrs_req_m cnt_buf;
 
-		memset(&cnt_buf, 0, sizeof(cnt_buf));
-		/* Allocate memory for get buffer */
-		ret = qtee_shmbridge_allocate_shm(PAGE_ALIGN(bufsize), &buf_shm);
-		if (ret) {
-			ret = -ENOMEM;
-			pr_err("shmbridge alloc buf failed\n");
-			goto out;
-		}
-		/* Populate request data */
-		bwbuf->bwreq.get_req.cmd_id = TZ_BW_SVC_GET_ID;
-		bwbuf->bwreq.get_req.buf_ptr = buf_shm.paddr;
-		bwbuf->bwreq.get_req.buf_size = bufsize;
-		bwbuf->req_size = sizeof(struct tz_bw_svc_get_req);
-		qtee_shmbridge_flush_shm_buf(&buf_shm);
-		ret = bw_profiling_command(bwbuf);
-		if (ret) {
-			pr_err("bw_profiling_command failed\n");
-			goto out;
-		}
-		qtee_shmbridge_inv_shm_buf(&buf_shm);
-		memcpy(&cnt_buf, buf_shm.vaddr, bufsize);
-		if (copy_to_user(argp, &cnt_buf, sizeof(struct profiler_bw_cntrs_req_m)))
-			pr_err("copy_to_user failed\n");
-
-	} else {
-		int ch = 0;
-		int hf = 0;
-		int sf = 0;
-		int gc = 0;
-		const int bufsize = sizeof(struct profiler_bw_cntrs_req)
-								- sizeof(uint32_t);
-		struct profiler_bw_cntrs_req cnt_buf;
-		ret = qtee_shmbridge_allocate_shm(PAGE_ALIGN(bufsize), &buf_shm);
-		if (ret) {
-			ret = -ENOMEM;
-			pr_err("shmbridge alloc buf failed\n");
-			goto out;
-		}
-		/* Populate request data */
-		bwbuf->bwreq.get_req.cmd_id = TZ_BW_SVC_GET_ID;
-		bwbuf->bwreq.get_req.buf_ptr = buf_shm.paddr;
-		bwbuf->bwreq.get_req.buf_size = bufsize;
-		bwbuf->bwreq.get_req.type = 0;
-		bwbuf->req_size = sizeof(struct tz_bw_svc_get_req);
-		qtee_shmbridge_flush_shm_buf(&buf_shm);
-		ret = bw_profiling_command(bwbuf);
-		if (ret) {
-			pr_err("bw_profiling_command failed\n");
-			goto out;
-		}
-		qtee_shmbridge_inv_shm_buf(&buf_shm);
-
-		qtee_shmbridge_free_shm(&buf_shm);
-		memset(&cnt_buf, 0, sizeof(cnt_buf));
-		
-		for (ch = 0; ch < dev_params.num_llcc_channels; ch++) {
-			profiler->llcc_base = devm_ioremap(profiler->pdev, dev_params.llcc_base
-						+ dev_params.llcc_map_size * ch,
-						dev_params.llcc_map_size);
-			cnt_buf.llcc_values[ch*2] = readl(profiler->llcc_base
-							+ offset_reg_values.llcc_offset[ch*2]);
-			cnt_buf.llcc_values[ch*2 + 1] = readl(profiler->llcc_base
-							+ offset_reg_values.llcc_offset[ch*2 + 1]);
-			cnt_buf.cabo_values[ch*2] = readl(profiler->llcc_base
-							+ offset_reg_values.cabo_offset[ch*2]);
-			cnt_buf.cabo_values[ch*2 + 1] = readl(profiler->llcc_base
-							+ offset_reg_values.cabo_offset[ch*2+1]);
-
-			devm_iounmap(profiler->pdev, profiler->llcc_base);
-		}
-
-		profiler->gemnoc_base = devm_ioremap(profiler->pdev, dev_params.gemnoc_base, dev_params.gemnoc_map_size);
-
-		for(ch = 0; ch < dev_params.num_llcc_channels; ch++)
-		{
-			for(gc = 0; gc < dev_params.num_gemnoc_metrics; gc++)
-			{
-				cnt_buf.gemnoc_values[ch * dev_params.num_gemnoc_metrics + gc] = readl(profiler->gemnoc_base + offset_reg_values.gemnoc_offset[ch * dev_params.num_gemnoc_metrics + gc]);
-			}
-
-		}
-
-		devm_iounmap(profiler->pdev, profiler->gemnoc_base);
-
-		profiler->mmnoc_base = devm_ioremap(profiler->pdev, dev_params.mmnoc_base, dev_params.mmnoc_map_size);
-
-		for(hf = 0; hf < dev_params.num_hf_metrics; hf++)
-		{
-			cnt_buf.mmnoc_hf_values[hf] = readl(profiler->mmnoc_base + offset_reg_values.mmnoc_hf_offset[hf]);
-		}
-		for(sf = 0; sf < dev_params.num_sf_metrics; sf++)
-		{
-			cnt_buf.mmnoc_sf_values[sf] = readl(profiler->mmnoc_base + offset_reg_values.mmnoc_sf_offset[sf]);
-		}
-
-		devm_iounmap(profiler->pdev, profiler->mmnoc_base);
-
-		/* Allocate memory for get buffer */
-		ret = qtee_shmbridge_allocate_shm(PAGE_ALIGN(bufsize), &buf_shm);
-		if (ret) {
-			ret = -ENOMEM;
-			pr_err("shmbridge alloc buf failed\n");
-			goto out;
-		}
-		/* Populate request data */
-		bwbuf->bwreq.get_req.cmd_id = TZ_BW_SVC_GET_ID;
-		bwbuf->bwreq.get_req.buf_ptr = buf_shm.paddr;
-		bwbuf->bwreq.get_req.buf_size = bufsize;
-		bwbuf->bwreq.get_req.type = 1;
-		bwbuf->req_size = sizeof(struct tz_bw_svc_get_req);
-		qtee_shmbridge_flush_shm_buf(&buf_shm);
-		ret = bw_profiling_command(bwbuf);
-		if (ret) {
-			pr_err("bw_profiling_command failed\n");
-			goto out;
-		}
-		qtee_shmbridge_inv_shm_buf(&buf_shm);
-		if (copy_to_user(argp, &cnt_buf, sizeof(struct profiler_bw_cntrs_req)))
-			pr_err("copy_to_user failed\n");
+	memset(&cnt_buf, 0, sizeof(cnt_buf));
+	/* Allocate memory for get buffer */
+	ret = qtee_shmbridge_allocate_shm(PAGE_ALIGN(bufsize), &buf_shm);
+	if (ret) {
+		ret = -ENOMEM;
+		pr_err("shmbridge alloc buf failed\n");
+		return ret;
 	}
 
+	/* Populate request data */
+	bwbuf->bwreq.get_req.cmd_id = TZ_BW_SVC_GET_ID;
+	bwbuf->bwreq.get_req.buf_ptr = buf_shm.paddr;
+	bwbuf->bwreq.get_req.buf_size = bufsize;
+	bwbuf->req_size = sizeof(struct tz_bw_svc_get_req);
+	qtee_shmbridge_flush_shm_buf(&buf_shm);
+	ret = bw_profiling_command(bwbuf);
+	if (ret) {
+		pr_err("bw_profiling_command failed\n");
+		goto out;
+	}
+
+	qtee_shmbridge_inv_shm_buf(&buf_shm);
+	memcpy(&cnt_buf, buf_shm.vaddr, bufsize);
+	if (copy_to_user(argp, &cnt_buf, sizeof(struct profiler_bw_cntrs_req_m)))
+		pr_err("copy_to_user failed\n");
+
 out:
-		/* Free memory for response */
-		qtee_shmbridge_free_shm(&buf_shm);
+	/* Free memory for response */
+	qtee_shmbridge_free_shm(&buf_shm);
+	return ret;
+}
+
+static int bw_profiling_per_ip_get(void __user *argp, struct tz_bw_svc_buf *bwbuf)
+{
+	int ret = 0;
+	int ch, gc;
+	struct qtee_shm buf_shm = {0};
+	const int bufsize = sizeof(struct profiler_bw_cntrs_req)
+							- sizeof(uint32_t);
+	struct profiler_bw_cntrs_req cnt_buf;
+
+	ret = qtee_shmbridge_allocate_shm(PAGE_ALIGN(bufsize), &buf_shm);
+	if (ret) {
+		ret = -ENOMEM;
+		pr_err("shmbridge alloc buf failed\n");
 		return ret;
+	}
+
+	/* Populate request data */
+	bwbuf->bwreq.get_req.cmd_id = TZ_BW_SVC_GET_ID;
+	bwbuf->bwreq.get_req.buf_ptr = buf_shm.paddr;
+	bwbuf->bwreq.get_req.buf_size = bufsize;
+	bwbuf->bwreq.get_req.type = 0;
+	bwbuf->req_size = sizeof(struct tz_bw_svc_get_req);
+	qtee_shmbridge_flush_shm_buf(&buf_shm);
+	ret = bw_profiling_command(bwbuf);
+	if (ret) {
+		pr_err("bw_profiling_command failed\n");
+		goto out;
+	}
+
+	qtee_shmbridge_inv_shm_buf(&buf_shm);
+
+	memset(&cnt_buf, 0, sizeof(cnt_buf));
+
+	for (ch = 0; ch < dev_params.num_llcc_channels; ch++) {
+		cnt_buf.llcc_values[ch*2] = readl(profiler->llcc_mmap_base[ch]
+						+ offset_reg_values.llcc_offset[ch*2]);
+		cnt_buf.llcc_values[ch*2 + 1] = readl(profiler->llcc_mmap_base[ch]
+						+ offset_reg_values.llcc_offset[ch*2 + 1]);
+		cnt_buf.cabo_values[ch*2] = readl(profiler->llcc_mmap_base[ch]
+						+ offset_reg_values.cabo_offset[ch*2]);
+		cnt_buf.cabo_values[ch*2 + 1] = readl(profiler->llcc_mmap_base[ch]
+						+ offset_reg_values.cabo_offset[ch*2+1]);
+	}
+
+	for (ch = 0; ch < dev_params.gemnoc_channels; ch++) {
+		for (gc = 0; gc < dev_params.num_gemnoc_metrics; gc++) {
+			int index = ch * dev_params.num_gemnoc_metrics + gc;
+
+			cnt_buf.gemnoc_values[index] = readl(profiler->gemnoc_mmap_base[ch]
+						+ offset_reg_values.gemnoc_offset[index]);
+		}
+	}
+
+	/* Populate request data */
+	bwbuf->bwreq.get_req.cmd_id = TZ_BW_SVC_GET_ID;
+	bwbuf->bwreq.get_req.buf_ptr = buf_shm.paddr;
+	bwbuf->bwreq.get_req.buf_size = bufsize;
+	bwbuf->bwreq.get_req.type = 1;
+	bwbuf->req_size = sizeof(struct tz_bw_svc_get_req);
+	qtee_shmbridge_flush_shm_buf(&buf_shm);
+	ret = bw_profiling_command(bwbuf);
+	if (ret) {
+		pr_err("bw_profiling_command failed\n");
+		goto out;
+	}
+
+	qtee_shmbridge_inv_shm_buf(&buf_shm);
+	if (copy_to_user(argp, &cnt_buf, sizeof(struct profiler_bw_cntrs_req)))
+		pr_err("copy_to_user failed\n");
+
+out:
+	/* Free memory for response */
+	qtee_shmbridge_free_shm(&buf_shm);
+	return ret;
 }
 
 static int bw_profiling_stop(struct tz_bw_svc_buf *bwbuf)
@@ -295,7 +288,7 @@ static int profiler_get_bw_info(void __user *argp)
 				pr_err("bw_profiling_start Failed with ret: %d\n", ret);
 			break;
 		case TZ_BW_SVC_GET_ID:
-			ret = bw_profiling_get(argp, bwbuf);
+			ret = bw_profiling_per_ip_get(argp, bwbuf);
 			if (ret)
 				pr_err("bw_profiling_get Failed with ret: %d\n", ret);
 			break;
@@ -338,23 +331,6 @@ static int profiler_get_bw_info(void __user *argp)
 	return ret;
 }
 
-static int profiler_set_bw_offsets(void __user *argp)
-{
-	int ret;
-
-	ret = copy_from_user(&offset_reg_values, argp,
-				sizeof(struct reg_offset));
-	return 0;
-}
-
-static int profiler_device_init(void __user *argp)
-{
-	int ret;
-
-	ret = copy_from_user(&dev_params, argp, sizeof(struct device_param_init));
-	return 0;
-}
-
 static int profiler_open(struct inode *inode, struct file *file)
 {
 	int ret = 0;
@@ -386,14 +362,6 @@ static long profiler_ioctl(struct file *file,
 		ret = profiler_get_bw_info(argp);
 		if (ret)
 			pr_err("failed get system bandwidth info: %d\n", ret);
-		break;
-
-	case PROFILER_IOCTL_SET_OFFSETS:
-		ret = profiler_set_bw_offsets(argp);
-		break;
-
-	case PROFILER_IOCTL_DEVICE_INIT:
-		ret = profiler_device_init(argp);
 		break;
 
 	case PROFILER_IOCTL_GET_BW_INFO_BC:
@@ -432,6 +400,56 @@ static int profiler_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
+static int profiler_info_init(struct conf_data *desc, struct platform_device *pdev)
+{
+	dev_params.num_llcc_channels = desc->num_llcc_channels;
+	dev_params.num_gemnoc_metrics = desc->num_gemnoc_metrics;
+	dev_params.num_hf_metrics = desc->num_hf_metrics;
+	dev_params.num_sf_metrics = desc->num_sf_metrics;
+	dev_params.gemnoc_channels = desc->gemnoc_channels;
+
+	for (int i = 0; i < desc->num_llcc_channels; i++) {
+		profiler->llcc_mmap_base[i] = devm_platform_ioremap_resource(pdev, i);
+		if (IS_ERR(profiler->llcc_mmap_base[i]))
+			return dev_err_probe(&pdev->dev, PTR_ERR(profiler->llcc_mmap_base[i]),
+						"Failed to ioremap llcc registers\n");
+	}
+
+	for (int i = 0; i < desc->gemnoc_channels; i++) {
+		profiler->gemnoc_mmap_base[i] =
+			devm_platform_ioremap_resource(pdev,
+						(desc->num_llcc_channels + i));
+		if (IS_ERR(profiler->gemnoc_mmap_base[i]))
+			return dev_err_probe(&pdev->dev, PTR_ERR(profiler->gemnoc_mmap_base[i]),
+						"Failed to ioremap gemnoc registers\n");
+	}
+
+
+	for (int i = 0; i < desc->num_llcc_channels; i++) {
+		offset_reg_values.llcc_offset[i*2] = desc->llcc_offset
+							+ LLCC_CAB0_COUNTER_OFFSET(0);
+		offset_reg_values.llcc_offset[i*2 + 1] = desc->llcc_offset
+							+ LLCC_CAB0_COUNTER_OFFSET(1);
+		offset_reg_values.cabo_offset[i*2] = desc->cabo_offset
+							+ LLCC_CAB0_COUNTER_OFFSET(9);//rd
+		offset_reg_values.cabo_offset[i*2 + 1] = desc->cabo_offset
+							+ LLCC_CAB0_COUNTER_OFFSET(11);//wr
+	}
+
+	for (int i = 0; i < desc->gemnoc_channels; i++) {
+		for (int j = 0; j < desc->num_gemnoc_metrics; j++) {
+			offset_reg_values.gemnoc_offset[i * desc->num_gemnoc_metrics + j]
+							= GEMNOC_OFFSET(j);
+		}
+	}
+	for (int hf = 0; hf < desc->num_hf_metrics; hf++)
+		offset_reg_values.mmnoc_hf_offset[hf] = desc->mmnoc_hf_offset + MMNOC_OFFSETS(hf);
+
+	for (int sf = 0; sf < desc->num_sf_metrics; sf++)
+		offset_reg_values.mmnoc_sf_offset[sf] = desc->mmnoc_sf_offset + MMNOC_OFFSETS(sf);
+
+	return 0;
+}
 static const struct file_operations profiler_fops = {
 	.owner = THIS_MODULE,
 	.open = profiler_open,
@@ -446,15 +464,21 @@ static int bwprofiler_probe(struct platform_device *pdev)
 {
 	int rc;
 	struct device *class_dev;
+	struct conf_data *desc;
 
 	profiler = devm_kzalloc(&pdev->dev, sizeof(*profiler), GFP_KERNEL);
 
 	if (!profiler)
 		return -ENOMEM;
 
-
 	mutex_init(&profiler->lock);
+	desc = of_device_get_match_data(&pdev->dev);
+	if (!desc)
+		return dev_err_probe(&pdev->dev, -ENOMEM, "failed to probe chip info\n");
 
+	rc = profiler_info_init(desc, pdev);
+	if (rc < 0)
+		return dev_err_probe(&pdev->dev, "%s: init chip info failed %d\n", __func__, rc);
 
 	rc = alloc_chrdev_region(&profiler_device_no, 0, 1, PROFILER_DEV);
 	if (rc < 0) {
@@ -487,6 +511,7 @@ static int bwprofiler_probe(struct platform_device *pdev)
 	}
 
 	profiler->pdev = class_dev;
+
 	return 0;
 
 exit_destroy_device:
@@ -504,8 +529,47 @@ static int bwprofiler_remove(struct platform_device *pdev)
 	return 0;
 }
 
+static const struct conf_data sa8797_ddr_info = {
+	.num_llcc_channels = 16,
+	.num_gemnoc_metrics = 8,
+	.num_hf_metrics = 16,
+	.num_sf_metrics = 12,
+	.llcc_offset = 0x69010,
+	.cabo_offset = 0x10B0A0,
+	.mmnoc_hf_offset = 0x46140,
+	.mmnoc_sf_offset = 0x9140,
+	.gemnoc_channels = 8,
+};
+
+static const struct conf_data sa8775_ddr_info = {
+	.num_llcc_channels = 6,
+	.num_gemnoc_metrics = 8,
+	.num_hf_metrics = 16,
+	.num_sf_metrics = 12,
+	.llcc_offset = 0x36060,
+	.cabo_offset = 0xAB0A0,
+	.mmnoc_hf_offset = 0x4140,
+	.mmnoc_sf_offset = 0x24140,
+	.gemnoc_channels = 6,
+};
+
+static const struct conf_data sa7255_ddr_info = {
+	.num_llcc_channels = 4,
+	.num_gemnoc_metrics = 8,
+	.num_hf_metrics = 16,
+	.num_sf_metrics = 12,
+	.llcc_offset = 0x36060,
+	.cabo_offset = 0xAB0A0,
+	.mmnoc_hf_offset = 0x5140,
+	.mmnoc_sf_offset = 0x25140,
+	.gemnoc_channels = 4,
+};
 static const struct of_device_id bwprofiler_of_match[] = {
-	{ .compatible = "qcom,ddr_bwprofiler", },
+	{ .compatible = "qcom,sa8797_ddr_bwprofiler", .data = &sa8797_ddr_info},
+	{ .compatible = "qcom,sa8775_ddr_bwprofiler", .data = &sa8775_ddr_info},
+	{ .compatible = "qcom,sa8255_ddr_bwprofiler", .data = &sa8775_ddr_info},
+	{ .compatible = "qcom,sa8620_ddr_bwprofiler", .data = &sa7255_ddr_info},
+	{ .compatible = "qcom,sa7255_ddr_bwprofiler", .data = &sa7255_ddr_info},
 	{},
 };
 
