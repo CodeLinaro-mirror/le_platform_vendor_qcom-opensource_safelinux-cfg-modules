@@ -450,7 +450,6 @@ static int bwprofiler_probe(struct platform_device *pdev)
 	struct device *class_dev;
 	struct conf_data *desc;
 	struct qcom_tzmem_pool_config pool_config;
-	struct qcom_tzmem_pool *tzmem_pool;
 
 	profiler = devm_kzalloc(&pdev->dev, sizeof(*profiler), GFP_KERNEL);
 
@@ -466,17 +465,17 @@ static int bwprofiler_probe(struct platform_device *pdev)
 
 	profiler->tzmem_pool = qcom_tzmem_pool_new(&pool_config);
 	if (IS_ERR(profiler->tzmem_pool)) {
-		return dev_err_probe(&pdev->dev, "profiler: Failed to create qcom_tzmem_pool %d\n",
-				PTR_ERR(profiler->tzmem_pool));
+		return dev_err_probe(&pdev->dev, PTR_ERR(profiler->tzmem_pool),
+				"profiler: Failed to create qcom_tzmem_pool\n");
 	}
 
-	desc = of_device_get_match_data(&pdev->dev);
+	desc = (struct conf_data *)of_device_get_match_data(&pdev->dev);
 	if (!desc)
 		return dev_err_probe(&pdev->dev, -ENOMEM, "failed to probe chip info\n");
 
 	rc = profiler_info_init(desc, pdev);
 	if (rc < 0)
-		return dev_err_probe(&pdev->dev, "%s: init chip info failed %d\n", __func__, rc);
+		return dev_err_probe(&pdev->dev, rc, "init chip info failed\n");
 
 	rc = alloc_chrdev_region(&profiler_device_no, 0, 1, PROFILER_DEV);
 	if (rc < 0) {
