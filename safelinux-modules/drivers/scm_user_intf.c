@@ -31,6 +31,9 @@
 		.cmd_ids = ARG_TO_ARRAY(__u32, __VA_ARGS__),        \
 	}
 
+#define DT_LABEL_LENGTH 32
+#define MAX_VM_SIZE     128
+
 struct scm_user_res {
 	u64 result[MAX_QCOM_SCM_RETS];
 };
@@ -78,8 +81,9 @@ static const struct svc_cmd_list sip_tbl[] = {
 					  QCOM_SCM_INFO_BW_PROF_ID),
 
 	[QCOM_SCM_SVC_MP] = SVC_CMD_GRP(QCOM_SCM_SVC_MP,
-					4,
+					5,
 					QCOM_SCM_MP_VIDEO_VAR,
+					QCOM_SCM_MP_ASSIGN,
 					QCOM_SCM_MP_SHM_BRIDGE_ENABLE,
 					QCOM_SCM_MP_SHM_BRIDGE_DELETE,
 					QCOM_SCM_MP_SHM_BRIDGE_CREATE),
@@ -154,6 +158,57 @@ int qcom_scm_ddrbw_profiler(uint64_t in_buf,
 }
 EXPORT_SYMBOL(qcom_scm_ddrbw_profiler);
 #endif
+
+static int qcom_scm_intf_assign_mem(struct scm_dev_data *dev_data,
+                                 struct scm_hand_shake scm_data)
+{
+	struct device_node *node;
+	struct resource of_res;
+	char name[DT_LABEL_LENGTH];
+	int ret = 0;
+
+	void __user *destVM_arr = (void __user *)scm_data.args_buffer[3];
+	u64 srcVM = BIT(scm_data.args_buffer[2]);
+	u64 destVM_cnt = scm_data.args_buffer[4];
+
+	if (!destVM_cnt || destVM_cnt > MAX_VM_SIZE)
+		return -EFAULT;
+
+	// Parse DT label in arg[0] and read PA from reserved-memory node.
+	if (copy_from_user(name, (char *)scm_data.args_buffer[0], sizeof(name)))
+		return -EFAULT;
+
+	//Null terminate the name to ensure safety
+	name[DT_LABEL_LENGTH - 1] = '\0';
+
+	node = of_find_node_by_name(NULL, name);
+	if (!node) {
+		dev_err(dev_data->dev, "Failed to find DT node : %s\n", name);
+		return -ENODEV;
+	}
+
+	ret = of_address_to_resource(node, 0, &of_res);
+	if (ret) {
+		of_node_put(node);
+		dev_err(dev_data->dev, "Failed to parse memory region\n");
+		return ret;
+	}
+	of_node_put(node);
+
+	struct qcom_scm_vmperm *destVM __free(kfree) = kzalloc(destVM_cnt *
+					   sizeof(struct qcom_scm_vmperm), GFP_KERNEL);
+	if(!destVM)
+		return -ENOMEM;
+
+	if (copy_from_user(destVM, destVM_arr,
+			   destVM_cnt * sizeof(struct qcom_scm_vmperm)))
+		return -EFAULT;
+
+	ret = qcom_scm_assign_mem(of_res.start, resource_size(&of_res),
+					   &srcVM, destVM, destVM_cnt);
+
+	return ret;
+}
 
 static int get_pa_from_dmabuf_fd(struct dma_buf* dma_buf, u64 *p_addr)
 {
@@ -234,16 +289,16 @@ static int translate_fd_to_pa(unsigned  int *dmabuf_fd,
                         return -EFAULT;
                 }
 
-                if (get_pa_from_dmabuf_fd(dma_buf, &pa) < 0)
-                        return -EINVAL;
+		if (get_pa_from_dmabuf_fd(dma_buf, &pa) < 0) {
+			dma_buf_put(dma_buf);
+			return -EINVAL;
+		}
 
-                scm_args[dmabuf_fd[i]] = pa;
-        }
-
-	if (!IS_ERR_OR_NULL(dma_buf))
+		scm_args[dmabuf_fd[i]] = pa;
 		dma_buf_put(dma_buf);
+	}
 
-        return 0;
+	return 0;
 }
 
 static bool validate_svc_cmd(unsigned int svc_id, unsigned int cmd_id)
@@ -289,10 +344,10 @@ static int qcom_scm_open(struct inode *inode, struct file *filp)
 static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct scm_dev_data *dev_data = (struct scm_dev_data *)file->private_data;
-	struct platform_device *scm_pdev = dev_data->scm_pdev;
 	void __user *ip = (void __user *)arg;
 	struct scm_hand_shake scm_data;
 #if (LINUX_VERSION_CODE == KERNEL_VERSION(5, 14, 0))
+	struct platform_device *scm_pdev = dev_data->scm_pdev;
 	struct qcom_scm_desc desc;
 	struct qcom_scm_res res;
 #else
@@ -300,7 +355,7 @@ static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	u64 res1 = 0;
 #endif
 
-	int id, i, no_of_args, no_dma_fds, ret = 0;
+	int i, no_of_args, no_dma_fds, ret = 0;
 	u32 dma_fd_args[MAX_QCOM_SCM_ARGS];
 
 	if (cmd != SCM_HAND_SHAKE_IOCTL)
@@ -319,7 +374,7 @@ static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	// Validate number of args
 	no_of_args = scm_data.arginfo & 0x0F;
 	if (no_of_args > MAX_QCOM_SCM_ARGS)
-		ret = -EINVAL;
+		return -EINVAL;
 
         no_dma_fds = get_dmafd_args(scm_data.svc, scm_data.cmd, dma_fd_args);
         if (no_dma_fds > 0) {
@@ -347,7 +402,7 @@ static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			void *data;
 			__u32 meta_len = scm_data.args_buffer[2];
 
-			data = memremap((void *)scm_data.args_buffer[1], meta_len, MEMREMAP_WB);
+			data = memremap(scm_data.args_buffer[1], meta_len, MEMREMAP_WB);
 			if(!data)
 				return -ENOMEM;
 
@@ -394,6 +449,9 @@ static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 								      scm_data.args_buffer[2],
 								      scm_data.args_buffer[3]);
 			break;
+		case QCOM_SCM_MP_ASSIGN:
+			scm_data.ret = qcom_scm_intf_assign_mem(dev_data, scm_data);
+			break;
 		}
 		break;
 
@@ -428,7 +486,7 @@ static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 			if (copy_from_user(scm_buf,
 					(struct qcom_scm_camera_qos *)scm_data.args_buffer[1],
-					size)) {
+					min(size, sizeof(scm_buf)))) {
 				dev_err(dev_data->dev, "copy_from_user failed\n");
 			}
 			scm_data.ret = qcom_scm_camera_update_camnoc_qos(
@@ -483,6 +541,9 @@ static int qcom_scm_intf_probe(struct platform_device *pdev)
 	struct scm_dev_data *dev_data;
 	int ret = 0;
 
+	if (!qcom_scm_is_available())
+		dev_err_probe(dev_data->dev, -EPROBE_DEFER, "qcom_scm is not up!\n");
+
 	dev_data = devm_kzalloc(dev, sizeof(struct scm_dev_data), GFP_KERNEL);
 	if (!dev_data)
 		return -ENOMEM;
@@ -494,6 +555,7 @@ static int qcom_scm_intf_probe(struct platform_device *pdev)
 	dev_data->scm_miscdev.name = devm_kasprintf(&pdev->dev, GFP_KERNEL,
 						    "scmnode");
 	dev_data->scm_miscdev.fops = &qcom_scm_fops;
+
 	ret = misc_register(&dev_data->scm_miscdev);
 	if (ret) {
 		dev_err(dev, "failed to register misc device. err %d\n", ret);
@@ -503,9 +565,6 @@ static int qcom_scm_intf_probe(struct platform_device *pdev)
 	__scm_dev = dev_data;
 	__scm_dev->dev = dev_data->dev;
 
-	if (!qcom_scm_is_available())
-		dev_err_probe(dev_data->dev, -EPROBE_DEFER, "qcom_scm is not up!\n");
-
 	platform_set_drvdata(pdev, dev_data);
 	return 0;
 }
@@ -514,7 +573,6 @@ static int qcom_scm_intf_remove(struct platform_device *pdev)
 {
 	struct scm_dev_data *dev_data = platform_get_drvdata(pdev);
 
-	put_device(dev_data->dev);
 	misc_deregister(&dev_data->scm_miscdev);
 	return 0;
 }

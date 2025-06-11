@@ -13,6 +13,7 @@
 #define CREATE_TRACE_POINTS
 #include "vendor_uscmi_trace.h"
 
+#define SCMI_MAX_TX_RX_SIZE 128
 extern struct bus_type scmi_bus_type;
 
 struct qcom_vendor_uscmi_dev {
@@ -44,36 +45,44 @@ static long scmi_vendor_ioctl(struct file *file, unsigned int cmd,
 {
 	char __user *argp = (char __user *)arg;
 	scmi_vendor_msg_t kmsg;
-	void *payload;
+	u8 *payload __free(kfree) = NULL;
 	int ret = 0;
 	u64 size;
 	struct qcom_vendor_uscmi_dev *uscmi = miscdev_to_priv(file->private_data);
 
-	if (!uscmi) {
+	if (unlikely(!uscmi)) {
 		pr_err("%s invalid device file\n", __func__);
 		return -EINVAL;
 	}
 
 	ret = copy_from_user(&kmsg, argp, sizeof(kmsg));
-	if (ret)
-		goto err;
+	if (unlikely(ret))
+		return ret;
 
 	if (cmd == GET_PARAM)
 		size = kmsg.tx_size > kmsg.rx_size ? kmsg.tx_size : kmsg.rx_size;
 	else
 		size = kmsg.tx_size;
 
+	if (size <= 0 && size >= SCMI_MAX_TX_RX_SIZE) {
+		dev_err(uscmi->dev, "invalid size:%d\n", size);
+		return -EINVAL;
+	}
+
 	payload = kzalloc(size, GFP_KERNEL);
-	if (!payload) {
-		ret = -ENOMEM;
-		goto err;
+	if (unlikely(ZERO_OR_NULL_PTR(payload))) {
+		dev_err(uscmi->dev, "could not allocate mem,invalid size:%d\n",
+                        size);
+		return -ENOMEM;
         }
 
 	ret = copy_from_user(payload, kmsg.msg, kmsg.tx_size);
-	if (ret) {
-		kfree(payload);
-		goto err;
+	if (unlikely(ret)) {
+		dev_err(uscmi->dev, "could not copy message%d\n");
+		return ret;
 	}
+	dev_dbg(uscmi->dev, "cmd:%d size:%d param:%d algo_str:%llx\n",
+                 cmd, size, kmsg.param_id, uscmi->algo_str);
 
 	switch (cmd) {
 	case SET_PARAM:
@@ -102,8 +111,6 @@ static long scmi_vendor_ioctl(struct file *file, unsigned int cmd,
 		break;
 	}
 
-	kfree(payload);
-err:
 	trace_vendor_uscmi_ioctl(cmd, size, ret, uscmi->algo_str, kmsg.param_id);
 	return ret;
 }
@@ -118,15 +125,16 @@ static const struct file_operations scmi_vendor_fops = {
 
 static int uscmi_vendor_probe(struct platform_device *pdev)
 {
-	int ret;
-	const char *name;
 	struct device *dev = &pdev->dev, *scmi_dev;
-	struct device_node *np, *scmi_node;
+	struct device_node *scmi_node __free(device_node) = NULL;
+	struct device_node *np;
 	struct qcom_vendor_uscmi_dev *uscmi;
 	struct miscdevice miscdev;
+	int ret;
+	const char *name;
 
 	uscmi = devm_kzalloc(dev, sizeof(*uscmi), GFP_KERNEL);
-	if (!uscmi)
+	if (unlikely(ZERO_OR_NULL_PTR(uscmi)))
 		return -ENOMEM;
 
 	uscmi->dev = dev;
@@ -137,6 +145,9 @@ static int uscmi_vendor_probe(struct platform_device *pdev)
 	else
 		uscmi->name = devm_kasprintf(dev, GFP_KERNEL, "%pOFn", np);
 
+	if (unlikely(!uscmi->name))
+		return -ENOMEM;
+
 	ret = of_property_read_u64(np, "qcom,algo", &uscmi->algo_str);
 	if (ret) {
 		dev_err(dev, "qcom algo string not found %s\n", __func__);
@@ -144,29 +155,31 @@ static int uscmi_vendor_probe(struct platform_device *pdev)
 	}
 
 	scmi_node = of_parse_phandle(np, "qcom,vendor", 0);
-	if (!scmi_node) {
+	if (unlikely(!scmi_node)) {
 		dev_err(dev, "qcom vendor prop not found %s\n", __func__);
 		return -ENODEV;
 	}
 
 	scmi_dev = bus_find_device_by_of_node(&scmi_bus_type, scmi_node);
-	if (!scmi_dev) {
+	if (unlikely(!scmi_dev)) {
 		dev_err(dev, "scmi dev not found %s\n", __func__);
 		return -ENODEV;
 	}
 
 	dev_dbg(dev, "device found: %s\n", dev_name(scmi_dev));
-	of_node_put(scmi_node);
 
 	uscmi->sdev = dev_get_drvdata(scmi_dev);
-	if (!uscmi->sdev) {
+	if (unlikely(!uscmi->sdev)) {
 		pr_info("drv data not set %s\n", __func__);
 		return -EINVAL;
 	}
 
+	if (unlikely(!uscmi->sdev->handle))
+		return -EINVAL;
+
 	uscmi->ops = uscmi->sdev->handle->devm_protocol_get(uscmi->sdev,
 			QCOM_SCMI_VENDOR_PROTOCOL, &uscmi->ph);
-	if (IS_ERR(uscmi->ops)) {
+	if (unlikely(IS_ERR(uscmi->ops))) {
 		ret = PTR_ERR(uscmi->ops);
 		uscmi->ops = NULL;
 		dev_err(dev, "Error getting vendor protocol ops: %d\n", ret);
@@ -178,14 +191,23 @@ static int uscmi_vendor_probe(struct platform_device *pdev)
 	uscmi->miscdev.fops = &scmi_vendor_fops;
 
 	ret = misc_register(&uscmi->miscdev);
-	if (ret) {
+	if (unlikely(ret)) {
 		dev_err(dev, "misc_register failed(ret=%d)\n", ret);
 		return ret;
 	}
 
+	platform_set_drvdata(pdev, uscmi);
 	dev_info(dev, "/dev/%s node created\n", uscmi->name);
 
 	return ret;
+}
+
+static void uscmi_vendor_remove(struct platform_device *pdev)
+{
+	struct qcom_vendor_uscmi_dev *uscmi = platform_get_drvdata(pdev);
+
+	if (!uscmi)
+		misc_deregister(&uscmi->miscdev);
 }
 
 static const struct of_device_id  uscmi_vendor_match_table[] = {
@@ -201,6 +223,7 @@ static struct platform_driver uscmi_vendor_drv = {
 		.suppress_bind_attrs = true,
 	},
 	.probe		= uscmi_vendor_probe,
+	.remove_new	= uscmi_vendor_remove,
 };
 module_platform_driver(uscmi_vendor_drv);
 
