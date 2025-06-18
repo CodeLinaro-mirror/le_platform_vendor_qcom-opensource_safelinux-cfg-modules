@@ -81,20 +81,9 @@ struct kiumd_smmu_mmio_ctx {
 	size_t size;
 };
 
-struct dmabuf_fd {
-	struct dma_buf *kiumd_dmabuf; //Value
-	uint32_t token;  //Key
-	struct list_head *next;
-};
-
 enum iommu_dma_cookie_type {
 	IOMMU_DMA_IOVA_COOKIE,
 	IOMMU_DMA_MSI_COOKIE,
-};
-
-struct dma_buf_handle {
-	unsigned long dmabuf;
-	atomic_t handle_refcount;
 };
 
 /*
@@ -276,8 +265,6 @@ struct kiumd_ctx {
 	DECLARE_HASHTABLE(hyp_table, SMMU_MAPTABLE_SIZE);
 	struct kiumd_reserved_mem_area *res_mem_area;
 	int num_reserved_regions;
-	struct xarray kiumd_xa;
-	struct mutex kiumd_xa_mutex;
 	struct mutex hyp_lock;
 	struct mutex resmem_lock;
 	unsigned long pt_start_iova;
@@ -2846,180 +2833,6 @@ int kiumd_iova_ctrl(char __user *arg)
 }
 
 /**
- * @Brief: This function facilitates to
- * get the handle to a fd,fd to a handle
- * or closing the handle based on user space
- * arguments. API uses xarray to store
- * and retrieve handles.The function
- * is called via IOCTL interface
- * and input is provided via struct
- * kiumd_user from the user space.
- *
- * Parameters:
- * @arg: user space argument pointer
- *
- * Returns  handle/fd upon success and error codes on failure
- */
-int kiumd_fd_dmabuf_handler(char __user *arg, struct file *fp)
-{
-	struct dma_buf_handle *dmabuf_xarray_entry;
-	struct dma_buf_handle *dmabuf_handle;
-	bool handle_available = false;
-	struct dma_buf *kiumd_dmabuf;
-	struct kiumd_ctx *kiumd_ctx;
-	struct kiumd_user kiusr;
-	unsigned long xa_index;
-	unsigned long dmabuf;
-	uint32_t local_id;
-	void *xa_entry;
-	int err;
-
-	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-
-	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user))) {
-		pr_err("%s: copy_from_user failed\n", __func__);
-		return -EFAULT;
-	}
-
-	trace_kiumd_fd_dmabuf_handler_start(kiusr.handle, kiusr.dma_buf_fd);
-
-	/* FD to Handle */
-	if (kiusr.handle == FD_TO_HANDLE) {
-
-		if (kiusr.dma_buf_fd < 0) {
-			pr_err("%s: dma_buf_fd is invalid\n", __func__);
-			return -EBADF;
-		}
-
-		mutex_lock(&kiumd_ctx->kiumd_xa_mutex);
-		/* Retrieve struct dma_buf from FD*/
-		dmabuf  = (unsigned long) dma_buf_get(kiusr.dma_buf_fd);
-		if (((struct dma_buf *) dmabuf) == NULL) {
-			pr_err("%s: dma_buf_get returns NULL\n", __func__);
-			mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
-			return -EINVAL;
-		}
-
-		/* Check if handle for buffer already exists, RCU lock acquired*/
-		xa_for_each(&kiumd_ctx->kiumd_xa, xa_index, xa_entry) {
-			dmabuf_xarray_entry = (struct dma_buf_handle *) xa_entry;
-			if (dmabuf_xarray_entry->dmabuf == dmabuf) {
-				handle_available = true;
-				local_id = xa_index;
-				atomic_inc(&dmabuf_xarray_entry->handle_refcount);
-				break; //Handle found, exit the loop
-			}
-		}
-
-		/* If Handle does not exist, allocate xa_array entry*/
-		if (!handle_available) {
-			dmabuf_handle = kzalloc(sizeof(*dmabuf_handle), GFP_KERNEL);
-			if (!dmabuf_handle) {
-				dma_buf_put((struct dma_buf *) dmabuf);
-				mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
-				return -ENOMEM;
-			}
-			dmabuf_handle->dmabuf = dmabuf;
-			atomic_set(&dmabuf_handle->handle_refcount, 1);
-			err = xa_alloc(&kiumd_ctx->kiumd_xa, &local_id,
-				       (void *)dmabuf_handle, xa_limit_32b,
-				       GFP_KERNEL);
-			if (err < 0) {
-				pr_err("%s:xarray alloc failure %d\n", __func__, err);
-				dma_buf_put((struct dma_buf *) dmabuf);
-				kfree(dmabuf_handle);
-				mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
-				return err;
-			}
-		} else {
-			dmabuf_handle = xa_load(&kiumd_ctx->kiumd_xa, local_id);
-			if (!dmabuf_handle) {
-				pr_err("%s: dmabuf_handle is NULL\n", __func__);
-				mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
-				return -EINVAL;
-			}
-		}
-
-		kiumd_dmabuf = (struct dma_buf *) dmabuf;
-		kiusr.handle = local_id;
-		mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
-		trace_kiumd_fd_dmabuf_handler_fd_to_handle(kiusr.dma_buf_fd,
-							   kiusr.handle,
-							   atomic_read(&dmabuf_handle->handle_refcount));
-	} else if (kiusr.dma_buf_fd == HANDLE_TO_FD) { /* Handle to FD */
-		if (kiusr.handle < 0) {
-			pr_err("%s: dmabuf handle is invalid\n", __func__);
-			return -EINVAL;
-		}
-		mutex_lock(&kiumd_ctx->kiumd_xa_mutex);
-		local_id = kiusr.handle;
-		dmabuf_handle = xa_load(&kiumd_ctx->kiumd_xa, local_id);
-		if (!dmabuf_handle) {
-			pr_err("%s: dmabuf_handle is NULL\n", __func__);
-			mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
-			return -EINVAL;
-		}
-		if (!IS_ERR_OR_NULL((struct dma_buf *) dmabuf_handle->dmabuf)) {
-			get_dma_buf((struct dma_buf *) dmabuf_handle->dmabuf);
-			kiusr.dma_buf_fd = dma_buf_fd((struct dma_buf *) dmabuf_handle->dmabuf,
-						      (O_CLOEXEC));
-		}
-		if (kiusr.dma_buf_fd < 0) {
-			pr_err("%s:dma_buf_fd failed\n", __func__);
-			mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
-			return -EBADF;
-		}
-
-		mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
-		trace_kiumd_fd_dmabuf_handler_handle_to_fd(kiusr.dma_buf_fd,
-							   kiusr.handle,
-							   atomic_read(&dmabuf_handle->handle_refcount));
-
-	} else if (kiusr.dma_buf_fd == CLOSE_HANDLE) {  /* Close Handle */
-		if (kiusr.handle < 0) {
-			pr_err("%s: Invalid dma buf handle.\n", __func__);
-			return -EINVAL;
-		}
-
-		mutex_lock(&kiumd_ctx->kiumd_xa_mutex);
-		local_id = (int32_t)kiusr.handle;
-
-		dmabuf_handle = xa_load(&kiumd_ctx->kiumd_xa, local_id);
-		if (!dmabuf_handle) {
-			pr_err("%s:Entry not available in xarray\n", __func__);
-			mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
-			return -EINVAL;
-		}
-
-		kiumd_dmabuf = ((struct dma_buf *)dmabuf_handle->dmabuf);
-		if (atomic_dec_and_test(&dmabuf_handle->handle_refcount)) {
-
-			if (!IS_ERR_OR_NULL(kiumd_dmabuf))
-				dma_buf_put(kiumd_dmabuf);
-			xa_erase(&kiumd_ctx->kiumd_xa, local_id);
-			if (!dmabuf_handle) {
-				kfree(dmabuf_handle);
-				dmabuf_handle = NULL;
-			}
-		} else {
-			if (!IS_ERR_OR_NULL(kiumd_dmabuf))
-				dma_buf_put(kiumd_dmabuf);
-		}
-		kiusr.dma_buf_fd = 0;
-		mutex_unlock(&kiumd_ctx->kiumd_xa_mutex);
-	}
-
-	trace_kiumd_fd_dmabuf_handler_end(kiusr.handle, kiusr.dma_buf_fd);
-
-	if (copy_to_user(arg, &kiusr, sizeof(kiusr))) {
-		pr_err("%s: copy_to_user failed...\n", __func__);
-		return -EFAULT;
-	}
-
-	return 0;
-}
-
-/**
  * @Brief: This function facilitates to hyp-assign the page for given vmid
  *
  * Parameters:
@@ -4427,11 +4240,8 @@ static int kiumd_open(struct inode *inode, struct file *filp)
 	spin_lock_init(&kictx->smmu_lock);
 	spin_lock_init(&kictx->kgsl_context->kgsl_hash_lock);
 	spin_lock_init(&kictx->pt_lock);
-	xa_init(&kictx->kiumd_xa);
-	mutex_init(&kictx->kiumd_xa_mutex);
 	mutex_init(&kictx->resmem_lock);
 	mutex_init(&kictx->hyp_lock);
-	xa_init_flags(&kictx->kiumd_xa, XA_FLAGS_ALLOC);
 	filp->private_data = kictx;
 
 	return 0;
@@ -4452,15 +4262,11 @@ static int kiumd_open(struct inode *inode, struct file *filp)
 static int kiumd_close(struct inode *inode, struct file *filp)
 {
 	struct kiumd_ctx *ki_ctx = (struct kiumd_ctx *)filp->private_data;
-	struct dma_buf_handle *dmabuf_handle;
 	struct iommu_domain *iommu_dom;
 	struct dma_buf *kiumd_dmabuf;
 	struct smmu_map_data *smap;
-	unsigned long xa_index;
 	struct hlist_node *tmp;
-	int count, ret, iter;
-	void *xa_entry;
-
+	int ret, iter;
 
 	if (!hash_empty(ki_ctx->smmu_table)) {
 		hash_for_each_safe(ki_ctx->smmu_table, iter, tmp, smap, node) {
@@ -4538,27 +4344,6 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 	}
 
 	kfree(ki_ctx->res_mem_area);
-	mutex_lock(&ki_ctx->kiumd_xa_mutex);
-	if (!xa_empty(&ki_ctx->kiumd_xa)) {
-		xa_for_each(&ki_ctx->kiumd_xa, xa_index, xa_entry) {
-			dmabuf_handle = (struct dma_buf_handle *) xa_entry;
-			if (!dmabuf_handle)
-				continue;
-
-			kiumd_dmabuf = ((struct dma_buf *)dmabuf_handle->dmabuf);
-			count = atomic_read(&dmabuf_handle->handle_refcount);
-			if (!IS_ERR_OR_NULL(kiumd_dmabuf)) {
-				while (count > 0) {
-					dma_buf_put(kiumd_dmabuf);
-					count--;
-				}
-			}
-			kfree(dmabuf_handle);
-		}
-		xa_destroy(&ki_ctx->kiumd_xa);
-	}
-	mutex_unlock(&ki_ctx->kiumd_xa_mutex);
-
 	kfree(ki_ctx);
 
 	return 0;
@@ -4765,9 +4550,6 @@ static long kiumd_ioctl(struct file *file, unsigned int cmd,
 		break;
 	case KIUMD_PER_PROCESS_FREE:
 		err = kiumd_perprocess_pgtble_free(argp, file);
-		break;
-	case KIUMD_FD_DMABUF_HANDLE:
-		err = kiumd_fd_dmabuf_handler(argp, file);
 		break;
 	case KIUMD_CUSTOM_IOVA_INIT:
 		err = kiumd_dmabuf_custom_iova_init(argp, file);
