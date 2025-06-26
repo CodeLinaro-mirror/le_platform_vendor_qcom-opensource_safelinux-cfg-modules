@@ -31,8 +31,11 @@
 		.cmd_ids = ARG_TO_ARRAY(__u32, __VA_ARGS__),        \
 	}
 
-#define DT_LABEL_LENGTH 32
-#define MAX_VM_SIZE     128
+#define DT_LABEL_LENGTH      32
+#define MAX_VM_SIZE          128
+#define SRC_VMS_LIST_INDEX   2
+#define DEST_VMS_LIST_INDEX  4
+#define DEST_VMS_SIZE_INDEX  5
 
 struct scm_user_res {
 	u64 result[MAX_QCOM_SCM_RETS];
@@ -172,9 +175,9 @@ static int qcom_scm_intf_assign_mem(struct scm_dev_data *dev_data,
 	char name[DT_LABEL_LENGTH];
 	int ret = 0;
 
-	void __user *destVM_arr = (void __user *)scm_data.args_buffer[3];
-	u64 srcVM = BIT(scm_data.args_buffer[2]);
-	u64 destVM_cnt = scm_data.args_buffer[4];
+	void __user *destVM_arr = (void __user *)scm_data.args_buffer[DEST_VMS_LIST_INDEX];
+	u64 srcVM = BIT(scm_data.args_buffer[SRC_VMS_LIST_INDEX]);
+	u64 destVM_cnt = scm_data.args_buffer[DEST_VMS_SIZE_INDEX];
 
 	if (!destVM_cnt || destVM_cnt > MAX_VM_SIZE)
 		return -EFAULT;
