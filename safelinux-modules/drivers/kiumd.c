@@ -253,6 +253,7 @@ struct pgtable_map {
  * @id: id to map/unmap entries in hashtable
  * @smmu_map_data: structurefor hashtable data
  * @smmu_lock: Lock for map/unmap operations
+ * @resmem_lock: Lock for res_mem_area operations
  * @hyp_lock: Lock for hyp assign operations
  * @smmu_table: Hashtable to hold entries based on id
  * @reserved_mem_area: pointer to hold reserved memory area
@@ -278,6 +279,7 @@ struct kiumd_ctx {
 	struct xarray kiumd_xa;
 	struct mutex kiumd_xa_mutex;
 	struct mutex hyp_lock;
+	struct mutex resmem_lock;
 	unsigned long pt_start_iova;
 	unsigned long pt_end_iova;
 	DECLARE_HASHTABLE(page_table, SMMU_MAPTABLE_SIZE);
@@ -4418,6 +4420,7 @@ static int kiumd_open(struct inode *inode, struct file *filp)
 	spin_lock_init(&kictx->pt_lock);
 	xa_init(&kictx->kiumd_xa);
 	mutex_init(&kictx->kiumd_xa_mutex);
+	mutex_init(&kictx->resmem_lock);
 	mutex_init(&kictx->hyp_lock);
 	xa_init_flags(&kictx->kiumd_xa, XA_FLAGS_ALLOC);
 	filp->private_data = kictx;
@@ -4597,17 +4600,24 @@ static int kiumd_vfio_ctx_init(char __user *arg, struct file *fp)
 		return -EINVAL;
 	}
 
+	guard(mutex)(&kiumd_ctx->resmem_lock);
+	if (kiumd_ctx->num_reserved_regions)
+		return -ENOMEM;
+
 	kiumd_ctx->num_reserved_regions = of_property_count_elems_of_size(np,
 									  "memory-region",
 									  sizeof(phandle));
 	if (kiumd_ctx->num_reserved_regions <= 0)
 		return -EINVAL;
 
+	if (!kiumd_ctx->res_mem_area) {
+		kfree(kiumd_ctx->res_mem_area);
+		pr_err("%s:res_mem_area repeatedly allocates memory\n", __func__);
+	}
+
 	kiumd_ctx->res_mem_area = kcalloc((kiumd_ctx->num_reserved_regions + 1),
 					  sizeof(*kiumd_ctx->res_mem_area),
 					  GFP_KERNEL);
-	if (!kiumd_ctx->res_mem_area)
-		return -ENOMEM;
 
 	kiusr.num_regions = kiumd_ctx->num_reserved_regions;
 	for (u64 i = 0; i < kiusr.num_regions; i++) {
@@ -4754,8 +4764,9 @@ static long kiumd_ioctl(struct file *file, unsigned int cmd,
  */
 static int kiumd_mmap(struct file *file, struct vm_area_struct *vma)
 {
-	u64 req_len, index, pgoff;
 	struct kiumd_ctx *ki_ctx;
+	u64 req_len, index, pgoff, base;
+	size_t size;
 
 	if (!file) {
 		pr_err("%s:file ptr returns NULL\n", __func__);
@@ -4768,10 +4779,26 @@ static int kiumd_mmap(struct file *file, struct vm_area_struct *vma)
 		return -EINVAL;
 	}
 
+	if (!vma) {
+		pr_err("%s:vma is NULL\n", __func__);
+		return -EINVAL;
+	}
+
+	index = vma->vm_pgoff >> (KIUMD_INDEX_OFFSET - PAGE_SHIFT);
+	if (ki_ctx->num_reserved_regions <= index) {
+		pr_err("%s:Invalid index:%lx\n", __func__, index);
+		return -EINVAL;
+	}
+
+	guard(mutex)(&ki_ctx->resmem_lock);
+
 	if (!ki_ctx->res_mem_area) {
 		pr_err("%s:No reserved mem areas\n", __func__);
 		return -EINVAL;
 	}
+
+	base = ki_ctx->res_mem_area[index].base;
+	size = ki_ctx->res_mem_area[index].size;
 
 	if (vma->vm_end < vma->vm_start) {
 		pr_err("%s:Invalid vm start and end\n", __func__);
@@ -4785,7 +4812,7 @@ static int kiumd_mmap(struct file *file, struct vm_area_struct *vma)
 	}
 
 	pr_debug("%s:index:%lx\n", __func__, index);
-	if (ki_ctx->res_mem_area[index].base & ~PAGE_MASK) {
+	if (base & ~PAGE_MASK) {
 		pr_err("%s:Unalligned base address\n", __func__);
 		return -EINVAL;
 	}
@@ -4798,14 +4825,12 @@ static int kiumd_mmap(struct file *file, struct vm_area_struct *vma)
 	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
 
 	pr_debug("%s:res mem start:%llx End:%llx size:%lx vma start:%lx vma end:%lx size:%lx offset:%lx\n",
-		 __func__, ki_ctx->res_mem_area[index].base,
-		 ki_ctx->res_mem_area[index].base + ki_ctx->res_mem_area[index].size,
-		 ki_ctx->res_mem_area[index].size, vma->vm_start,
-		 vma->vm_end, vma->vm_end - vma->vm_start, vma->vm_pgoff);
+			__func__, base, base + size, size, vma->vm_start,
+			vma->vm_end, vma->vm_end - vma->vm_start, vma->vm_pgoff);
 
 	return remap_pfn_range(vma, vma->vm_start,
-			       ki_ctx->res_mem_area[index].base >> PAGE_SHIFT,
-			       req_len, vma->vm_page_prot);
+				base >> PAGE_SHIFT,
+				req_len, vma->vm_page_prot);
 }
 
 static const struct file_operations kiumd_fops = {
