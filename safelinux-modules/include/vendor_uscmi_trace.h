@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * Copyright (c) 2025 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #undef TRACE_SYSTEM
@@ -32,7 +32,7 @@ TRACE_EVENT(vendor_uscmi_ioctl,
 		__entry->param_id = param_id;
 	),
 
-	TP_printk("cmd=%d, size=%ul, ret=%d algo:%ul param_id:%d", __entry->cmd,
+	TP_printk("cmd=%d, size=%llu, ret=%d algo:%llu param_id:%d", __entry->cmd,
 		  __entry->size, __entry->ret, __entry->algo, __entry->param_id)
 );
 

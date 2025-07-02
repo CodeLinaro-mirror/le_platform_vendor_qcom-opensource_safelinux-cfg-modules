@@ -1,6 +1,5 @@
-/* SPDX-License-Identifier: GPL-2.0-only
- * Copyright (c) 2025 Qualcomm Innovation Center, Inc. All rights reserved.
- */
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 
 #include <linux/module.h>
 #include <linux/miscdevice.h>
@@ -64,24 +63,24 @@ static long scmi_vendor_ioctl(struct file *file, unsigned int cmd,
 	else
 		size = kmsg.tx_size;
 
-	if (size <= 0 && size >= SCMI_MAX_TX_RX_SIZE) {
-		dev_err(uscmi->dev, "invalid size:%d\n", size);
+	if (size <= 0 || size >= SCMI_MAX_TX_RX_SIZE) {
+		dev_err(uscmi->dev, "invalid size:%llu\n", size);
 		return -EINVAL;
 	}
 
 	payload = kzalloc(size, GFP_KERNEL);
 	if (unlikely(ZERO_OR_NULL_PTR(payload))) {
-		dev_err(uscmi->dev, "could not allocate mem,invalid size:%d\n",
+		dev_err(uscmi->dev, "could not allocate mem,invalid size:%llu\n",
                         size);
 		return -ENOMEM;
         }
 
 	ret = copy_from_user(payload, kmsg.msg, kmsg.tx_size);
 	if (unlikely(ret)) {
-		dev_err(uscmi->dev, "could not copy message%d\n");
+		dev_err(uscmi->dev, "could not copy message %d\n", ret);
 		return ret;
 	}
-	dev_dbg(uscmi->dev, "cmd:%d size:%d param:%d algo_str:%llx\n",
+	dev_dbg(uscmi->dev, "cmd:%d size:%llu param:%d algo_str:%llx\n",
                  cmd, size, kmsg.param_id, uscmi->algo_str);
 
 	switch (cmd) {
@@ -129,7 +128,6 @@ static int uscmi_vendor_probe(struct platform_device *pdev)
 	struct device_node *scmi_node __free(device_node) = NULL;
 	struct device_node *np;
 	struct qcom_vendor_uscmi_dev *uscmi;
-	struct miscdevice miscdev;
 	int ret;
 	const char *name;
 
@@ -206,7 +204,7 @@ static void uscmi_vendor_remove(struct platform_device *pdev)
 {
 	struct qcom_vendor_uscmi_dev *uscmi = platform_get_drvdata(pdev);
 
-	if (!uscmi)
+	if (uscmi)
 		misc_deregister(&uscmi->miscdev);
 }
 
