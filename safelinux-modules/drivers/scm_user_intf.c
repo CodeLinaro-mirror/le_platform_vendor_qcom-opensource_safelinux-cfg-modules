@@ -78,9 +78,10 @@ static const struct svc_cmd_list sip_tbl[] = {
 					 QCOM_SCM_PIL_PAS_SHUTDOWN),
 
 	[QCOM_SCM_SVC_INFO] = SVC_CMD_GRP(QCOM_SCM_SVC_INFO,
-					  3,
+					  4,
 					  QCOM_SCM_INFO_IS_CALL_AVAIL,
 					  QCOM_SCM_INFO_GET_FEAT_VERSION_CMD,
+					  QCOM_SCM_GET_SECURE_STATE,
 					  QCOM_SCM_INFO_BW_PROF_ID),
 
 	[QCOM_SCM_SVC_MP] = SVC_CMD_GRP(QCOM_SCM_SVC_MP,
@@ -447,6 +448,13 @@ static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 							       scm_data.args_buffer[2],
 							       scm_data.args_buffer[3]);
 			break;
+
+		case QCOM_SCM_GET_SECURE_STATE:
+				scm_data.ret = qcom_scm_get_secure_state(&res1);
+				res.result[0] = res1;
+
+			break;
+
 		}
 		break;
 

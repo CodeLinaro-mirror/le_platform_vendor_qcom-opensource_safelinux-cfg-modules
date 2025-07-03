@@ -7,6 +7,7 @@
 #define SCM_HAND_SHAKE_IOCTL       _IOWR('R', 10, struct scm_hand_shake)
 
 #define QCOM_SCM_INFO_GET_FEAT_VERSION_CMD      0x03
+#define QCOM_SCM_GET_SECURE_STATE               0x04
 #define QCOM_SCM_INFO_BW_PROF_ID                0x07
 
 #define QCOM_SCM_MP_SHM_BRIDGE_ENABLE		0x1c
