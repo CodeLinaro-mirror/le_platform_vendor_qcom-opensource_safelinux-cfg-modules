@@ -4410,8 +4410,10 @@ static int kiumd_open(struct inode *inode, struct file *filp)
 		return -ENOMEM;
 
 	kictx->kgsl_context = kzalloc(sizeof(*kictx->kgsl_context), GFP_KERNEL);
-	if (!kictx->kgsl_context)
+	if (!kictx->kgsl_context) {
+		kfree(kictx);
 		return -ENOMEM;
+	}
 
 	kictx->id = 0;
 	kictx->pt_start_iova = KIUMD_32BIT_START_IOVA;
@@ -4564,10 +4566,10 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 
 /**
  * @Brief: This function facilitates to
- * initialise the context of the device.
- * Currently it reads the Device tree to check if the
- * device has any reserved regions and stores the information
- * of reserved memory regions internally.
+ * get the reserved region number and information.
+ * Currently it reads the Device tree and save
+ * the memory-region properties in struct kiumd_ctx,
+ * then return the reserved region number to the caller.
  *
  * Parameters:
  * @arg: User space argument ptr
@@ -4618,17 +4620,21 @@ static int kiumd_vfio_ctx_init(char __user *arg, struct file *fp)
 									  sizeof(phandle));
 	if (kiumd_ctx->num_reserved_regions <= 0)
 		return -EINVAL;
+	kiusr.num_regions = kiumd_ctx->num_reserved_regions;
 
-	if (!kiumd_ctx->res_mem_area) {
+	if (kiumd_ctx->res_mem_area) {
 		kfree(kiumd_ctx->res_mem_area);
 		pr_err("%s:res_mem_area repeatedly allocates memory\n", __func__);
 	}
 
-	kiumd_ctx->res_mem_area = kcalloc((kiumd_ctx->num_reserved_regions + 1),
+	kiumd_ctx->res_mem_area = kcalloc(kiumd_ctx->num_reserved_regions,
 					  sizeof(*kiumd_ctx->res_mem_area),
 					  GFP_KERNEL);
+	if (!kiumd_ctx->res_mem_area) {
+		pr_err("%s:%d fail to allocate kiumd_ctx->res_mem_area\n", __func__, __LINE__);
+		return -ENOMEM;
+	}
 
-	kiusr.num_regions = kiumd_ctx->num_reserved_regions;
 	for (u64 i = 0; i < kiusr.num_regions; i++) {
 		mem_np = of_parse_phandle(vfio_dev->dev->of_node, "memory-region", i);
 		if (!mem_np) {
@@ -4647,21 +4653,75 @@ static int kiumd_vfio_ctx_init(char __user *arg, struct file *fp)
 		of_node_put(mem_np);
 		kiumd_ctx->res_mem_area[i].size = rmem->size;
 		kiumd_ctx->res_mem_area[i].base = rmem->base;
-		kiusr.mem_info[i].size = rmem->size;
-		kiusr.mem_info[i].offset = i << KIUMD_INDEX_OFFSET;
-		pr_debug("%s:base:%llx size:%llx offset:%llx\n", __func__,
-			 kiumd_ctx->res_mem_area[i].base,
-			 kiusr.mem_info[i].size, kiusr.mem_info[i].offset);
 	}
 
 	if (copy_to_user(arg, &kiusr, sizeof(kiusr))) {
-		kfree(kiumd_ctx->res_mem_area);
-		kiumd_ctx->res_mem_area = NULL;
 		pr_err("%s:error in copying vfio ctx data for reserved memory\n",
 		       __func__);
 		return -EFAULT;
 	}
+
 	trace_kiumd_vfio_ctx_init_end(kiusr.vfio_fd);
+	return 0;
+}
+
+/**
+ * @Brief: This function facilitates to
+ * copy the reserved region information saved
+ * in struct kiumd_ctx to user space.
+ *
+ * Parameters:
+ * @arg: User space argument ptr
+ * @fp: file ptr for device context
+ *
+ * return value is errno in failure cases
+ * or 0 in case of success
+ */
+static int kiumd_vfio_ctx_get_data(char __user *arg, struct file *fp)
+{
+	struct kiumd_dev_mem_info kiusr;
+	struct kiumd_ctx *kiumd_ctx;
+	struct kiumd_mem_info *mem_info;
+
+	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
+
+	if (copy_from_user(&kiusr, arg, sizeof(kiusr))) {
+		pr_err("%s:%d invalid args from user\n", __func__, __LINE__);
+		return -EINVAL;
+	}
+
+	if (!kiusr.num_regions ||
+			kiusr.num_regions != kiumd_ctx->num_reserved_regions)
+		return -EINVAL;
+
+	if (!kiusr.mem_info) {
+		pr_err("%s: Invalid kiusr.mem_info pointer\n", __func__);
+		return -EINVAL;
+	}
+
+	mem_info = kcalloc(kiumd_ctx->num_reserved_regions,
+			sizeof(struct kiumd_mem_info), GFP_KERNEL);
+	if (!mem_info) {
+		pr_err("%s:%d fail to allocate mem_info\n", __func__, __LINE__);
+		return -ENOMEM;
+	}
+
+	for (u64 i = 0; i < kiusr.num_regions; i++) {
+		mem_info[i].size = kiumd_ctx->res_mem_area[i].size;
+		mem_info[i].offset = i << KIUMD_INDEX_OFFSET;
+		pr_debug("%s:base:%llx size:%llx offset:%llx\n", __func__,
+			 kiumd_ctx->res_mem_area[i].base,
+			 mem_info[i].size, mem_info[i].offset);
+	}
+
+	if (copy_to_user(kiusr.mem_info, mem_info,
+				kiumd_ctx->num_reserved_regions * sizeof(struct kiumd_mem_info))) {
+		kfree(mem_info);
+		pr_err("%s:error in copying vfio ctx data for reserved memory\n",
+		       __func__);
+		return -EFAULT;
+	}
+	kfree(mem_info);
 	return 0;
 }
 
@@ -4735,6 +4795,9 @@ static long kiumd_ioctl(struct file *file, unsigned int cmd,
 		break;
 	case KIUMD_VFIO_CTX_INIT:
 		err = kiumd_vfio_ctx_init(argp, file);
+		break;
+	case KIUMD_VFIO_CTX_GET_DATA:
+		err = kiumd_vfio_ctx_get_data(argp, file);
 		break;
 	case KIUMD_SMMU_MANAGED_IOVA_MAP:
 		err = kiumd_dmabuf_managed_iova_map(argp, file);
