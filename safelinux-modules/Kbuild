@@ -1,5 +1,7 @@
 LINUXINCLUDE += -I$(SAFELINUX_MODULES_ROOT)/include
 
+ccflags-y += -Werror
+
 ifeq (y,$(native_build))
 KBUILD_EXTRA_SYMBOLS +=$(HDR_INSTAL_PATH)/../lib/security-modules-symbol/Module.symvers
 endif
