@@ -27,6 +27,9 @@ arm-smmu-qcom-fusa-objs := drivers/arm-smmu-qcom-fusa.o
 obj-m += iommu_iova_map.o
 iommu_iova_map-objs := drivers/iommu_iova_map.o
 
+obj-m += qcom_vdev.o
+qcom_vdev-objs := drivers/qcom_vdev.o
+
 obj-m += vfio_iommu_qcom.o
 vfio_iommu_qcom-objs := drivers/vfio_iommu_qcom.o
 
