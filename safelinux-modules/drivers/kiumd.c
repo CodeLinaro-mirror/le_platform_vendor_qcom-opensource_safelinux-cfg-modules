@@ -286,6 +286,7 @@ struct pgtable_map {
 struct kiumd_ctx {
 	int id;
 	u32 pt_id;
+	bool is_initialized;
 	struct hlist_node smmu_map_data;
 	struct hlist_node pgtable_map;
 	unsigned int hyp_idx;
@@ -301,11 +302,11 @@ struct kiumd_ctx {
 	struct mutex hyp_lock;
 	unsigned long pt_start_iova;
 	unsigned long pt_end_iova;
+	DECLARE_HASHTABLE(page_table, SMMU_MAPTABLE_SIZE);
 	DECLARE_HASHTABLE(kgsl_page_table, SMMU_MAPTABLE_SIZE);
 	struct kiumd_kgsl_context *kgsl_context;
 	unsigned long max_shift;
 	struct io_pgtable *pgtable;
-	struct pgtable_map *pgtable_ctx;
 };
 
 struct iommu_addr_entry {
@@ -698,13 +699,9 @@ int free_allocated_iova(struct kiumd_ctx *kiumd_ctx, unsigned long iova, unsigne
 {
 	struct pgtable_map *pgtble_ctx;
 
-	if (is_process)
-		pgtble_ctx = kiumd_get_pgtable_entry(kiumd_ctx, idx, is_process);
-	else
-		pgtble_ctx = kiumd_ctx->pgtable_ctx;
-
+	pgtble_ctx = kiumd_get_pgtable_entry(kiumd_ctx, idx, is_process);
 	if (!pgtble_ctx) {
-		pr_err("%s:invalid pgtable context for iova: %lx, id: %d, is_process: %d\n", __func__, iova, idx, is_process);
+		pr_err("%s:invalid id for hash table: id: %d\n", __func__, idx);
 		return -EINVAL;
 	}
 
@@ -1996,21 +1993,37 @@ int set_allocated_iova(struct vfio_device *vfio_dev, unsigned long iova)
 
 static int init_and_allocate_iova(struct vfio_device *vfio_dev, struct kiumd_ctx *kiumd_ctx, unsigned long idx, unsigned int size, unsigned long max_shift)
 {
+	struct pgtable_map *pgtable_ctx;
 	unsigned long iova;
 	int ret;
 
-	if (!kiumd_ctx->pgtable_ctx) {
-		kiumd_ctx->pgtable_ctx = kzalloc(sizeof(struct pgtable_map), GFP_KERNEL);
-		if (!kiumd_ctx->pgtable_ctx) {
+	if (!kiumd_ctx->is_initialized) {
+
+		pgtable_ctx = kzalloc(sizeof(*pgtable_ctx), GFP_KERNEL);
+		if (!pgtable_ctx) {
 			pr_err("%s: Failed to allocate pagetable_map\n", __func__);
 			return -ENOMEM;
 		}
-		kiumd_ctx->pgtable_ctx->rbtree = RB_ROOT;
-		kiumd_ctx->pgtable_ctx->start_iova = kiumd_ctx->pt_start_iova;
-		kiumd_ctx->pgtable_ctx->end_iova = kiumd_ctx->pt_end_iova;
+
+		pgtable_ctx->rbtree = RB_ROOT;
+		pgtable_ctx->idx = idx;
+		pgtable_ctx->start_iova = kiumd_ctx->pt_start_iova;
+		pgtable_ctx->end_iova = kiumd_ctx->pt_end_iova;
+
+		spin_lock(&kiumd_ctx->pt_lock);
+		hash_add(kiumd_ctx->page_table, &pgtable_ctx->node, idx);
+		spin_unlock(&kiumd_ctx->pt_lock);
+
+		kiumd_ctx->is_initialized = true;
+	} else {
+		pgtable_ctx = kiumd_get_pgtable_entry(kiumd_ctx, idx, false);
+		if (!pgtable_ctx) {
+			pr_err("%s: Failed to find pgtable_map for device: %d", __func__, idx);
+			return -EINVAL;
+		}
 	}
 
-	iova = alloc_iova_range(vfio_dev, kiumd_ctx->pgtable_ctx, size, max_shift);
+	iova = alloc_iova_range(vfio_dev, pgtable_ctx, size, max_shift);
 	if (!iova) {
 		pr_err("%s: Failed to allocate iova.\n", __func__);
 		return -ENOMEM;
@@ -2061,6 +2074,7 @@ int kiumd_dmabuf_managed_iova_map(char __user *arg, struct file *fp)
 	struct smmu_map_data *smap;
 	struct kiumd_user kiusr;
 	unsigned long max_shift;
+	unsigned long hash_id;
 	struct sg_table *sgt;
 
 	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user)))
@@ -2081,6 +2095,12 @@ int kiumd_dmabuf_managed_iova_map(char __user *arg, struct file *fp)
 	vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
 	if (!vfio_dev) {
 		pr_err("%s: invalid vfio device fd\n", __func__);
+		return -EINVAL;
+	}
+
+	hash_id = get_hash_key(kiusr.vfio_fd);
+	if (!hash_id) {
+		pr_err("%s:invalid domain\n", __func__);
 		return -EINVAL;
 	}
 
@@ -2216,6 +2236,12 @@ int kiumd_dmabuf_managed_iova_unmap(char __user *arg, struct file *fp)
 	kiumd_dmabuf = (struct dma_buf *)smap->dmabuf_ptr;
 	if (!kiumd_dmabuf) {
 		pr_err("%s:kiumd_dmabuf is NULL\n", __func__);
+		return -EINVAL;
+	}
+
+	hash_id = get_hash_key(kiusr.vfio_fd);
+	if (hash_id < 0) {
+		pr_err("%s:invalid domain\n", __func__);
 		return -EINVAL;
 	}
 
@@ -4385,6 +4411,7 @@ static int kiumd_open(struct inode *inode, struct file *filp)
 	kictx->id = 0;
 	kictx->pt_start_iova = KIUMD_32BIT_START_IOVA;
 	kictx->pt_end_iova = KIUMD_32BIT_END_IOVA;
+	kictx->is_initialized = false;
 	kictx->hyp_idx = 0;
 	kictx->kgsl_context->kgsl_start_iova = KGSL_PER_PROCESS_PT_BASE_IOVA;
 	kictx->kgsl_context->kgsl_end_iova = KGSL_PER_PROCESS_PT_END_IOVA;
