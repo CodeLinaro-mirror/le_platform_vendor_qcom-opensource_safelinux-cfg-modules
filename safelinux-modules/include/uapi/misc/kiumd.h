@@ -106,8 +106,6 @@ struct kiumd_user {
 	__u64 ttbr0;
 	__u16 asid;
 	__u32 flags;
-	int is_fix_map;
-	__u32 pm_state;
 };
 
 struct kiumd_smmu_mmio_map {
