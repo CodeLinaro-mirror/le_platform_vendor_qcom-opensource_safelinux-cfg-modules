@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Copyright (C) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
+/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 #include <linux/arm-smccc.h>
 #include <linux/cdev.h>
@@ -31,8 +31,11 @@
 		.cmd_ids = ARG_TO_ARRAY(__u32, __VA_ARGS__),        \
 	}
 
-#define DT_LABEL_LENGTH 32
-#define MAX_VM_SIZE     128
+#define DT_LABEL_LENGTH      32
+#define MAX_VM_SIZE          128
+#define SRC_VMS_LIST_INDEX   2
+#define DEST_VMS_LIST_INDEX  4
+#define DEST_VMS_SIZE_INDEX  5
 
 struct scm_user_res {
 	u64 result[MAX_QCOM_SCM_RETS];
@@ -75,9 +78,10 @@ static const struct svc_cmd_list sip_tbl[] = {
 					 QCOM_SCM_PIL_PAS_SHUTDOWN),
 
 	[QCOM_SCM_SVC_INFO] = SVC_CMD_GRP(QCOM_SCM_SVC_INFO,
-					  3,
+					  4,
 					  QCOM_SCM_INFO_IS_CALL_AVAIL,
 					  QCOM_SCM_INFO_GET_FEAT_VERSION_CMD,
+					  QCOM_SCM_GET_SECURE_STATE,
 					  QCOM_SCM_INFO_BW_PROF_ID),
 
 	[QCOM_SCM_SVC_MP] = SVC_CMD_GRP(QCOM_SCM_SVC_MP,
@@ -103,6 +107,11 @@ static const struct svc_cmd_list sip_tbl[] = {
 	[QCOM_SCM_SVC_CAMERA] = SVC_CMD_GRP(QCOM_SCM_SVC_CAMERA,
 					    1,
 					    QCOM_SCM_CAMERA_UPDATE_CAMNOC_QOS),
+
+	[QCOM_SCM_SVC_GPU] = SVC_CMD_GRP(QCOM_SCM_SVC_GPU,
+					 2,
+					 QCOM_SCM_SVC_GPU0_INIT_REGS,
+					 QCOM_SCM_SVC_GPU1_INIT_REGS),
 };
 
 /*
@@ -167,9 +176,9 @@ static int qcom_scm_intf_assign_mem(struct scm_dev_data *dev_data,
 	char name[DT_LABEL_LENGTH];
 	int ret = 0;
 
-	void __user *destVM_arr = (void __user *)scm_data.args_buffer[3];
-	u64 srcVM = BIT(scm_data.args_buffer[2]);
-	u64 destVM_cnt = scm_data.args_buffer[4];
+	void __user *destVM_arr = (void __user *)scm_data.args_buffer[DEST_VMS_LIST_INDEX];
+	u64 srcVM = BIT(scm_data.args_buffer[SRC_VMS_LIST_INDEX]);
+	u64 destVM_cnt = scm_data.args_buffer[DEST_VMS_SIZE_INDEX];
 
 	if (!destVM_cnt || destVM_cnt > MAX_VM_SIZE)
 		return -EFAULT;
@@ -315,6 +324,7 @@ static bool validate_svc_cmd(unsigned int svc_id, unsigned int cmd_id)
 	case QCOM_SCM_SVC_SAFETY:
 	case QCOM_SCM_SVC_LMH:
 	case QCOM_SCM_SVC_CAMERA:
+	case QCOM_SCM_SVC_GPU:
 
 		svc_cmd_tmp = sip_tbl[svc_id];
 		break;
@@ -438,6 +448,13 @@ static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 							       scm_data.args_buffer[2],
 							       scm_data.args_buffer[3]);
 			break;
+
+		case QCOM_SCM_GET_SECURE_STATE:
+				scm_data.ret = qcom_scm_get_secure_state(&res1);
+				res.result[0] = res1;
+
+			break;
+
 		}
 		break;
 
@@ -496,6 +513,10 @@ static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			break;
 		}
 		}
+		break;
+
+	case QCOM_SCM_SVC_GPU:
+		scm_data.ret = qcom_scm_multi_kgsl_init_regs(scm_data.args_buffer[0], scm_data.cmd);
 		break;
 	}
 

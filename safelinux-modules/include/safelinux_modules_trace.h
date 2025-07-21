@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * Copyright (c) 2024-2025 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #undef TRACE_SYSTEM
@@ -239,8 +239,8 @@ TRACE_EVENT(kiumd_dmabuf_custom_iova_init_end,
 
 TRACE_EVENT(kiumd_dmabuf_vfio_map_start,
 
-	TP_PROTO(char * device_name, int vfio_fd, int dma_buf_fd, int dma_attr, int dma_direction, int ptselect,
-		 int is_iova_zero, u64 size, void *kiumd_ctx),
+	TP_PROTO(const char *device_name, int vfio_fd, int dma_buf_fd, int dma_attr,
+		int dma_direction, int ptselect, int is_iova_zero, u64 size, void *kiumd_ctx),
 
 	TP_ARGS(device_name, vfio_fd, dma_buf_fd, dma_attr, dma_direction, ptselect, is_iova_zero, size, kiumd_ctx),
 

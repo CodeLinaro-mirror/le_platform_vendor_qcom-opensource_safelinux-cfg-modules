@@ -1,5 +1,7 @@
 LINUXINCLUDE += -I$(SAFELINUX_MODULES_ROOT)/include
 
+ccflags-y += -Werror
+
 ifeq (y,$(native_build))
 KBUILD_EXTRA_SYMBOLS +=$(HDR_INSTAL_PATH)/../lib/security-modules-symbol/Module.symvers
 endif
@@ -25,6 +27,9 @@ arm-smmu-qcom-fusa-objs := drivers/arm-smmu-qcom-fusa.o
 obj-m += iommu_iova_map.o
 iommu_iova_map-objs := drivers/iommu_iova_map.o
 
+obj-m += qcom_vdev.o
+qcom_vdev-objs := drivers/qcom_vdev.o
+
 obj-m += vfio_iommu_qcom.o
 vfio_iommu_qcom-objs := drivers/vfio_iommu_qcom.o
 
@@ -45,6 +50,9 @@ kiumd_kgsl-objs := drivers/kiumd_kgsl.o
 
 obj-m += profiler.o
 profiler-objs := drivers/profiler.o
+
+obj-m += qcom_l3_cache_config.o
+qcom_l3_cache_config-objs := drivers/qcom_l3_cache_config.o
 
 obj-m += qcom_ethqos_filter.o
 qcom_ethqos_filter-objs := drivers/qcom_ethqos_filter.o

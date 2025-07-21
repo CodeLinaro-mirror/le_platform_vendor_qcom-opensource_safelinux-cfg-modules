@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note
- * Copyright (C) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 #include <linux/types.h>
 #include <linux/version.h>
@@ -7,6 +7,7 @@
 #define SCM_HAND_SHAKE_IOCTL       _IOWR('R', 10, struct scm_hand_shake)
 
 #define QCOM_SCM_INFO_GET_FEAT_VERSION_CMD      0x03
+#define QCOM_SCM_GET_SECURE_STATE               0x04
 #define QCOM_SCM_INFO_BW_PROF_ID                0x07
 
 #define QCOM_SCM_MP_SHM_BRIDGE_ENABLE		0x1c
@@ -29,6 +30,10 @@
 #define QCOM_SCM_CAMERA_UPDATE_CAMNOC_QOS       0x0A
 
 #define TZ_SVC_BW_PROF_ID			0x07
+
+#define QCOM_SCM_SVC_GPU			0x28
+#define QCOM_SCM_SVC_GPU0_INIT_REGS		0x1
+#define QCOM_SCM_SVC_GPU1_INIT_REGS		0x2
 
 #define MAX_QCOM_SCM_RESULT                     3
 #define MAX_QCOM_SCM_IN                         10
