@@ -105,14 +105,16 @@ struct qcom_l3cc_wg_config {
  * struct qcom_l3cc_cl_qos_config - L3 cache QOS settings for scheme id
  * @cookie: Cookie for service request
  * @cl: Cluster for configuration
- * @qos: Qos priority for the schemeid
  * @op: Operation type
+ * @rvalue: register with qos value
+ * @mask: mask for qos register
  */
 struct qcom_l3cc_cl_qos_config {
 	__u32 cookie;
 	cluster_idx cl;
-	__u32 qos;
 	op_type op;
+	__u64 rvalue;
+	__u32 mask;
 };
 
 /**
