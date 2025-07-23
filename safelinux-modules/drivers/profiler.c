@@ -20,11 +20,12 @@
 #include <linux/mm.h>
 #include <linux/of_platform.h>
 #include <uapi/misc/scm_user_intf.h>
+#include <linux/firmware/qcom/qcom_tzmem.h>
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/delay.h>
 #include <linux/version.h>
-#include <linux/qtee_shmbridge.h>
+
 #include "profiler.h"
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 33))
 #include <linux/firmware/qcom/qcom_scm_addon.h>
@@ -43,6 +44,7 @@ struct profiler_control {
 	struct device *pdev;
 	struct cdev cdev;
 	struct mutex lock;
+	struct qcom_tzmem_pool *tzmem_pool;
 	void __iomem *mmnoc_base;
 	void __iomem *llcc_mmap_base[LLCC_CHANNELS];
 	void __iomem *gemnoc_mmap_base[GEMNOC_CHANNELS_NUM];
@@ -68,7 +70,6 @@ static int bw_profiling_command(const void *req)
 	uint32_t qseos_cmd_id = 0;
 	struct tz_bw_svc_resp *rsp = NULL;
 	size_t req_size = 0, rsp_size = 0;
-	struct qtee_shm bw_shm = {0};
 
 	if (!req) {
 		pr_err("Invalid request buffer pointer\n");
@@ -84,23 +85,21 @@ static int bw_profiling_command(const void *req)
 
 	qseos_cmd_id = *(uint32_t *)req;
 
-	ret = qtee_shmbridge_allocate_shm(PAGE_ALIGN(req_size + rsp_size), &bw_shm);
-	if (ret) {
-		ret = -ENOMEM;
-		pr_err("shmbridge alloc failed for in msg in release\n");
-		goto out;
-	}
+	void *req_ptr __free(qcom_tzmem) = qcom_tzmem_alloc(profiler->tzmem_pool,
+							PAGE_ALIGN(req_size + rsp_size),
+							GFP_KERNEL);
+	if (!req_ptr)
+		return -ENOMEM;
 
-	memcpy(bw_shm.vaddr, req, req_size);
-	qtee_shmbridge_flush_shm_buf(&bw_shm);
+	memcpy(req_ptr, req, req_size);
 
 	switch (qseos_cmd_id) {
 	case TZ_BW_SVC_START_ID:
 	case TZ_BW_SVC_GET_ID:
 	case TZ_BW_SVC_STOP_ID:
 		/* Send the command to TZ */
-		ret = qcom_scm_ddrbw_profiler(bw_shm.paddr, req_size,
-				bw_shm.paddr + req_size, rsp_size);
+		ret = qcom_scm_ddrbw_profiler(qcom_tzmem_to_phys(req_ptr), req_size,
+				qcom_tzmem_to_phys(req_ptr) + req_size, rsp_size);
 		break;
 	default:
 		pr_err("cmd_id %d is not supported.\n",
@@ -108,10 +107,8 @@ static int bw_profiling_command(const void *req)
 		ret = -EINVAL;
 	} /*end of switch (qsee_cmd_id)  */
 
-	qtee_shmbridge_inv_shm_buf(&bw_shm);
-	memcpy(rsp, (char *)bw_shm.vaddr + req_size, rsp_size);
-out:
-	qtee_shmbridge_free_shm(&bw_shm);
+	memcpy(rsp, (char *)req_ptr + req_size, rsp_size);
+
 	/* Verify cmd id and Check that request succeeded.*/
 	if ((rsp->status != E_BW_SUCCESS) ||
 		(qseos_cmd_id != rsp->cmd_id)) {
@@ -135,40 +132,34 @@ static int bw_profiling_start(struct tz_bw_svc_buf *bwbuf)
 static int bw_profiling_get(void __user *argp, struct tz_bw_svc_buf *bwbuf)
 {
 	int ret = 0;
-	struct qtee_shm buf_shm = {0};
 	const int bufsize = sizeof(struct profiler_bw_cntrs_req_m)
 							- sizeof(uint32_t);
 	struct profiler_bw_cntrs_req_m cnt_buf;
 
 	memset(&cnt_buf, 0, sizeof(cnt_buf));
-	/* Allocate memory for get buffer */
-	ret = qtee_shmbridge_allocate_shm(PAGE_ALIGN(bufsize), &buf_shm);
-	if (ret) {
-		ret = -ENOMEM;
-		pr_err("shmbridge alloc buf failed\n");
-		return ret;
-	}
+
+	void *tzmem_disabled_ptr __free(qcom_tzmem) = qcom_tzmem_alloc(profiler->tzmem_pool,
+							bufsize,
+							GFP_KERNEL);
+	if (!tzmem_disabled_ptr)
+		return -ENOMEM;
 
 	/* Populate request data */
 	bwbuf->bwreq.get_req.cmd_id = TZ_BW_SVC_GET_ID;
-	bwbuf->bwreq.get_req.buf_ptr = buf_shm.paddr;
+	bwbuf->bwreq.get_req.buf_ptr = qcom_tzmem_to_phys(tzmem_disabled_ptr);
 	bwbuf->bwreq.get_req.buf_size = bufsize;
 	bwbuf->req_size = sizeof(struct tz_bw_svc_get_req);
-	qtee_shmbridge_flush_shm_buf(&buf_shm);
+
 	ret = bw_profiling_command(bwbuf);
 	if (ret) {
 		pr_err("bw_profiling_command failed\n");
-		goto out;
+		return ret;
 	}
 
-	qtee_shmbridge_inv_shm_buf(&buf_shm);
-	memcpy(&cnt_buf, buf_shm.vaddr, bufsize);
+	memcpy(&cnt_buf, tzmem_disabled_ptr, bufsize);
 	if (copy_to_user(argp, &cnt_buf, sizeof(struct profiler_bw_cntrs_req_m)))
 		pr_err("copy_to_user failed\n");
 
-out:
-	/* Free memory for response */
-	qtee_shmbridge_free_shm(&buf_shm);
 	return ret;
 }
 
@@ -176,32 +167,28 @@ static int bw_profiling_per_ip_get(void __user *argp, struct tz_bw_svc_buf *bwbu
 {
 	int ret = 0;
 	int ch, gc;
-	struct qtee_shm buf_shm = {0};
 	const int bufsize = sizeof(struct profiler_bw_cntrs_req)
 							- sizeof(uint32_t);
 	struct profiler_bw_cntrs_req cnt_buf;
 
-	ret = qtee_shmbridge_allocate_shm(PAGE_ALIGN(bufsize), &buf_shm);
-	if (ret) {
-		ret = -ENOMEM;
-		pr_err("shmbridge alloc buf failed\n");
-		return ret;
-	}
+	void *tzmem_ptr __free(qcom_tzmem) = qcom_tzmem_alloc(profiler->tzmem_pool,
+							      bufsize,
+							      GFP_KERNEL);
+	if (!tzmem_ptr)
+		return -ENOMEM;
 
 	/* Populate request data */
 	bwbuf->bwreq.get_req.cmd_id = TZ_BW_SVC_GET_ID;
-	bwbuf->bwreq.get_req.buf_ptr = buf_shm.paddr;
+	bwbuf->bwreq.get_req.buf_ptr = qcom_tzmem_to_phys(tzmem_ptr);
 	bwbuf->bwreq.get_req.buf_size = bufsize;
 	bwbuf->bwreq.get_req.type = 0;
 	bwbuf->req_size = sizeof(struct tz_bw_svc_get_req);
-	qtee_shmbridge_flush_shm_buf(&buf_shm);
+
 	ret = bw_profiling_command(bwbuf);
 	if (ret) {
 		pr_err("bw_profiling_command failed\n");
-		goto out;
+		return ret;
 	}
-
-	qtee_shmbridge_inv_shm_buf(&buf_shm);
 
 	memset(&cnt_buf, 0, sizeof(cnt_buf));
 
@@ -227,24 +214,20 @@ static int bw_profiling_per_ip_get(void __user *argp, struct tz_bw_svc_buf *bwbu
 
 	/* Populate request data */
 	bwbuf->bwreq.get_req.cmd_id = TZ_BW_SVC_GET_ID;
-	bwbuf->bwreq.get_req.buf_ptr = buf_shm.paddr;
+	bwbuf->bwreq.get_req.buf_ptr = qcom_tzmem_to_phys(tzmem_ptr);
 	bwbuf->bwreq.get_req.buf_size = bufsize;
 	bwbuf->bwreq.get_req.type = 1;
 	bwbuf->req_size = sizeof(struct tz_bw_svc_get_req);
-	qtee_shmbridge_flush_shm_buf(&buf_shm);
+
 	ret = bw_profiling_command(bwbuf);
 	if (ret) {
 		pr_err("bw_profiling_command failed\n");
-		goto out;
+		return ret;
 	}
 
-	qtee_shmbridge_inv_shm_buf(&buf_shm);
 	if (copy_to_user(argp, &cnt_buf, sizeof(struct profiler_bw_cntrs_req)))
 		pr_err("copy_to_user failed\n");
 
-out:
-	/* Free memory for response */
-	qtee_shmbridge_free_shm(&buf_shm);
 	return ret;
 }
 
@@ -465,6 +448,8 @@ static int bwprofiler_probe(struct platform_device *pdev)
 	int rc;
 	struct device *class_dev;
 	struct conf_data *desc;
+	struct qcom_tzmem_pool_config pool_config;
+	struct qcom_tzmem_pool *tzmem_pool;
 
 	profiler = devm_kzalloc(&pdev->dev, sizeof(*profiler), GFP_KERNEL);
 
@@ -472,6 +457,18 @@ static int bwprofiler_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	mutex_init(&profiler->lock);
+
+	memset(&pool_config, 0, sizeof(pool_config));
+	pool_config.initial_size = 0;
+	pool_config.policy = QCOM_TZMEM_POLICY_ON_DEMAND;
+	pool_config.max_size = SZ_256K;
+
+	profiler->tzmem_pool = qcom_tzmem_pool_new(&pool_config);
+	if (IS_ERR(profiler->tzmem_pool)) {
+		return dev_err_probe(&pdev->dev, "profiler: Failed to create qcom_tzmem_pool %d\n",
+				PTR_ERR(profiler->tzmem_pool));
+	}
+
 	desc = of_device_get_match_data(&pdev->dev);
 	if (!desc)
 		return dev_err_probe(&pdev->dev, -ENOMEM, "failed to probe chip info\n");
