@@ -204,6 +204,9 @@ static int bw_profiling_per_ip_get(void __user *argp, struct tz_bw_svc_buf *bwbu
 						+ offset_reg_values.cabo_offset[ch*2+1]);
 	}
 
+	if (dev_params.gemnoc_channels > GEMNOC_CHANNELS_NUM)
+		dev_params.gemnoc_channels = GEMNOC_CHANNELS_NUM;
+
 	for (ch = 0; ch < dev_params.gemnoc_channels; ch++) {
 		for (gc = 0; gc < dev_params.num_gemnoc_metrics; gc++) {
 			int index = ch * dev_params.num_gemnoc_metrics + gc;
@@ -226,8 +229,10 @@ static int bw_profiling_per_ip_get(void __user *argp, struct tz_bw_svc_buf *bwbu
 		return ret;
 	}
 
-	if (copy_to_user(argp, &cnt_buf, sizeof(struct profiler_bw_cntrs_req)))
+	if (copy_to_user(argp, &cnt_buf, sizeof(struct profiler_bw_cntrs_req))) {
 		pr_err("copy_to_user failed\n");
+		return -EFAULT;
+	}
 
 	return ret;
 }
