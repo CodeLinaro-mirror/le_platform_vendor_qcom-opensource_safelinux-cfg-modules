@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/*
- * Copyright (c) 2022,2024 Qualcomm Innovation Center, Inc. All rights reserved.
- */
+// // Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 #include <linux/device.h>
 #include <linux/dma-buf.h>
 #include <linux/list.h>
@@ -235,16 +233,16 @@ struct kiumd_reserved_mem_area {
 /**
  * struct kiumd_kgsl_context: to store GPU context
  * @kgsl_pt_id: pagetable id
- * @kgsl_pt_lock: lock for pagetable add/retrieve
  * @kgsl_start_iova: Starting iova for GPU
  * @kgsl_end_iova Ending iova for GPU
+ * @kgsl_hash_lock: lock for pagetable add/retrieve
  */
 
 struct kiumd_kgsl_context {
 	u32 kgsl_pt_id;
-	spinlock_t kgsl_pt_lock;
 	unsigned long kgsl_start_iova;
 	unsigned long kgsl_end_iova;
+	spinlock_t kgsl_hash_lock;
 };
 
 /**
@@ -257,7 +255,7 @@ struct kiumd_kgsl_context {
  * @ttbr0_addr: TTBR0 address for GPU
  * @pgtbl_ops_ptr: Pointer to pagetable operations for GPU
  * @last_allocated_end: Last allocated end address for GPU
- * @is_contiguous: Flag indicating if the iova range is contiguous
+ * @kgsl_rbtree_lock: lock for pagetable add/retrieve
  */
 struct pgtable_map {
 	unsigned long idx;
@@ -270,7 +268,7 @@ struct pgtable_map {
 	unsigned long ttbr0_addr;
 	unsigned long pgtbl_ops_ptr;
 	unsigned long last_allocated_end;
-	bool is_contiguous;
+	spinlock_t kgsl_rbtree_lock;
 };
 
 
@@ -625,7 +623,7 @@ struct pgtable_map *kiumd_get_pgtable_entry(struct kiumd_ctx *kiumd_ctx, unsigne
 
 	if (is_process) {
 		kgsl_context = kiumd_ctx->kgsl_context;
-		spin_lock(&kgsl_context->kgsl_pt_lock);
+		spin_lock(&kgsl_context->kgsl_hash_lock);
 		hash_for_each_possible(kiumd_ctx->kgsl_page_table, pgtble_ctx, node, idx) {
 			if (pgtble_ctx->idx == idx) {
 				found = true;
@@ -633,7 +631,7 @@ struct pgtable_map *kiumd_get_pgtable_entry(struct kiumd_ctx *kiumd_ctx, unsigne
 			}
 		}
 
-		spin_unlock(&kgsl_context->kgsl_pt_lock);
+		spin_unlock(&kgsl_context->kgsl_hash_lock);
 		if (!found) {
 			pr_err("%s:%d id not found in hash table\n", __func__, __LINE__);
 			return NULL;
@@ -1336,17 +1334,17 @@ int kiumd_perprocess_pt_alloc(char __user *arg, struct file *fp)
 		return -EINVAL;
 	}
 
+	spin_lock_init(&pgtbl_ctx->kgsl_rbtree_lock);
 	pgtbl_ctx->rbtree = RB_ROOT;
 	pgtbl_ctx->ttbr0_addr = kiusr.ttbr0;
 	pgtbl_ctx->start_iova = kiumd_ctx->kgsl_context->kgsl_start_iova;
 	pgtbl_ctx->end_iova = kiumd_ctx->kgsl_context->kgsl_end_iova;
 	pgtbl_ctx->pgtbl_ops_ptr = kiusr.pgtbl_ops_ptr;
-	pgtbl_ctx->last_allocated_end = 0;
-	pgtbl_ctx->is_contiguous = true;
-	spin_lock(&kgsl_context->kgsl_pt_lock);
+	pgtbl_ctx->last_allocated_end = pgtbl_ctx->start_iova;
+	spin_lock(&kgsl_context->kgsl_hash_lock);
 	pgtbl_ctx->idx = kgsl_context->kgsl_pt_id++;
 	hash_add(kiumd_ctx->kgsl_page_table, &pgtbl_ctx->node, pgtbl_ctx->idx);
-	spin_unlock(&kgsl_context->kgsl_pt_lock);
+	spin_unlock(&kgsl_context->kgsl_hash_lock);
 
 	kiusr.pt_id = pgtbl_ctx->idx;
 
@@ -1698,18 +1696,29 @@ int kiumd_dmabuf_custom_iova_init(char __user *arg, struct file *fp)
 *
 * Returns nothing
 */
-int clear_map_iova(struct kiumd_ctx *kiumd_ctx, u64 iova, u64 size, int ptselect, unsigned int idx)
+
+int clear_map_iova(struct kiumd_ctx *kiumd_ctx, u64 iova, u64 size,
+                   int ptselect, unsigned int idx)
 {
-	u64 bit;
+	struct pgtable_map *pgtble_ctx;
 	int ret = 0;
+	u64 bit;
 
 	if (ptselect == KGSL_GLOBAL_PT) {
 		bit = (iova & ~KGSL_GLOBAL_PT_BASE_IOVA) >> PAGE_SHIFT;
 		bitmap_clear(global_map, bit, size >> PAGE_SHIFT);
 	} else if (ptselect == KGSL_PER_PROCESS_PT) {
-		ret = free_allocated_iova(kiumd_ctx, iova, idx, true);
+		pgtble_ctx = kiumd_get_pgtable_entry(kiumd_ctx, idx, true);
+		if (!pgtble_ctx) {
+			pr_err("%s:invalid id for hash table: id: %d\n", __func__, idx);
+			return -EINVAL;
+		}
+
+		spin_lock(&pgtble_ctx->kgsl_rbtree_lock);
+		ret = free_iova_range(pgtble_ctx, iova);
+		spin_unlock(&pgtble_ctx->kgsl_rbtree_lock);
 		if (ret) {
-			pr_err("%s:%d unable to free iova\n", __func__, __LINE__);
+			pr_err("%s: iova: %llx, not found\n", __func__, iova);
 			return ret;
 		}
 	}
@@ -1854,6 +1863,53 @@ bool is_fixed_mapping(struct vfio_device *vfio_dev)
 
 	return false;
 }
+
+/**
+ * find_available_region_in_range - Search for an available IOVA region
+ * @ptable_ctx: Pointer to the page table mapping context
+ * @search_start: Start of the IOVA search range (inclusive)
+ * @search_end: End of the IOVA search range (exclusive)
+ * @size: Size of the region to allocate
+ *
+ * Searches for a contiguous region of I/O virtual address (IOVA) space
+ * of the specified @size within the range [@search_start, @search_end)
+ * that does not overlap with any existing mappings in the red-black tree
+ * rooted at @ptable_ctx->rbtree.
+ *
+ * Return: Starting address of the available region, or 0 if none found.
+ */
+static unsigned long find_available_region_in_range(struct pgtable_map *ptable_ctx,
+							unsigned long search_start,
+							unsigned long search_end,
+							unsigned long size)
+{
+	struct rb_node *node = rb_first(&ptable_ctx->rbtree);
+	unsigned long available_start = search_start;
+	struct iommu_addr_entry *entry;
+
+	while (node) {
+		entry = rb_entry(node, struct iommu_addr_entry, rbnode);
+		if (available_start + size <= entry->base_addr &&
+			available_start + size <= search_end) {
+				return available_start;
+		}
+
+		if (entry->base_addr + entry->size > available_start)
+			available_start = entry->base_addr + entry->size;
+
+		if (available_start >= search_end)
+			break;
+		node = rb_next(node);
+	}
+
+	// Final gap check after last node
+	if (available_start + size <= search_end)
+		return available_start;
+
+	return 0; // No available region found
+}
+
+
 /**
  * alloc_iova_range_contiguous - Allocate a contiguous IOVA range
  * @ptable_ctx: Pointer to the pagetable context
@@ -1872,74 +1928,40 @@ bool is_fixed_mapping(struct vfio_device *vfio_dev)
 
 static unsigned long alloc_iova_range_contiguous(struct pgtable_map *ptable_ctx, unsigned long size)
 {
-	struct iommu_addr_entry *new_entry, *entry;
-	unsigned long available_start;
-	bool found_hole;
+	struct iommu_addr_entry *new_entry = NULL;
+	unsigned long available_start = 0;
+	unsigned long last_allocated_end;
 
-	struct rb_node *node = rb_first(&ptable_ctx->rbtree);
-	unsigned long last_allocated_end = ptable_ctx->last_allocated_end;
+	spin_lock(&ptable_ctx->kgsl_rbtree_lock);
+	last_allocated_end = ptable_ctx->last_allocated_end;
 
-	if (last_allocated_end == 0)
-		last_allocated_end = ptable_ctx->start_iova;
-
-	// Try to allocate from the end of the last allocated block
-	if ((last_allocated_end + size <= ptable_ctx->end_iova) && ptable_ctx->is_contiguous) {
-		new_entry = alloc_iommu_addr_entry(last_allocated_end, size);
-
-		if (!new_entry) {
-			pr_err("%s:%d failed to create new entry for iova: %lx with size: %lu\n", __func__, __LINE__, last_allocated_end, size);
-			return 0;
-		}
-
-
-		insert_iova(ptable_ctx, new_entry);
-		ptable_ctx->last_allocated_end = last_allocated_end + size;
-		return last_allocated_end;
+	// First pass: search from last_allocated_end to end_iova
+	available_start = find_available_region_in_range(ptable_ctx,
+							last_allocated_end,
+							ptable_ctx->end_iova,
+							size);
+	// Second pass: wrap around if needed
+	if (!available_start) {
+		available_start = find_available_region_in_range(ptable_ctx,
+							ptable_ctx->start_iova,
+							last_allocated_end,
+							size);
 	}
 
-	// Reset alloacted end
-	if (last_allocated_end + size > ptable_ctx->end_iova) {
-		ptable_ctx->last_allocated_end = ptable_ctx->start_iova;
-		ptable_ctx->is_contiguous = false;
-		last_allocated_end = ptable_ctx->start_iova;
-	}
+	spin_unlock(&ptable_ctx->kgsl_rbtree_lock);
+	// If no region found, return failure
+	if (!available_start)
+		return 0;
 
-	available_start = last_allocated_end;
-	found_hole = false;
+	new_entry = alloc_iommu_addr_entry(available_start, size);
+	if (!new_entry)
+		return 0;
 
-	// If no contiguous space is available, systematically search for holes
-	while (node) {
-		entry = rb_entry(node, struct iommu_addr_entry, rbnode);
-
-		if ((available_start + size <= entry->base_addr) && (available_start >= ptable_ctx->start_iova)) {
-			if (available_start >= last_allocated_end) {
-				found_hole = true;
-				break;
-			}
-		}
-
-		available_start = entry->base_addr + entry->size;
-		node = rb_next(node);
-	}
-
-	if (!found_hole && (available_start + size <= ptable_ctx->end_iova) && (available_start >= ptable_ctx->start_iova))
-		found_hole = true;
-
-	// Finally, check for space after the last allocated block
-	if (found_hole) {
-		new_entry = alloc_iommu_addr_entry(available_start, size);
-
-		if (!new_entry) {
-			pr_err("%s:%d failed to create entry for addr: %lx with size: %lu\n", __func__, __LINE__, last_allocated_end, size);
-			return 0;
-		}
-
-		insert_iova(ptable_ctx, new_entry);
-		ptable_ctx->last_allocated_end = available_start + size;
-		return available_start;
-	}
-
-	return 0; // No suitable IOVA found
+	spin_lock(&ptable_ctx->kgsl_rbtree_lock);
+	insert_iova(ptable_ctx, new_entry);
+	ptable_ctx->last_allocated_end = available_start + size;
+	spin_unlock(&ptable_ctx->kgsl_rbtree_lock);
+	return available_start;
 }
 
 /**
@@ -4475,6 +4497,8 @@ static int kiumd_open(struct inode *inode, struct file *filp)
 	hash_init(kictx->smmu_table);
 	hash_init(kictx->hyp_table);
 	spin_lock_init(&kictx->smmu_lock);
+	spin_lock_init(&kictx->kgsl_context->kgsl_hash_lock);
+	spin_lock_init(&kictx->pt_lock);
 	xa_init(&kictx->kiumd_xa);
 	mutex_init(&kictx->kiumd_xa_mutex);
 	mutex_init(&kictx->hyp_lock);
