@@ -359,9 +359,9 @@ static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 #if (LINUX_VERSION_CODE == KERNEL_VERSION(5, 14, 0))
 	struct platform_device *scm_pdev = dev_data->scm_pdev;
 	struct qcom_scm_desc desc;
-	struct qcom_scm_res res;
+	struct qcom_scm_res res = {0};
 #else
-	struct scm_user_res res;
+	struct scm_user_res res = {0};
 	u64 res1 = 0;
 #endif
 
@@ -548,7 +548,7 @@ static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		dev_err(dev_data->dev, "scm ioctl failed for svc_id : %u and cmd_id : %u with ret : %d\n",
 			scm_data.svc, scm_data.cmd, scm_data.ret);
 
-        return ret;
+	return ret;
 }
 
 static const struct file_operations qcom_scm_fops = {
@@ -563,7 +563,7 @@ static int qcom_scm_intf_probe(struct platform_device *pdev)
 	int ret = 0;
 
 	if (!qcom_scm_is_available())
-		dev_err_probe(dev_data->dev, -EPROBE_DEFER, "qcom_scm is not up!\n");
+		dev_err_probe(dev, -EPROBE_DEFER, "qcom_scm is not up!\n");
 
 	dev_data = devm_kzalloc(dev, sizeof(struct scm_dev_data), GFP_KERNEL);
 	if (!dev_data)
