@@ -35,6 +35,8 @@
 #include <linux/platform_device.h>
 #include <linux/string.h>
 #include <linux/version.h>
+#include <linux/pm_runtime.h>
+
 #define CREATE_TRACE_POINTS
 #include "safelinux_modules_trace.h"
 
@@ -1587,16 +1589,60 @@ int kiumd_perprocess_pgtble_free(char __user *arg, struct file *fp)
 }
 
 /**
-* @Brief: This function is to map the IOVAs in a predefined address range. The
-* IOVA address range should be specified in the device tree using the attribute
-* qcom,iommu-dma-addr-pool The function is called via IOCTL
-* interface and input is provided via struct kiumd_user from the user space.
-*
-* Parameters:
-* @arg: user space argument pointer
-*
-* Returns  0 upon success and error codes on failure
-*/
+ * kiumd_manage_runtime_pm - Handle runtime PM for a VFIO device
+ * @arg: User pointer to struct kiumd_user with VFIO fd and PM state
+ *
+ * Copies user data, retrieves the VFIO device, and applies the requested
+ * runtime power state (on/off) ujsing runtime pm framework.
+ *
+ * Return: 0 on success or a negative error code on failure.
+ */
+int kiumd_manage_runtime_pm(char __user *arg)
+{
+	struct vfio_device *vfio_dev;
+	struct kiumd_user kiusr;
+	int ret = 0;
+
+	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user)))
+		return -EFAULT;
+
+	vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
+	if (!vfio_dev) {
+		pr_err("%s:vfio_dev is invalid\n", __func__);
+		return -EINVAL;
+	}
+
+	switch (kiusr.pm_state) {
+
+	case DEV_PWR_OFF:
+		ret = pm_runtime_put_sync(vfio_dev->dev);
+		break;
+	case DEV_PWR_ON:
+		ret = pm_runtime_resume_and_get(vfio_dev->dev);
+		break;
+	default:
+		ret = -EINVAL;
+		dev_warn(vfio_dev->dev, "%s: Unsupported state(%d)\n", __func__, kiusr.pm_state);
+		break;
+	}
+
+	if (ret < 0)
+		dev_err(vfio_dev->dev, "%s: Operation(%d) failed with err=%d\n", __func__, kiusr.pm_state, ret);
+
+	return ret;
+}
+
+/**
+ * @Brief: This function is to map the IOVAs in a predefined address range. The
+ * IOVA address range should be specified in the device tree using the attribute
+ * qcom,iommu-dma-addr-pool The function is called via IOCTL
+ * interface and input is provided via struct kiumd_user from the user space.
+ *
+ * Parameters:
+ * @arg: user space argument pointer
+ *
+ * Returns  0 upon success and error codes on failure
+ */
 int kiumd_dmabuf_custom_iova_init(char __user *arg, struct file *fp)
 {
 	struct kiumd_user kiusr;
@@ -4792,6 +4838,9 @@ static long kiumd_ioctl(struct file *file, unsigned int cmd,
 		break;
 	case KIUMD_SMMU_UNASSIGN_BUF:
 		err = kiumd_dmabuf_unassign_buf(argp, file);
+		break;
+	case KIUMD_MANAGE_RUNTIME_PM:
+		err = kiumd_manage_runtime_pm(argp);
 		break;
 	default:
 		err = -ENOTTY;
