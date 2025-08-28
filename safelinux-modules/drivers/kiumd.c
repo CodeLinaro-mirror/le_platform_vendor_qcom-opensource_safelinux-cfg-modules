@@ -2384,7 +2384,7 @@ int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 	}
 	df = (struct vfio_device_file *)file->private_data;
 	vfio_dev = (struct vfio_device *)df->device;
-	if (vfio_dev == NULL) {
+	if (!vfio_dev || !vfio_dev->dev) {
 		pr_err("%s:vfio_dev is NULL\n", __func__);
 		ret = -EINVAL;
 		goto fail_fput;
@@ -3170,6 +3170,8 @@ static int kiumd_hyp_unassign_sg(struct sg_table *sgt, int *source_vm_list,
 		pr_debug("%s: memory ownership transfer end:%d\n", __func__, ret);
 		sg = sg_next(sg);
 	} while (sg);
+
+	sg = sgt->sgl;
 
 	if (clear_page_private)
 		for_each_sg(sgt->sgl, sg, sgt->nents, i) {
