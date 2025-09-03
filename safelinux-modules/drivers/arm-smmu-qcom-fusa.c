@@ -212,6 +212,8 @@ static irqreturn_t qcom_smmu_tcu_fault(int irq, void *dev)
 	writel(fisr, qsmmu_fusa->tcu_fusa_base);
 
 	desc = irq_data_to_desc(irq_get_irq_data(irq));
+	if (unlikely(!desc))
+		return IRQ_NONE;
 
 	spin_lock_irqsave(&qsmmu_fusa->lock, flags);
 	scnprintf(qsmmu_fusa->hw_fault.fault_source, BUFFER_SZ, "%s",
@@ -243,6 +245,9 @@ static irqreturn_t qcom_smmu_client_fault(int irq, void *dev)
 	u8 severity;
 
 	desc = irq_data_to_desc(irq_get_irq_data(irq));
+	if (unlikely(!desc))
+		return IRQ_NONE;
+
 	client_name = strnstr(desc->action->name, "CLIENT", strlen(desc->action->name));
 	ret = kstrtouint(client_name + strlen("CLIENT"), 0, &client_index);
 
@@ -363,9 +368,11 @@ static int qsmmu_fusa_probe(struct platform_device *pdev)
 	qsmmu_fusa->smmu_name = dev_name(dev);
 
 	tcu_res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!tcu_res)
+		return -ENODEV;
+
 	tcu_sz = resource_size(tcu_res);
 	qsmmu_fusa->tcu_fusa_base = devm_ioremap(dev, tcu_res->start, tcu_sz);
-
 	if (!qsmmu_fusa->tcu_fusa_base) {
 		dev_err(dev, "Can't map SMMU FUSA @%pa\n", &tcu_res->start);
 		return PTR_ERR(qsmmu_fusa->tcu_fusa_base);
