@@ -1,0 +1,1589 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+
+#include <linux/adreno-smmu-priv.h>
+#include <linux/kiumd_common.h>
+#include <linux/pm_runtime.h>
+
+#define CREATE_TRACE_POINTS
+#define TRACE_SAFELINUX_COMMON
+
+#include "safelinux_modules_trace.h"
+#include "vfio.h"
+
+DECLARE_BITMAP(global_map, KGSL_PT_MEM_PAGES);
+DECLARE_BITMAP(perprocess_map, KGSL_PT_MEM_PAGES);
+
+/**
+ * kiumd_get_vfio_device - Provide the vfio device pointer for the given file descriptor
+ *
+ * @fd: File descriptor
+ *
+ * Return: vfio device pointer upon success and NULL on failure
+ */
+struct vfio_device *kiumd_get_vfio_device(int fd)
+{
+	struct vfio_device *vfio_dev = NULL;
+	struct vfio_device_file *df;
+	struct file *file;
+
+	if (fd < 0)
+		return NULL;
+
+	file = fget(fd);
+	if (!file)
+		return NULL;
+
+	if (!vfio_file_is_valid(file))
+		goto close_file;
+
+	df = (struct vfio_device_file *)file->private_data;
+	if (!df)
+		goto close_file;
+
+	vfio_dev = (struct vfio_device *)df->device;
+
+close_file:
+	fput(file);
+	return vfio_dev;
+}
+
+/**
+ * kiumd_iommu_get_dma_domain - This function find the iommu group for given
+ * vfio device and then return default iommu domain for that group
+ *
+ * Parameters:
+ * @dev: vfio device
+ *
+ * Return: struct iommu_domain * upon successand NULL on failure
+ */
+struct iommu_domain *kiumd_iommu_get_dma_domain(struct device *dev)
+{
+	struct kiumd_iommu_group *iommu_group;
+
+	iommu_group = (struct kiumd_iommu_group *) dev->iommu_group;
+	if (!iommu_group) {
+		dev_err(dev, "%s:iommu group is invalid\n", __func__);
+		return NULL;
+	}
+
+	return iommu_group->default_domain;
+}
+
+/**
+ * kiumd_get_dma_cookie - Provide the dma cookie for given vfio device
+ *
+ * Parameters:
+ * @vfio_dev: vfio device
+ *
+ * Return:  struct kiumd_iommu_dma_cookie *(cookie) upon success and NULL on failure
+ */
+struct kiumd_iommu_dma_cookie *kiumd_get_dma_cookie(struct vfio_device *vfio_dev)
+{
+	struct kiumd_iommu_dma_cookie *cookie;
+	struct iommu_domain *domain;
+
+	if (!vfio_dev) {
+		pr_err("%s:vfio dev is NULL\n", __func__);
+		return NULL;
+	}
+
+	if (!vfio_dev->dev) {
+		pr_err("%s:vfio dev is NULL\n", __func__);
+		return NULL;
+	}
+
+	domain = kiumd_iommu_get_dma_domain(vfio_dev->dev);
+	if (!domain) {
+		pr_err("%s:iommu domain is NULL for %s\n", __func__, dev_name(vfio_dev->dev));
+		return NULL;
+	}
+
+	cookie = (struct kiumd_iommu_dma_cookie *)domain->iova_cookie;
+	if (!cookie) {
+		pr_err("%s:cookie not found\n", __func__);
+		return NULL;
+	}
+
+	return cookie;
+}
+
+/**
+ * kiumd_set_dma_cookie - Set dma cookie type and iova to given cookie type and iova
+ *
+ * Parameters:
+ * @*cookie: iommu dma cookie
+ * @type: iommu_dma_cookie_type
+ * @iova: iova address
+ *
+ * Return:  0 upon success and -EINVAL on failure
+ */
+int kiumd_set_dma_cookie(struct kiumd_iommu_dma_cookie *cookie,
+			 enum iommu_dma_cookie_type type,
+			 dma_addr_t iova)
+{
+	if (!cookie) {
+		pr_err("%s:Unable to set cookie\n", __func__);
+		return -EINVAL;
+	}
+
+	cookie->type = type;
+	cookie->msi_iova = iova;
+
+	return 0;
+}
+
+/**
+ * kiumd_set_dma_cookie_unlocked - Calls the api to set dma cookie.
+ * Cookie mutex should not be held while calling the function.
+ *
+ * Parameters:
+ * @*cookie: iommu dma cookie
+ * @type: iommu_dma_cookie_type
+ * @iova: iova address
+ *
+ * Return: 0 upon success and -EINVAL on failure
+ */
+int kiumd_set_dma_cookie_unlocked(struct kiumd_iommu_dma_cookie *cookie,
+				  enum iommu_dma_cookie_type type,
+				  dma_addr_t iova)
+{
+	int ret;
+
+	if (!cookie) {
+		pr_err("%s:Unable to set cookie\n", __func__);
+		return -EINVAL;
+	}
+
+	mutex_lock(&cookie->mutex);
+	ret = kiumd_set_dma_cookie(cookie, type, iova);
+	mutex_unlock(&cookie->mutex);
+	return ret;
+}
+
+/**
+ * kiumd_get_iommu_domain - Get the iommu domain for given vfio device
+ *
+ * Parameters:
+ * @vfio_fd: file descriptor for vfio device
+ *
+ * Return: iommu_dom upon success and NULL
+ * on failure
+ */
+struct iommu_domain *kiumd_get_iommu_domain(int vfio_fd)
+{
+	struct vfio_device *vfio_dev;
+	struct iommu_domain *domain;
+
+	vfio_dev = kiumd_get_vfio_device(vfio_fd);
+	if (!vfio_dev) {
+		pr_err("%s:vfio_dev is NULL\n", __func__);
+		return NULL;
+	}
+	domain = kiumd_iommu_get_dma_domain(vfio_dev->dev);
+	if (!domain) {
+		pr_err("%s:iommu domain is NULL\n", __func__);
+		return NULL;
+	}
+
+	return domain;
+}
+
+/**
+ * kiumd_get_smmu_domain - This function facilitates to set the iommu domain
+ *
+ * Parameters:
+ * @vfio_fd: file descriptor for vfio device
+ *
+ * Return: iommu_dom upon success and NULL
+ * on failure
+ */
+static struct arm_smmu_domain *kiumd_get_smmu_domain(int vfio_fd)
+{
+	struct arm_smmu_domain *smmu_domain;
+	struct iommu_domain *iommu_dom;
+
+	iommu_dom = kiumd_get_iommu_domain(vfio_fd);
+	if (!iommu_dom) {
+		pr_err("%s:IOMMU domain is NULL\n", __func__);
+		return NULL;
+	}
+	smmu_domain = container_of(iommu_dom, struct arm_smmu_domain, domain);
+	if (!smmu_domain) {
+		pr_err("%s:SMMU domain is NULL\n", __func__);
+		return NULL;
+	}
+
+	return smmu_domain;
+}
+
+/**
+ * kiumd_get_pgtable_entry - Searche for a pagetable entry in
+ * the given context's hash table based on the provided index
+ *
+ * Parameters:
+ * @kiumd_ctx: Pointer to the kiumd context
+ * @idx: Index of the pagetable entry to retrieve
+ * @is_process: Flag indicating if the context is process-specific
+ *
+ * Return: Pointer to the found pagetable entry, or NULL if not found.
+ */
+struct pgtable_map *kiumd_get_pgtable_entry(struct kiumd_ctx *kiumd_ctx,
+					    unsigned long idx, bool is_process)
+{
+	struct kiumd_kgsl_context *kgsl_context;
+	struct pgtable_map *pgtble_ctx;
+	bool found = false;
+
+	if (is_process) {
+		kgsl_context = kiumd_ctx->kgsl_context;
+		spin_lock(&kgsl_context->kgsl_hash_lock);
+		hash_for_each_possible(kiumd_ctx->kgsl_page_table, pgtble_ctx, node, idx) {
+			if (pgtble_ctx->idx == idx) {
+				found = true;
+				break;
+			}
+		}
+
+		spin_unlock(&kgsl_context->kgsl_hash_lock);
+		if (!found) {
+			pr_err("%s:%d id not found in hash table\n", __func__, __LINE__);
+			return NULL;
+		}
+	} else {
+		spin_lock(&kiumd_ctx->pt_lock);
+		hash_for_each_possible(kiumd_ctx->page_table, pgtble_ctx, node, idx) {
+			if (pgtble_ctx->idx == idx) {
+				found = true;
+				break;
+			}
+		}
+
+		spin_unlock(&kiumd_ctx->pt_lock);
+		if (!found) {
+			pr_err("%s:%d id not found in hash table\n", __func__, __LINE__);
+			return NULL;
+		}
+	}
+
+	return pgtble_ctx;
+}
+
+bool check_ptselect(struct kiumd_user *kiusr)
+{
+	return ((kiusr->ptselect == KGSL_GLOBAL_PT)
+		|| (kiusr->ptselect == KGSL_PER_PROCESS_PT)
+		|| (kiusr->ptselect == KGSL_DEFAULT_PT));
+}
+
+static void free_iommu_addr_entry(struct iommu_addr_entry *entry)
+{
+	kmem_cache_free(iommu_addr_cache, entry);
+}
+
+static int free_iova_range(struct pgtable_map *map, unsigned long iova)
+{
+	struct rb_node *node = map->rbtree.rb_node;
+	struct iommu_addr_entry *entry;
+
+	while (node) {
+		entry = rb_entry(node, struct iommu_addr_entry, rbnode);
+
+		if (iova < entry->base_addr)
+			node = node->rb_left;
+		else if (iova > entry->base_addr)
+			node = node->rb_right;
+		else {
+			rb_erase(&entry->rbnode, &map->rbtree);
+			free_iommu_addr_entry(entry);
+			return 0;
+		}
+	}
+
+	return -EINVAL; // IOVA not found
+}
+
+/**
+ * free_allocated_iova - Free an allocated IOVA range from a pagetable entry
+ * based on index
+ *
+ * Parameters:
+ * @kiumd_ctx: Pointer to the kiumd context
+ * @iova: IOVA address to free
+ * @idx: Index of the pagetable entry
+ * @is_process: Flag indicating if the context is process-specific
+ *
+ * Return: 0 on success, -EINVAL if the pagetable entry is not found.
+ */
+int free_allocated_iova(struct kiumd_ctx *kiumd_ctx, unsigned long iova,
+			unsigned long idx, bool is_process)
+{
+	struct pgtable_map *pgtble_ctx;
+
+	pgtble_ctx = kiumd_get_pgtable_entry(kiumd_ctx, idx, is_process);
+	if (!pgtble_ctx) {
+		pr_err("%s:invalid id for hash table: id: %lu\n", __func__, idx);
+		return -EINVAL;
+	}
+
+	return free_iova_range(pgtble_ctx, iova);
+}
+
+static struct iommu_addr_entry *alloc_iommu_addr_entry(unsigned long base_addr,
+						       unsigned long size)
+{
+	struct iommu_addr_entry *entry = kmem_cache_alloc(iommu_addr_cache, GFP_KERNEL);
+
+	if (!entry) {
+		pr_err("%s:%d failed to create entry for addr: %lx, size: %lu)\n",
+		       __func__, __LINE__, base_addr, size);
+		return NULL;
+	}
+
+	entry->base_addr = base_addr;
+	entry->size = size;
+	return entry;
+}
+
+static int insert_iova(struct pgtable_map *pgtable_ctx,
+		       struct iommu_addr_entry *entry)
+{
+	struct rb_node **new = &(pgtable_ctx->rbtree.rb_node);
+	struct rb_node *parent = NULL;
+
+	while (*new) {
+		struct iommu_addr_entry *this = rb_entry(*new, struct iommu_addr_entry, rbnode);
+
+		parent = *new;
+
+		if (entry->base_addr < this->base_addr)
+			new = &((*new)->rb_left);
+		else if (entry->base_addr > this->base_addr)
+			new = &((*new)->rb_right);
+		else
+			return -EEXIST;
+	}
+
+	rb_link_node(&entry->rbnode, parent, new);
+	rb_insert_color(&entry->rbnode, &pgtable_ctx->rbtree);
+
+	return 0;
+}
+
+int kiumd_configure_dma_cookie(struct vfio_device *vfio_dev,
+			       enum iommu_dma_cookie_type cookie_type,
+			       dma_addr_t dma_addr)
+{
+	struct kiumd_iommu_dma_cookie *cookie;
+	int ret;
+
+	cookie = kiumd_get_dma_cookie(vfio_dev);
+	if (!cookie)
+		return -EINVAL;
+
+	ret = kiumd_set_dma_cookie_unlocked(cookie, cookie_type, dma_addr);
+	if (ret) {
+		pr_err("%s %d failed to set cookie\n", __func__, __LINE__);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static struct iova_domain *kiumd_get_iova_domain(struct device *dev)
+{
+	struct kiumd_iommu_dma_cookie *cookie;
+	struct iommu_domain *domain;
+	struct iova_domain *iovad;
+
+	domain = kiumd_iommu_get_dma_domain(dev);
+	if (!domain) {
+		pr_err("%s:dma_domain is invalid\n", __func__);
+		return NULL;
+	}
+
+	cookie = (struct kiumd_iommu_dma_cookie *)domain->iova_cookie;
+	iovad = &cookie->iovad;
+
+	return iovad;
+}
+
+unsigned long get_shift_from_dt(struct device *dev)
+{
+	struct device_node *node;
+	u32 shift = 0;
+
+	node = dev->of_node;
+	if (!of_property_read_u32(node, "qcom,iova-align-shift-max", &shift))
+		return shift;
+
+	return 0;
+}
+
+
+static unsigned long limit_align_shift(struct device *dev, unsigned long shift,
+				       unsigned long max_shift)
+{
+	unsigned long max_align_shift, final_shift = 0;
+	struct iova_domain *iovad;
+
+	iovad = kiumd_get_iova_domain(dev);
+	if (iovad) {
+		max_align_shift = max_shift + PAGE_SHIFT - iova_shift(iovad);
+		final_shift = min_t(unsigned long, max_align_shift, shift);
+	}
+
+	return final_shift;
+}
+
+static unsigned long align_iova(struct device *dev, unsigned long start_iova,
+				unsigned long size, unsigned long max_shift)
+{
+	unsigned long align_mask, final_shift;
+
+	final_shift = limit_align_shift(dev, fls_long(size-1), max_shift);
+	if (!final_shift)
+		return ULONG_MAX;
+
+	align_mask = (1UL << final_shift) - 1;
+
+	if (start_iova % size != 0)
+		start_iova = (start_iova + align_mask) & ~align_mask;
+
+	return start_iova;
+}
+
+static unsigned long alloc_iova_range(struct vfio_device *vfio_dev,
+				      struct pgtable_map *ptable_ctx,
+				      unsigned long size,
+				      unsigned long max_shift)
+{
+	struct rb_node *node = rb_first(&ptable_ctx->rbtree);
+	unsigned long start_iova = ptable_ctx->start_iova;
+	struct iommu_addr_entry *new_entry;
+	struct iommu_addr_entry *entry;
+
+	start_iova = align_iova(vfio_dev->dev, start_iova, size, max_shift);
+	if (start_iova == ULONG_MAX)
+		return 0;
+
+	while (node) {
+		entry = rb_entry(node, struct iommu_addr_entry, rbnode);
+
+		if (start_iova + size < entry->base_addr) {
+			if (start_iova + size <= ptable_ctx->end_iova) {
+				new_entry = alloc_iommu_addr_entry(start_iova, size);
+
+				if (!new_entry)
+					return 0;
+
+				insert_iova(ptable_ctx, new_entry);
+				return start_iova;
+			}
+
+			return 0;
+		}
+
+		start_iova = entry->base_addr + entry->size;
+		start_iova = align_iova(vfio_dev->dev, start_iova, size, max_shift);
+		if (start_iova == ULONG_MAX)
+			return 0;
+		node = rb_next(node);
+	}
+
+	if (start_iova + size <= ptable_ctx->end_iova) {
+		new_entry = alloc_iommu_addr_entry(start_iova, size);
+		if (!new_entry)
+			return 0;
+
+		insert_iova(ptable_ctx, new_entry);
+		return start_iova;
+	}
+
+	return 0;
+}
+
+/**
+ * check_pgtable_context - Validate the pagetable context
+ *
+ * Parameters:
+ * @vfio_fd: File descriptor for the VFIO device
+ * @pgtable_ctx: Pointer to the pagetable context to validate
+ *
+ * Return: true if the pagetable context is valid, false otherwise.
+ */
+bool check_pgtable_context(int vfio_fd, struct pgtable_map *pgtable_ctx)
+{
+	struct arm_smmu_domain *smmu_dom;
+	struct io_pgtable *pgtable;
+	unsigned long ttbr0;
+
+	smmu_dom = kiumd_get_smmu_domain(vfio_fd);
+	if (!smmu_dom) {
+		pr_err("%s:%d invalid smmu_dom\n", __func__, __LINE__);
+		return false;
+	}
+
+	pgtable = io_pgtable_ops_to_pgtable(smmu_dom->pgtbl_ops);
+	if (!pgtable) {
+		pr_err("%s:%d invalid pagetable\n", __func__, __LINE__);
+		return false;
+	}
+
+	ttbr0 = pgtable->cfg.arm_lpae_s1_cfg.ttbr;
+
+	if (ttbr0 != pgtable_ctx->ttbr0_addr) {
+		pr_err("%s:%d mismatch pt_id and pgtable context, probably wrong id from UMD\n",
+		       __func__, __LINE__);
+		return false;
+	}
+
+	return true;
+}
+
+/**
+ * kiumd_smmuv2_write_context_bank - Write smmu context bank for given index
+ * bank register for given context bank
+ *
+ * Parameters:
+ * @*smmu: pointer for arm smmu device information
+ * @idx: index for context bank
+ *
+ * Returns void
+ */
+static void kiumd_smmuv2_write_context_bank(struct arm_smmu_device *smmu,
+					    int idx)
+{
+	struct arm_smmu_cb *cb = &smmu->cbs[idx];
+	struct arm_smmu_cfg *cfg = cb->cfg;
+	bool stage1;
+	u32 reg;
+
+	trace_kiumd_smmuv2_write_context_bank_start(idx, cfg->cbndx, cfg->cbar);
+
+	stage1 = cfg->cbar != CBAR_TYPE_S2_TRANS;
+
+	if (cfg->fmt == ARM_SMMU_CTX_FMT_AARCH64)
+		reg = ARM_SMMU_CBA2R_VA64;
+	else
+		reg = 0;
+
+	arm_smmu_gr1_write(smmu, ARM_SMMU_GR1_CBA2R(idx), reg);
+	reg = FIELD_PREP(ARM_SMMU_CBAR_TYPE, cfg->cbar);
+
+	if (stage1) {
+		reg |= FIELD_PREP(ARM_SMMU_CBAR_S1_BPSHCFG,
+			ARM_SMMU_CBAR_S1_BPSHCFG_NSH) |
+			FIELD_PREP(ARM_SMMU_CBAR_S1_MEMATTR,
+				ARM_SMMU_CBAR_S1_MEMATTR_WB);
+	} else if (!(smmu->features & ARM_SMMU_FEAT_VMID16)) {
+		/* 8-bit VMIDs live in CBAR */
+		reg |= FIELD_PREP(ARM_SMMU_CBAR_VMID, cfg->vmid);
+	}
+
+	arm_smmu_gr1_write(smmu, ARM_SMMU_GR1_CBAR(idx), reg);
+
+	if (stage1)
+		arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_TCR2, cb->tcr[1]);
+
+	arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_TCR, cb->tcr[0]);
+
+	arm_smmu_cb_writeq(smmu, idx, ARM_SMMU_CB_TTBR0, cb->ttbr[0]);
+
+	if (stage1)
+		arm_smmu_cb_writeq(smmu, idx, ARM_SMMU_CB_TTBR1, cb->ttbr[1]);
+
+	arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_S1_MAIR0, cb->mair[0]);
+	arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_S1_MAIR1, cb->mair[1]);
+
+	reg = ARM_SMMU_SCTLR_CFIE | ARM_SMMU_SCTLR_CFRE | ARM_SMMU_SCTLR_AFE |
+	      ARM_SMMU_SCTLR_TRE | ARM_SMMU_SCTLR_M;
+
+	reg |= ARM_SMMU_SCTLR_S1_ASIDPNE;
+
+	smmu->impl->write_sctlr(smmu, idx, reg);
+
+	trace_kiumd_smmuv2_write_context_bank_end(idx);
+}
+
+/**
+ * kiumd_smmuv2_set_ttbr0cfg - Configure TTBR0 settings for the ARM SMMU
+ * for a specific vfio device(as of now used by GPU)
+ *
+ * Parameters:
+ * @smmu_domain: Pointer to the SMMU domain structure
+ * @pgtbl_cfg: Pointer to the page table configuration
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+static int kiumd_smmuv2_set_ttbr0_cfg(struct arm_smmu_domain *smmu_domain,
+				      const struct io_pgtable_cfg *pgtbl_cfg)
+{
+
+	struct arm_smmu_cfg *cfg = &smmu_domain->cfg;
+	struct arm_smmu_cb *cb = &smmu_domain->smmu->cbs[cfg->cbndx];
+	u32 tcr = cb->tcr[0];
+
+	if (!(cb->tcr[0] & ARM_SMMU_TCR_EPD0)) {
+		pr_err("TTBR0 translation is already enabled\n");
+		return -EINVAL;
+	}
+
+	tcr |= arm_smmu_lpae_tcr(pgtbl_cfg);
+	tcr &= ~(ARM_SMMU_TCR_EPD0 | ARM_SMMU_TCR_EPD1);
+
+	cb->tcr[0] = tcr;
+	cb->ttbr[0] = pgtbl_cfg->arm_lpae_s1_cfg.ttbr;
+	cb->ttbr[0] |= FIELD_PREP(ARM_SMMU_TTBRn_ASID, cb->cfg->asid);
+
+	kiumd_smmuv2_write_context_bank(smmu_domain->smmu, cb->cfg->cbndx);
+
+	return 0;
+}
+
+/**
+ * kiumd_smmuv2_set_ttbr1_cfg - Configure TTBR1 settings for the ARM SMMU
+ * for a specific vfio device(as of now used by LPAC).
+ *
+ * Parameters:
+ * @smmu_domain: Pointer to the SMMU domain structure
+ * @pgtbl_cfg: Pointer to the page table configuration
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+static void kiumd_smmuv2_set_ttbr1_cfg(struct arm_smmu_domain *smmu_domain,
+				      const struct io_pgtable_cfg *pgtbl_cfg)
+{
+	struct arm_smmu_cfg *cfg = &smmu_domain->cfg;
+	struct arm_smmu_cb *cb = &smmu_domain->smmu->cbs[cfg->cbndx];
+	u32 tcr = cb->tcr[0];
+
+	tcr |= arm_smmu_lpae_tcr(pgtbl_cfg);
+	tcr &= ~(ARM_SMMU_TCR_EPD0 | ARM_SMMU_TCR_EPD1);
+
+	cb->tcr[0] = tcr;
+	cb->ttbr[1] = pgtbl_cfg->arm_lpae_s1_cfg.ttbr;
+	cb->ttbr[1] |= FIELD_PREP(ARM_SMMU_TTBRn_ASID, cb->cfg->asid);
+
+	kiumd_smmuv2_write_context_bank(smmu_domain->smmu, cb->cfg->cbndx);
+}
+
+
+/**
+ * kiumd_perprocess_set_ttbr1_context - Configure TTTBR1 settings for the
+ * ARM SMMU for a specific vfio device(as of now used by LPAC).
+ *
+ * Parameters:
+ * @arg: User-provided argument pointer
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+int kiumd_set_pgtble_ttbr1_context(struct iommu_domain *iommu_dom)
+{
+	struct io_pgtable_ops *pgtable_ops;
+	struct arm_smmu_domain *smmu_dom;
+	struct arm_smmu_cfg *smmu_cfg;
+	struct io_pgtable *pagetable;
+	struct io_pgtable_cfg cfg;
+	struct arm_smmu_cb *cb;
+
+	smmu_dom = container_of(iommu_dom, struct arm_smmu_domain, domain);
+	if (!smmu_dom || !smmu_dom->pgtbl_ops) {
+		pr_err("%s: smmu domain/pagetable ops is invalid\n", __func__);
+		return -EINVAL;
+	}
+
+	smmu_cfg = &smmu_dom->cfg;
+	cb = &smmu_dom->smmu->cbs[smmu_cfg->cbndx];
+	if (!(cb->tcr[0] & ARM_SMMU_TCR_EPD1)) {
+		/** Not an error. During kgsl relaunch, we dont have to reprogram
+		 *  TTBR1 if its already enabled.
+		 */
+		pr_err("%s: TTBR1 is already enabled for the device\n", __func__);
+		return 0;
+	}
+
+	pagetable = io_pgtable_ops_to_pgtable(smmu_dom->pgtbl_ops);
+	if (!pagetable) {
+		pr_err("%s: pagetable is NULL\n", __func__);
+		return -EINVAL;
+	}
+
+	memcpy(&cfg, &pagetable->cfg, sizeof(struct io_pgtable_cfg));
+	cfg.quirks |= IO_PGTABLE_QUIRK_ARM_TTBR1;
+	cfg.tlb = &kgsl_iopgtbl_tlb_ops;
+
+	if (cfg.quirks & IO_PGTABLE_QUIRK_ARM_TTBR1) {
+		iommu_dom->geometry.aperture_start = ~0UL << cfg.ias;
+		iommu_dom->geometry.aperture_end = ~0UL;
+	}
+
+	pgtable_ops = alloc_io_pgtable_ops(ARM_64_LPAE_S1, &cfg, NULL);
+	if (!pgtable_ops) {
+		pr_err("%s: failed to allocate pagetable ops\n", __func__);
+		return -EINVAL;
+	}
+
+	kiumd_smmuv2_set_ttbr1_cfg(smmu_dom, &cfg);
+	smmu_dom->pgtbl_ops = pgtable_ops;
+
+	return 0;
+}
+
+/**
+ * kiumd_perprocess_set_ttbr1_context - Configure TTTBR0 settings for a
+ * specific vfio device(as of now used by GPU) ARM SMMU for the specified
+ * device.
+ *
+ * Parameters:
+ * @arg: User-provided argument pointer
+ *
+ * This function allocates a pagetable and invokes the function to program
+ * TTBR0 for the specified VFIO device's SMMU domain. It also configures
+ * the aperture for the specified vfio device through an scm call.
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+int kiumd_set_pgtble_ttbr0_context(struct iommu_domain *iommu_dom,
+				   struct kiumd_ctx *kiumd_ctx)
+{
+	struct io_pgtable_ops *pgtable_ops;
+	struct arm_smmu_domain *smmu_dom;
+	struct io_pgtable *pgtable;
+	struct io_pgtable_cfg cfg;
+	int ret;
+
+	smmu_dom = container_of(iommu_dom, struct arm_smmu_domain, domain);
+	if ((!smmu_dom) || (!(smmu_dom->pgtbl_ops))) {
+		pr_err("%s:smmu domain/pagetable ops is invalid\n", __func__);
+		return -EINVAL;
+	}
+
+	if (!kiumd_ctx->pgtable) {
+		kiumd_ctx->pgtable = io_pgtable_ops_to_pgtable(smmu_dom->pgtbl_ops);
+		if (!kiumd_ctx->pgtable) {
+			pr_err("%s:pagetable is NULL\n", __func__);
+			return -EINVAL;
+		}
+	}
+
+	pgtable = kiumd_ctx->pgtable;
+	if (!pgtable) {
+		pr_err("%s: pgtable is null\n", __func__);
+		return -EINVAL;
+	}
+
+	memcpy(&cfg, &pgtable->cfg, sizeof(struct io_pgtable_cfg));
+	cfg.quirks &= ~IO_PGTABLE_QUIRK_ARM_TTBR1;
+	cfg.tlb = &kgsl_iopgtbl_tlb_ops;
+	/*Allocate a default pagetable for TTBR0 in case per process allocation fails*/
+	pgtable_ops = alloc_io_pgtable_ops(ARM_64_LPAE_S1, &cfg, NULL);
+	if (!pgtable_ops) {
+		pr_err("%s:failed to allocate pagetable ops.\n", __func__);
+		return -ENOMEM;
+	}
+
+	kiumd_smmuv2_set_ttbr0_cfg(smmu_dom, &cfg);
+	ret = qcom_scm_kgsl_set_smmu_aperture(smmu_dom->cfg.cbndx);
+	if (ret == -EBUSY)
+		ret = qcom_scm_kgsl_set_smmu_aperture(smmu_dom->cfg.cbndx);
+
+	if (ret) {
+		pr_err("%s:Setting smmu aperture error: %d\n", __func__, ret);
+		free_io_pgtable_ops(pgtable_ops);
+		return ret;
+	}
+
+	return 0;
+}
+
+int kiumd_set_dma_addr_ranges(struct kiumd_ctx *kiumd_ctx, struct device *dev)
+{
+	const __be32 *addr_range;
+	u64 start_addr, end_addr;
+	struct device_node *np;
+	int len;
+
+	np = dev->of_node;
+	if (!np) {
+		dev_err(dev, "Device tree node not found\n");
+		return -EINVAL;
+	}
+
+	addr_range = of_get_property(np, "qcom,iommu-dma-addr-range", &len);
+	if (!addr_range)
+		return 0; /*This is not an error, not every device need to have this property set*/
+
+	if (len < (2 * sizeof(u32))) {
+		dev_err(dev, "qcom,iommu-dma-addr-range property length is invalid\n");
+		return -EINVAL;
+	}
+
+	start_addr = of_read_number(addr_range, 2);
+	end_addr = of_read_number(addr_range + 2, 2);
+	if (end_addr < start_addr) {
+		dev_err(dev, "invalid address specified in the device tree\n");
+		return -EINVAL;
+	}
+
+	kiumd_ctx->pt_start_iova = start_addr;
+	kiumd_ctx->pt_end_iova = end_addr;
+
+	return 0;
+}
+
+/**
+ * clear_map_iova - This function facilitates to clear the global map based of
+ * given iova and ptselect
+ *
+ * Parameters:
+ * @iova: u64 virtual address for page table
+ * @size: u64 size
+ * @ptselect: type of pagetable per
+ * process or global
+ *
+ * Return: nothing
+ */
+int clear_map_iova(struct kiumd_ctx *kiumd_ctx, u64 iova, u64 size,
+		   int ptselect, unsigned int idx)
+{
+	struct pgtable_map *pgtble_ctx;
+	int ret = 0;
+	u64 bit;
+
+	if (ptselect == KGSL_GLOBAL_PT) {
+		bit = (iova & ~KGSL_GLOBAL_PT_BASE_IOVA) >> PAGE_SHIFT;
+		bitmap_clear(global_map, bit, size >> PAGE_SHIFT);
+	} else if (ptselect == KGSL_PER_PROCESS_PT) {
+		pgtble_ctx = kiumd_get_pgtable_entry(kiumd_ctx, idx, true);
+		if (!pgtble_ctx) {
+			pr_err("%s:invalid id for hash table: id: %d\n", __func__, idx);
+			return -EINVAL;
+		}
+
+		spin_lock(&pgtble_ctx->kgsl_rbtree_lock);
+		ret = free_iova_range(pgtble_ctx, iova);
+		spin_unlock(&pgtble_ctx->kgsl_rbtree_lock);
+		if (ret) {
+			pr_err("%s: iova: %llx, not found\n", __func__, iova);
+			return ret;
+		}
+	}
+
+	return ret;
+}
+
+/**
+ * get_map_offset - This function facilitates to get the offset of the global
+ * map based of given size and  ptselect
+ *
+ * Parameters:
+ * @size: u64 size
+ * @ptselect: type of pagetable per process or global
+ *
+ * Returns map offset
+ */
+s64 get_map_offset(u64 size, int ptselect)
+{
+	static u64 last_offset_global;
+	static u64 last_offset_perprocess;
+	u64 *last_offset;
+	u64 bit, offset;
+	unsigned long *map;
+
+	if (ptselect != KGSL_GLOBAL_PT && ptselect != KGSL_PER_PROCESS_PT) {
+		pr_err("%s: Invalid ptselect: %d\n", __func__, ptselect);
+		return (s64) -EINVAL;
+	}
+
+	last_offset = (ptselect == KGSL_GLOBAL_PT) ? &last_offset_global :
+						     &last_offset_perprocess;
+	map = (ptselect == KGSL_GLOBAL_PT) ? global_map : perprocess_map;
+	if (map == NULL) {
+		pr_err("%s: Bitmap map is NULL for ptselect: %d\n", __func__, ptselect);
+		return (s64) -EFAULT;
+	}
+
+	if (size == 0 || (size >> PAGE_SHIFT) == 0) {
+		pr_err("%s: Invalid size: 0x%llx, for ptselect: %d\n",
+		       __func__, size, ptselect);
+		return (s64) -EINVAL;
+	}
+
+	bit = bitmap_find_next_zero_area(map, KGSL_PT_MEM_PAGES, *last_offset,
+					 size >> PAGE_SHIFT, 0);
+
+	if (bit + (size >> PAGE_SHIFT) >= KGSL_PT_MEM_PAGES) {
+		bit = bitmap_find_next_zero_area(map, KGSL_PT_MEM_PAGES, 0,
+						 size >> PAGE_SHIFT, 0);
+		if (bit >= KGSL_PT_MEM_PAGES) {
+			pr_err("%s: No free area in bitmap for size: 0x%llx, ptselect: %d\n",
+			       __func__, size, ptselect);
+			return (s64) -ENOSPC;
+		}
+	}
+
+	bitmap_set(map, bit, size >> PAGE_SHIFT);
+	offset = bit << PAGE_SHIFT;
+
+	*last_offset = (bit + (size >> PAGE_SHIFT)) % KGSL_PT_MEM_PAGES;
+
+	return (s64) offset;
+}
+
+/**
+ * set_map_iova - This function facilitates to set the offset of the global map
+ * based of given size and  ptselect
+ *
+ * Parameters:
+ * @offset: offset for global map
+ * @vfio_dev: vfio device *
+ * @ptselect: type of pagetable per
+ * process or global
+ *
+ * Return: errno in failure or 0 in case of success
+ */
+int set_map_iova(u64 offset, struct vfio_device *vfio_dev, int ptselect)
+{
+	struct kiumd_iommu_dma_cookie *cookie;
+	dma_addr_t iova = offset;
+	int ret;
+
+	if (ptselect == KGSL_GLOBAL_PT)
+		iova = KGSL_GLOBAL_PT_BASE_IOVA + offset;
+	else if (ptselect == KGSL_PER_PROCESS_PT)
+		iova = offset;
+	else {
+		pr_err("%s invalid ptselect\n", __func__);
+		return -EINVAL;
+	}
+
+	cookie = kiumd_get_dma_cookie(vfio_dev);
+	if (!cookie) {
+		pr_err("%s failed to get cookie\n", __func__);
+		return -EINVAL;
+	}
+
+	ret = kiumd_set_dma_cookie_unlocked(cookie, IOMMU_DMA_MSI_COOKIE, iova);
+	if (ret)
+		pr_err("%s failed to set cookie\n", __func__);
+
+	return ret;
+}
+
+#ifdef CONFIG_DMABUF_DEBUG
+/**
+ * kiumd_mangle_sg_table - This function facilitates to modify the page links
+ * for each of scatter gather table
+ *
+ * Parameters:
+ * @sg_table: pointer for scatter gather table
+ *
+ * Return: void
+ */
+static void kiumd_mangle_sg_table(struct sg_table *sg_table)
+{
+	struct scatterlist *sg;
+	int i;
+
+	for_each_sgtable_sg(sg_table, sg, i) {
+		if (sg)
+			sg->page_link ^= ~0xffUL;
+	}
+}
+#endif
+
+/**
+ * is_fixed_mapping - This function facilitates to check the fixed iova mapping
+ * by checking the cookie type for the vfio device.
+ *
+ * Parameters:
+ * @vfio_dev: pointer for vfio device structure
+ *
+ * Return: true/false
+ */
+bool is_fixed_mapping(struct vfio_device *vfio_dev)
+{
+	struct kiumd_iommu_dma_cookie *cookie;
+
+	cookie = kiumd_get_dma_cookie(vfio_dev);
+	if (cookie) {
+		if (cookie->type == IOMMU_DMA_MSI_COOKIE)
+			return true;
+	}
+
+	return false;
+}
+
+/**
+ * find_available_region_in_range - Search for an available IOVA region within
+ * a given VA range in RB tree
+ *
+ * Parameters:
+ * @ptable_ctx: Pointer to the page table mapping context
+ * @search_start: Start of the IOVA search range (inclusive)
+ * @search_end: End of the IOVA search range (exclusive)
+ * @size: Size of the region to allocate
+ *
+ * Return: Starting address of the available region, or 0 if none found.
+ */
+
+static unsigned long find_available_region_in_range(struct pgtable_map *ptable_ctx,
+						   unsigned long search_start,
+						   unsigned long search_end,
+						   unsigned long size)
+{
+	struct rb_node *node = rb_first(&ptable_ctx->rbtree);
+	unsigned long available_start = search_start;
+	struct iommu_addr_entry *entry;
+
+	while (node) {
+		entry = rb_entry(node, struct iommu_addr_entry, rbnode);
+		if (available_start + size <= entry->base_addr &&
+			available_start + size <= search_end) {
+			return available_start;
+		}
+
+		if (entry->base_addr + entry->size > available_start)
+			available_start = entry->base_addr + entry->size;
+
+		if (available_start >= search_end)
+			break;
+		node = rb_next(node);
+	}
+
+	// Final gap check after last node
+	if (available_start + size <= search_end)
+		return available_start;
+
+	return 0; // No available region found
+}
+
+/**
+ * alloc_iova_range_contiguous - Allocate a contiguous IOVA range
+ *
+ * Parameters:
+ * @ptable_ctx: Pointer to the pagetable context
+ * @size: Size of the IOVA range to allocate
+ *
+ * Return: The starting address of the allocated IOVA range, or 0 if no suitable
+ * range is found.
+ */
+
+static unsigned long alloc_iova_range_contiguous(struct pgtable_map *ptable_ctx, unsigned long size)
+{
+	struct iommu_addr_entry *new_entry = NULL;
+	unsigned long available_start = 0;
+	unsigned long last_allocated_end;
+
+	spin_lock(&ptable_ctx->kgsl_rbtree_lock);
+	last_allocated_end = ptable_ctx->last_allocated_end;
+
+	// First pass: search from last_allocated_end to end_iova
+	available_start = find_available_region_in_range(ptable_ctx,
+							last_allocated_end,
+							ptable_ctx->end_iova,
+							size);
+	// Second pass: wrap around if needed
+	if (!available_start) {
+		available_start = find_available_region_in_range(ptable_ctx,
+								ptable_ctx->start_iova,
+								last_allocated_end,
+								size);
+	}
+
+	spin_unlock(&ptable_ctx->kgsl_rbtree_lock);
+	// If no region found, return failure
+	if (!available_start)
+		return 0;
+
+	new_entry = alloc_iommu_addr_entry(available_start, size);
+	if (!new_entry)
+		return 0;
+
+	spin_lock(&ptable_ctx->kgsl_rbtree_lock);
+	insert_iova(ptable_ctx, new_entry);
+	ptable_ctx->last_allocated_end = available_start + size;
+	spin_unlock(&ptable_ctx->kgsl_rbtree_lock);
+	return available_start;
+}
+
+/**
+ * get_pgtble_and_alloc_iova - Retrieve pagetable entry and allocate IOVA range
+ *
+ * Parameters:
+ * @vfio_fd: File descriptor for the VFIO device
+ * @kiumd_ctx: Pointer to the kiumd context
+ * @size: Size of the IOVA range to allocate
+ * @idx: Index of the pagetable entry to retrieve
+ *
+ * Return: The starting address of the allocated IOVA range, or 0 if any step fails.
+ */
+uint64_t get_pgtble_and_alloc_iova(int vfio_fd,
+				   struct kiumd_ctx *kiumd_ctx,
+				   u64 size,
+				   unsigned int idx)
+{
+	struct pgtable_map *pgtble_ctx;
+	uint64_t addr;
+
+	pgtble_ctx = kiumd_get_pgtable_entry(kiumd_ctx, idx, true);
+	if (!pgtble_ctx) {
+		pr_err("%s:%d Invalid id for hash table: id: %d\n", __func__, __LINE__, idx);
+		return 0;
+	}
+
+	if (!check_pgtable_context(vfio_fd, pgtble_ctx)) {
+		pr_err("%s:%d check_pgtable_context failed\n", __func__, __LINE__);
+		return 0;
+	}
+
+	addr = alloc_iova_range_contiguous(pgtble_ctx, size);
+	if (!addr) {
+		pr_err("%s:%d IOVA memory limit reached\n", __func__, __LINE__);
+		return 0;
+	}
+
+	return addr;
+}
+
+void add_to_smmu_table(struct kiumd_ctx *ctx, struct smmu_map_data *map_data)
+{
+	spin_lock(&ctx->smmu_lock);
+	map_data->id = ctx->id++;
+	hash_add(ctx->smmu_table, &map_data->node, map_data->id);
+	spin_unlock(&ctx->smmu_lock);
+}
+
+static int set_allocated_iova(struct vfio_device *vfio_dev, unsigned long iova)
+{
+	struct kiumd_iommu_dma_cookie *cookie;
+	int ret;
+
+	cookie = kiumd_get_dma_cookie(vfio_dev);
+	if (!cookie) {
+		pr_err("%s failed to get cookie\n", __func__);
+		return -EINVAL;
+	}
+
+	ret = kiumd_set_dma_cookie_unlocked(cookie, IOMMU_DMA_MSI_COOKIE, iova);
+	if (ret)
+		pr_err("%s failed to set cookie\n", __func__);
+
+	return ret;
+}
+
+int init_and_allocate_iova(struct vfio_device *vfio_dev,
+			   struct kiumd_ctx *kiumd_ctx,
+			   unsigned long idx, unsigned int size,
+			   unsigned long max_shift)
+{
+	struct pgtable_map *pgtable_ctx;
+	unsigned long iova;
+	int ret;
+
+	if (!kiumd_ctx->is_initialized) {
+
+		pgtable_ctx = kzalloc(sizeof(*pgtable_ctx), GFP_KERNEL);
+		if (!pgtable_ctx)
+			return -ENOMEM;
+
+		pgtable_ctx->rbtree = RB_ROOT;
+		pgtable_ctx->idx = idx;
+		pgtable_ctx->start_iova = kiumd_ctx->pt_start_iova;
+		pgtable_ctx->end_iova = kiumd_ctx->pt_end_iova;
+
+		spin_lock(&kiumd_ctx->pt_lock);
+		hash_add(kiumd_ctx->page_table, &pgtable_ctx->node, idx);
+		spin_unlock(&kiumd_ctx->pt_lock);
+
+		kiumd_ctx->is_initialized = true;
+	} else {
+		pgtable_ctx = kiumd_get_pgtable_entry(kiumd_ctx, idx, false);
+		if (!pgtable_ctx) {
+			pr_err("%s: Failed to find pgtable_map for device: %lu\n", __func__, idx);
+			return -EINVAL;
+		}
+	}
+
+	iova = alloc_iova_range(vfio_dev, pgtable_ctx, size, max_shift);
+	if (!iova) {
+		pr_err("%s: Failed to allocate iova.\n", __func__);
+		return -ENOMEM;
+	}
+
+	ret = set_allocated_iova(vfio_dev, iova);
+	if (ret < 0) {
+		pr_err("%s: Failed to set the iova.\n", __func__);
+		return -ENOMEM;
+	}
+
+	return 0;
+}
+
+unsigned long get_hash_key(int vfio_fd)
+{
+	struct vfio_device *vfio_dev;
+	unsigned long hash_id;
+
+	if (vfio_fd < 0) {
+		pr_err("%s:%d invalid fd from user\n", __func__, __LINE__);
+		return -EBADF;
+	}
+
+	vfio_dev = kiumd_get_vfio_device(vfio_fd);
+	if (!vfio_dev) {
+		pr_err("%s:invalid vfio_fd from user\n", __func__);
+		return -EINVAL;
+	}
+
+	hash_id = (unsigned long) kiumd_iommu_get_dma_domain(vfio_dev->dev);
+	if (!hash_id) {
+		pr_err("%s:invalid domain\n", __func__);
+		return -EINVAL;
+	}
+
+	return hash_id;
+}
+
+/**
+ * @kiumd_io_pgtable_hyp_assign_page - This function facilitates to hyp-assign
+ * the page for given vmid
+ *
+ * Parameters:
+ * @vmid: user space argument pointer
+ * @page: Page
+ * @nr_acl_entries: Number of acl entries for scm assign
+ *
+ * Return: 0 upon success and error codes on failure
+ */
+int kiumd_io_pgtable_hyp_assign_page(u32 *vmid, u64 page, u32 nr_acl_entries)
+{
+	struct qcom_scm_vmperm *dst_vmids;
+	int ret, i;
+	u64 src_vmid_list[2] = {0};
+
+	src_vmid_list[0] = BIT(QCOM_SCM_VMID_HLOS);
+	trace_kiumd_io_pgtable_hyp_assign_page_start(vmid, page, nr_acl_entries);
+
+	dst_vmids = kcalloc((nr_acl_entries + 1), sizeof(*dst_vmids),
+			    GFP_KERNEL);
+	if (!dst_vmids)
+		return -ENOMEM;
+
+	i = 0;
+	dst_vmids[i].vmid = QCOM_SCM_VMID_HLOS;
+	dst_vmids[i].perm = QCOM_SCM_PERM_RW;
+	pr_debug("Hyp assign page for dst:%d vmid:%d perm:%d total vmids:%d\n",
+		 i, dst_vmids[i].vmid, dst_vmids[i].perm, nr_acl_entries + 1);
+
+	for (i = 1; i < nr_acl_entries + 1; i++) {
+		dst_vmids[i].vmid = vmid[i - 1];
+		dst_vmids[i].perm = QCOM_SCM_PERM_READ;
+		pr_debug("Hyp assign page for dst:%d vmid:%d perm:%d\n",
+			 i, dst_vmids[i].vmid, dst_vmids[i].perm);
+	}
+
+	ret = qcom_scm_assign_mem(page, PAGE_SIZE, &src_vmid_list[0],
+		dst_vmids, nr_acl_entries + 1);
+	if (ret)
+		pr_err("hyp assign for %llu address of size %lx rc:%d\n",
+		       page, PAGE_SIZE, ret);
+	kfree(dst_vmids);
+
+	trace_kiumd_io_pgtable_hyp_assign_page_end(page, nr_acl_entries);
+	return ret;
+}
+
+/**
+ * kiumd_io_pgtable_hyp_unassign_page - This function facilitates to
+ * hyp-unassign the page for given vmid
+ *
+ * Parameters:
+ * @vmid: user space argument pointer
+ * @page: Page
+ * @nr_acl_entries: Number of acl entries for scm assign
+ *
+ * Return: 0 upon success and error codes on failure
+ */
+int kiumd_io_pgtable_hyp_unassign_page(u32 *vmid, u64 page, u32 nr_acl_entries)
+{
+	int ret;
+	u64 src_vmid_list[2] = {0};
+
+	src_vmid_list[0] = BIT(QCOM_SCM_VMID_HLOS);
+
+	trace_kiumd_io_pgtable_hyp_unassign_page_start(vmid, page, nr_acl_entries);
+
+	struct qcom_scm_vmperm dst_vmids[] = { {
+			QCOM_SCM_VMID_HLOS,
+			QCOM_SCM_PERM_RWX
+		}
+	};
+	for (int i = 0; i < nr_acl_entries ; i++) {
+		qcom_scm_set_vmid_by_word(&src_vmid_list[0], vmid[i]);
+		pr_debug("Hyp unassign page for dst:%d vmid:%d\n",
+			 i, vmid[i]);
+	}
+
+	ret = qcom_scm_assign_mem(page, PAGE_SIZE, &src_vmid_list[0],
+				  dst_vmids, ARRAY_SIZE(dst_vmids));
+	if (ret)
+		pr_err("hyp unassign failed %llu address of size %lx rc:%d\n",
+		       page, PAGE_SIZE, ret);
+
+	trace_kiumd_io_pgtable_hyp_unassign_page_end(page, nr_acl_entries);
+	return ret;
+}
+
+/**
+ * kiumd_hyp_unassign_sg - This function facilitates to transfer memory
+ * ownership for given sg for source vm list
+ *
+ * Parameters:
+ * @sgt: user space argument pointer
+ * @source_vm_list: Page
+ * @source_nelems: Number of acl entries for scm assign
+ * @clear_page_private: boolean flag to check sg private page clearance
+ *
+ * Return: 0 upon success and error codes on failure
+ */
+int kiumd_hyp_unassign_sg(struct sg_table *sgt, int *source_vm_list,
+			  int source_nelems, bool clear_page_private)
+{
+	struct qcom_scm_vmperm dst_vmids[] = { {
+			QCOM_SCM_VMID_HLOS,
+			QCOM_SCM_PERM_RWX
+		}
+	};
+	struct scatterlist *sg;
+	u64 src_vmid_list[2] = {0};
+	u64 src_vmid_list_copy[2] = {0};
+	int ret, i;
+
+	if (source_nelems <= 0)
+		return -EINVAL;
+
+	if (!sgt)
+		return -EINVAL;
+
+	if (!sgt->sgl)
+		return -EINVAL;
+
+	trace_kiumd_hyp_unassign_sg_start(sgt);
+	sg = sgt->sgl;
+
+	for (int j = 0; j < source_nelems ; j++) {
+		qcom_scm_set_vmid_by_word(&src_vmid_list[0], source_vm_list[j]);
+		pr_debug("Hyp unassign sg for dst:%d vmid:%d\n",
+			 j, source_vm_list[j]);
+	}
+	src_vmid_list_copy[0] = src_vmid_list[0];
+	do {
+		src_vmid_list[0] = src_vmid_list_copy[0];
+		pr_debug("%s: memory ownership transfer start src vmid:%llx\n",
+			__func__, src_vmid_list[0]);
+		ret = qcom_scm_assign_mem(page_to_phys(sg_page(sg)), sg->length,
+		&src_vmid_list[0], dst_vmids,
+		ARRAY_SIZE(dst_vmids));
+		if (ret) {
+			pr_err("Hyp unassign failed %llu address of size %x rc:%d\n",
+			       page_to_phys(sg_page(sg)), sg->length, ret);
+			goto out;
+		}
+		pr_debug("%s: memory ownership transfer end:%d\n", __func__, ret);
+		sg = sg_next(sg);
+	} while (sg);
+
+	if (clear_page_private)
+		for_each_sg(sgt->sgl, sg, sgt->nents, i) {
+			if (sg)
+				ClearPagePrivate(sg_page(sg));
+		}
+
+	trace_kiumd_hyp_unassign_sg_end(sgt);
+out:
+	return ret;
+}
+
+/**
+ * kiumd_hyp_assign_sg - This function facilitates to hyp-assign
+ * given sg for destination vm list
+ *
+ * Parameters:
+ * @sgt: scatter gather table ptr
+ * @dest_vm_list: destination vm list
+ * @dest_nelems: Number of entries for destination
+ * @set_page_private: page flag
+ * @dest_perms: Destination permission
+ *
+ * Return: 0 upon success and error codes on failure
+ */
+int kiumd_hyp_assign_sg(struct sg_table *sgt, int *dest_vm_list,
+			int dest_nelems, bool set_page_private,
+			int *dest_perms)
+{
+	struct qcom_scm_vmperm *dst_vmids;
+	struct scatterlist *sg;
+	u64 src_vmid_list[2] = {0};
+	int ret;
+
+	src_vmid_list[0] = BIT(QCOM_SCM_VMID_HLOS);
+	if (dest_nelems <= 0) {
+		pr_err("%s: dest_nelems invalid\n", __func__);
+		return -EINVAL;
+	}
+
+	if (!sgt)
+		return -EINVAL;
+
+	trace_kiumd_hyp_assign_sg_start(sgt);
+	sg = sgt->sgl;
+	if (!sg)
+		return -EINVAL;
+
+	dst_vmids = kcalloc(dest_nelems, sizeof(*dst_vmids), GFP_KERNEL);
+	if (!dst_vmids)
+		return -ENOMEM;
+
+	for (int i = 0; i < dest_nelems; i++) {
+		dst_vmids[i].vmid = dest_vm_list[i];
+		dst_vmids[i].perm = dest_perms[i];
+		pr_debug("Hyp assign sg for dst:%d vmid:%d perm:%d\n",
+			 i, dst_vmids[i].vmid, dst_vmids[i].perm);
+	}
+
+	do {
+		src_vmid_list[0] = BIT(QCOM_SCM_VMID_HLOS);
+		pr_debug("Assign call initiated :%llx\n", src_vmid_list[0]);
+		ret = qcom_scm_assign_mem(page_to_phys(sg_page(sg)), sg->length, &src_vmid_list[0],
+					  dst_vmids, dest_nelems);
+		if (ret) {
+			pr_err("failed qcom_assign for assigning %llx address of size %x rc:%d\n",
+			       page_to_phys(sg_page(sg)), sg->length, ret);
+			goto err;
+		}
+		pr_debug("Assign call success:%d\n", ret);
+		sg = sg_next(sg);
+	} while (sg);
+	pr_debug("%s success\n", __func__);
+err:
+	kfree(dst_vmids);
+
+	trace_kiumd_hyp_assign_sg_end(sgt);
+	return ret;
+}
+
+/**
+ * kiumd_acl_to_vmid_perms_list - This function facilitates to set the
+ * destination vmids and permissions to given vmids and permissions.
+ *
+ * Parameters:
+ * @nr_acl_entries: Number of acl entries for scm assign
+ * @acl_entries: acl entries for scm assign
+ * @dst_vmids: pointer to destination vmid
+ * @dest_perms: Destination permission
+ *
+ * Return: 0 upon success and error codes on failure
+ */
+int kiumd_acl_to_vmid_perms_list(unsigned int nr_acl_entries,
+				 const void __user *acl_entries,
+				 int **dst_vmids, int **dst_perms)
+{
+	struct kiumd_acl_entry entry;
+	int ret, i, *vmids, *perms;
+
+	if (!nr_acl_entries || !acl_entries) {
+		pr_err("%s:%d Invalid params entries:%d\n", __func__, __LINE__, nr_acl_entries);
+		return -EINVAL;
+	}
+
+	if (nr_acl_entries > MAX_KIUMD_ACL_ENTRIES) {
+		pr_err("%s:%d Invalid params\n", __func__, __LINE__);
+		return -EINVAL;
+	}
+
+	vmids = kmalloc_array(nr_acl_entries, sizeof(*vmids), GFP_KERNEL);
+	if (!vmids)
+		return -ENOMEM;
+
+	perms = kmalloc_array(nr_acl_entries, sizeof(*perms), GFP_KERNEL);
+	if (!perms) {
+		kfree(vmids);
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < nr_acl_entries; i++) {
+		ret = copy_struct_from_user(&entry, sizeof(entry),
+					    acl_entries + (sizeof(entry) * i),
+					    sizeof(entry));
+		if (ret < 0) {
+			pr_err("%s:%d Invalid params\n", __func__, __LINE__);
+			goto out;
+		}
+
+		vmids[i] = entry.vmid;
+		perms[i] = entry.perms;
+		pr_debug("%d vmid:%d perms:%d\n", i, vmids[i], perms[i]);
+		if (vmids[i] < 0 || perms[i] < 0 ||
+		    vmids[i] > KIUMD_MAX_VMID ||
+		    perms[i] > KIUMD_MAX_PERMS) {
+			ret = -EINVAL;
+			goto out;
+		}
+	}
+
+	*dst_vmids = vmids;
+	*dst_perms = perms;
+	return ret;
+
+out:
+	kfree(perms);
+	kfree(vmids);
+	return ret;
+}
+
+/**
+ * kiumd_get_pgd - Facilitates to get the page table global directory by
+ * getting iommu_domain, smmu_domain and pagetable
+ *
+ * Parameters:
+ * @vfio_fd: file descriptor for vfio device
+ * @pgd: page global directory pointer
+ *
+ * Return: 0 upon success and error codes on failure
+ */
+int kiumd_get_pgd(struct vfio_device *vfio_dev, u64 *pgd)
+{
+	struct arm_smmu_domain *smmu_dom;
+	struct iommu_domain *iommu_dom;
+	struct io_pgtable *pgtable;
+
+	if (!pgd) {
+		pr_err("%s:%d invalid params\n", __func__, __LINE__);
+		return -EINVAL;
+	}
+
+	iommu_dom = kiumd_iommu_get_dma_domain(vfio_dev->dev);
+	if (!iommu_dom) {
+		pr_err("%s:%d Failed to get IOMMU DOMAIN VFIO\n",
+		       __func__, __LINE__);
+		return -EINVAL;
+	}
+
+	smmu_dom = container_of(iommu_dom, struct arm_smmu_domain, domain);
+	if (!smmu_dom || !smmu_dom->pgtbl_ops) {
+		pr_err("%s:%d failed to get smmu_dom\n", __func__, __LINE__);
+		return -EINVAL;
+	}
+
+	pgtable = io_pgtable_ops_to_pgtable(smmu_dom->pgtbl_ops);
+	if (!pgtable) {
+		pr_err("%s:%d failed to get pgtabl ops\n", __func__, __LINE__);
+		return -EINVAL;
+	}
+
+	*pgd = pgtable->cfg.arm_lpae_s1_cfg.ttbr;
+
+	return 0;
+}
