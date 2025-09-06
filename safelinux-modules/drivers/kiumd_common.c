@@ -9,51 +9,16 @@
 #define TRACE_SAFELINUX_COMMON
 
 #include "safelinux_modules_trace.h"
-#include "vfio.h"
 
 DECLARE_BITMAP(global_map, KGSL_PT_MEM_PAGES);
 DECLARE_BITMAP(perprocess_map, KGSL_PT_MEM_PAGES);
-
-/**
- * kiumd_get_vfio_device - Provide the vfio device pointer for the given file descriptor
- *
- * @fd: File descriptor
- *
- * Return: vfio device pointer upon success and NULL on failure
- */
-struct vfio_device *kiumd_get_vfio_device(int fd)
-{
-	struct vfio_device *vfio_dev = NULL;
-	struct vfio_device_file *df;
-	struct file *file;
-
-	if (fd < 0)
-		return NULL;
-
-	file = fget(fd);
-	if (!file)
-		return NULL;
-
-	if (!vfio_file_is_valid(file))
-		goto close_file;
-
-	df = (struct vfio_device_file *)file->private_data;
-	if (!df)
-		goto close_file;
-
-	vfio_dev = (struct vfio_device *)df->device;
-
-close_file:
-	fput(file);
-	return vfio_dev;
-}
 
 /**
  * kiumd_iommu_get_dma_domain - This function find the iommu group for given
  * vfio device and then return default iommu domain for that group
  *
  * Parameters:
- * @dev: vfio device
+ * @dev: device
  *
  * Return: struct iommu_domain * upon successand NULL on failure
  */
@@ -74,28 +39,18 @@ struct iommu_domain *kiumd_iommu_get_dma_domain(struct device *dev)
  * kiumd_get_dma_cookie - Provide the dma cookie for given vfio device
  *
  * Parameters:
- * @vfio_dev: vfio device
+ * @dev: device
  *
  * Return:  struct kiumd_iommu_dma_cookie *(cookie) upon success and NULL on failure
  */
-struct kiumd_iommu_dma_cookie *kiumd_get_dma_cookie(struct vfio_device *vfio_dev)
+struct kiumd_iommu_dma_cookie *kiumd_get_dma_cookie(struct device *dev)
 {
 	struct kiumd_iommu_dma_cookie *cookie;
 	struct iommu_domain *domain;
 
-	if (!vfio_dev) {
-		pr_err("%s:vfio dev is NULL\n", __func__);
-		return NULL;
-	}
-
-	if (!vfio_dev->dev) {
-		pr_err("%s:vfio dev is NULL\n", __func__);
-		return NULL;
-	}
-
-	domain = kiumd_iommu_get_dma_domain(vfio_dev->dev);
+	domain = kiumd_iommu_get_dma_domain(dev);
 	if (!domain) {
-		pr_err("%s:iommu domain is NULL for %s\n", __func__, dev_name(vfio_dev->dev));
+		pr_err("%s:iommu domain is NULL for %s\n", __func__, dev_name(dev));
 		return NULL;
 	}
 
@@ -162,48 +117,20 @@ int kiumd_set_dma_cookie_unlocked(struct kiumd_iommu_dma_cookie *cookie,
 }
 
 /**
- * kiumd_get_iommu_domain - Get the iommu domain for given vfio device
- *
- * Parameters:
- * @vfio_fd: file descriptor for vfio device
- *
- * Return: iommu_dom upon success and NULL
- * on failure
- */
-struct iommu_domain *kiumd_get_iommu_domain(int vfio_fd)
-{
-	struct vfio_device *vfio_dev;
-	struct iommu_domain *domain;
-
-	vfio_dev = kiumd_get_vfio_device(vfio_fd);
-	if (!vfio_dev) {
-		pr_err("%s:vfio_dev is NULL\n", __func__);
-		return NULL;
-	}
-	domain = kiumd_iommu_get_dma_domain(vfio_dev->dev);
-	if (!domain) {
-		pr_err("%s:iommu domain is NULL\n", __func__);
-		return NULL;
-	}
-
-	return domain;
-}
-
-/**
  * kiumd_get_smmu_domain - This function facilitates to set the iommu domain
  *
  * Parameters:
- * @vfio_fd: file descriptor for vfio device
+ * @dev: device
  *
  * Return: iommu_dom upon success and NULL
  * on failure
  */
-static struct arm_smmu_domain *kiumd_get_smmu_domain(int vfio_fd)
+struct arm_smmu_domain *kiumd_get_smmu_domain(struct device *dev)
 {
 	struct arm_smmu_domain *smmu_domain;
 	struct iommu_domain *iommu_dom;
 
-	iommu_dom = kiumd_get_iommu_domain(vfio_fd);
+	iommu_dom = kiumd_iommu_get_dma_domain(dev);
 	if (!iommu_dom) {
 		pr_err("%s:IOMMU domain is NULL\n", __func__);
 		return NULL;
@@ -370,14 +297,14 @@ static int insert_iova(struct pgtable_map *pgtable_ctx,
 	return 0;
 }
 
-int kiumd_configure_dma_cookie(struct vfio_device *vfio_dev,
+int kiumd_configure_dma_cookie(struct device *dev,
 			       enum iommu_dma_cookie_type cookie_type,
 			       dma_addr_t dma_addr)
 {
 	struct kiumd_iommu_dma_cookie *cookie;
 	int ret;
 
-	cookie = kiumd_get_dma_cookie(vfio_dev);
+	cookie = kiumd_get_dma_cookie(dev);
 	if (!cookie)
 		return -EINVAL;
 
@@ -453,7 +380,7 @@ static unsigned long align_iova(struct device *dev, unsigned long start_iova,
 	return start_iova;
 }
 
-static unsigned long alloc_iova_range(struct vfio_device *vfio_dev,
+static unsigned long alloc_iova_range(struct device *dev,
 				      struct pgtable_map *ptable_ctx,
 				      unsigned long size,
 				      unsigned long max_shift)
@@ -463,7 +390,7 @@ static unsigned long alloc_iova_range(struct vfio_device *vfio_dev,
 	struct iommu_addr_entry *new_entry;
 	struct iommu_addr_entry *entry;
 
-	start_iova = align_iova(vfio_dev->dev, start_iova, size, max_shift);
+	start_iova = align_iova(dev, start_iova, size, max_shift);
 	if (start_iova == ULONG_MAX)
 		return 0;
 
@@ -485,7 +412,7 @@ static unsigned long alloc_iova_range(struct vfio_device *vfio_dev,
 		}
 
 		start_iova = entry->base_addr + entry->size;
-		start_iova = align_iova(vfio_dev->dev, start_iova, size, max_shift);
+		start_iova = align_iova(dev, start_iova, size, max_shift);
 		if (start_iova == ULONG_MAX)
 			return 0;
 		node = rb_next(node);
@@ -512,13 +439,13 @@ static unsigned long alloc_iova_range(struct vfio_device *vfio_dev,
  *
  * Return: true if the pagetable context is valid, false otherwise.
  */
-bool check_pgtable_context(int vfio_fd, struct pgtable_map *pgtable_ctx)
+bool check_pgtable_context(struct device *dev, struct pgtable_map *pgtable_ctx)
 {
 	struct arm_smmu_domain *smmu_dom;
 	struct io_pgtable *pgtable;
 	unsigned long ttbr0;
 
-	smmu_dom = kiumd_get_smmu_domain(vfio_fd);
+	smmu_dom = kiumd_get_smmu_domain(dev);
 	if (!smmu_dom) {
 		pr_err("%s:%d invalid smmu_dom\n", __func__, __LINE__);
 		return false;
@@ -674,7 +601,7 @@ static void kiumd_smmuv2_set_ttbr1_cfg(struct arm_smmu_domain *smmu_domain,
  * ARM SMMU for a specific vfio device(as of now used by LPAC).
  *
  * Parameters:
- * @arg: User-provided argument pointer
+ * @:iommu_dom: iommu_domain
  *
  * Return: 0 on success, negative error code on failure
  */
@@ -731,16 +658,13 @@ int kiumd_set_pgtble_ttbr1_context(struct iommu_domain *iommu_dom)
 }
 
 /**
- * kiumd_perprocess_set_ttbr1_context - Configure TTTBR0 settings for a
+ * kiumd_perprocess_set_ttbr0_context - Configure TTTBR0 settings for a
  * specific vfio device(as of now used by GPU) ARM SMMU for the specified
  * device.
  *
  * Parameters:
- * @arg: User-provided argument pointer
- *
- * This function allocates a pagetable and invokes the function to program
- * TTBR0 for the specified VFIO device's SMMU domain. It also configures
- * the aperture for the specified vfio device through an scm call.
+ * @iommu_dom: iommu_domain
+ * @kiumd_ctx: kiumd context associated with the device
  *
  * Return: 0 on success, negative error code on failure
  */
@@ -937,13 +861,13 @@ s64 get_map_offset(u64 size, int ptselect)
  *
  * Parameters:
  * @offset: offset for global map
- * @vfio_dev: vfio device *
+ * @dev: device *
  * @ptselect: type of pagetable per
  * process or global
  *
  * Return: errno in failure or 0 in case of success
  */
-int set_map_iova(u64 offset, struct vfio_device *vfio_dev, int ptselect)
+int set_map_iova(u64 offset, struct device *dev, int ptselect)
 {
 	struct kiumd_iommu_dma_cookie *cookie;
 	dma_addr_t iova = offset;
@@ -958,7 +882,7 @@ int set_map_iova(u64 offset, struct vfio_device *vfio_dev, int ptselect)
 		return -EINVAL;
 	}
 
-	cookie = kiumd_get_dma_cookie(vfio_dev);
+	cookie = kiumd_get_dma_cookie(dev);
 	if (!cookie) {
 		pr_err("%s failed to get cookie\n", __func__);
 		return -EINVAL;
@@ -998,15 +922,15 @@ static void kiumd_mangle_sg_table(struct sg_table *sg_table)
  * by checking the cookie type for the vfio device.
  *
  * Parameters:
- * @vfio_dev: pointer for vfio device structure
+ * @dev: pointer for device structure
  *
  * Return: true/false
  */
-bool is_fixed_mapping(struct vfio_device *vfio_dev)
+bool is_fixed_mapping(struct device *dev)
 {
 	struct kiumd_iommu_dma_cookie *cookie;
 
-	cookie = kiumd_get_dma_cookie(vfio_dev);
+	cookie = kiumd_get_dma_cookie(dev);
 	if (cookie) {
 		if (cookie->type == IOMMU_DMA_MSI_COOKIE)
 			return true;
@@ -1113,15 +1037,15 @@ static unsigned long alloc_iova_range_contiguous(struct pgtable_map *ptable_ctx,
  *
  * Parameters:
  * @vfio_fd: File descriptor for the VFIO device
+ * @dev: device
  * @kiumd_ctx: Pointer to the kiumd context
  * @size: Size of the IOVA range to allocate
  * @idx: Index of the pagetable entry to retrieve
  *
  * Return: The starting address of the allocated IOVA range, or 0 if any step fails.
  */
-uint64_t get_pgtble_and_alloc_iova(int vfio_fd,
-				   struct kiumd_ctx *kiumd_ctx,
-				   u64 size,
+uint64_t get_pgtble_and_alloc_iova(struct device *dev,
+				   struct kiumd_ctx *kiumd_ctx, u64 size,
 				   unsigned int idx)
 {
 	struct pgtable_map *pgtble_ctx;
@@ -1133,7 +1057,7 @@ uint64_t get_pgtble_and_alloc_iova(int vfio_fd,
 		return 0;
 	}
 
-	if (!check_pgtable_context(vfio_fd, pgtble_ctx)) {
+	if (!check_pgtable_context(dev, pgtble_ctx)) {
 		pr_err("%s:%d check_pgtable_context failed\n", __func__, __LINE__);
 		return 0;
 	}
@@ -1155,12 +1079,12 @@ void add_to_smmu_table(struct kiumd_ctx *ctx, struct smmu_map_data *map_data)
 	spin_unlock(&ctx->smmu_lock);
 }
 
-static int set_allocated_iova(struct vfio_device *vfio_dev, unsigned long iova)
+static int set_allocated_iova(struct device *dev, unsigned long iova)
 {
 	struct kiumd_iommu_dma_cookie *cookie;
 	int ret;
 
-	cookie = kiumd_get_dma_cookie(vfio_dev);
+	cookie = kiumd_get_dma_cookie(dev);
 	if (!cookie) {
 		pr_err("%s failed to get cookie\n", __func__);
 		return -EINVAL;
@@ -1173,8 +1097,7 @@ static int set_allocated_iova(struct vfio_device *vfio_dev, unsigned long iova)
 	return ret;
 }
 
-int init_and_allocate_iova(struct vfio_device *vfio_dev,
-			   struct kiumd_ctx *kiumd_ctx,
+int init_and_allocate_iova(struct device *dev, struct kiumd_ctx *kiumd_ctx,
 			   unsigned long idx, unsigned int size,
 			   unsigned long max_shift)
 {
@@ -1206,13 +1129,13 @@ int init_and_allocate_iova(struct vfio_device *vfio_dev,
 		}
 	}
 
-	iova = alloc_iova_range(vfio_dev, pgtable_ctx, size, max_shift);
+	iova = alloc_iova_range(dev, pgtable_ctx, size, max_shift);
 	if (!iova) {
 		pr_err("%s: Failed to allocate iova.\n", __func__);
 		return -ENOMEM;
 	}
 
-	ret = set_allocated_iova(vfio_dev, iova);
+	ret = set_allocated_iova(dev, iova);
 	if (ret < 0) {
 		pr_err("%s: Failed to set the iova.\n", __func__);
 		return -ENOMEM;
@@ -1221,23 +1144,11 @@ int init_and_allocate_iova(struct vfio_device *vfio_dev,
 	return 0;
 }
 
-unsigned long get_hash_key(int vfio_fd)
+unsigned long get_hash_key(struct device *dev)
 {
-	struct vfio_device *vfio_dev;
 	unsigned long hash_id;
 
-	if (vfio_fd < 0) {
-		pr_err("%s:%d invalid fd from user\n", __func__, __LINE__);
-		return -EBADF;
-	}
-
-	vfio_dev = kiumd_get_vfio_device(vfio_fd);
-	if (!vfio_dev) {
-		pr_err("%s:invalid vfio_fd from user\n", __func__);
-		return -EINVAL;
-	}
-
-	hash_id = (unsigned long) kiumd_iommu_get_dma_domain(vfio_dev->dev);
+	hash_id = (unsigned long) kiumd_iommu_get_dma_domain(dev);
 	if (!hash_id) {
 		pr_err("%s:invalid domain\n", __func__);
 		return -EINVAL;
@@ -1548,12 +1459,12 @@ out:
  * getting iommu_domain, smmu_domain and pagetable
  *
  * Parameters:
- * @vfio_fd: file descriptor for vfio device
+ * @dev: device
  * @pgd: page global directory pointer
  *
  * Return: 0 upon success and error codes on failure
  */
-int kiumd_get_pgd(struct vfio_device *vfio_dev, u64 *pgd)
+int kiumd_get_pgd(struct device *dev, u64 *pgd)
 {
 	struct arm_smmu_domain *smmu_dom;
 	struct iommu_domain *iommu_dom;
@@ -1564,9 +1475,9 @@ int kiumd_get_pgd(struct vfio_device *vfio_dev, u64 *pgd)
 		return -EINVAL;
 	}
 
-	iommu_dom = kiumd_iommu_get_dma_domain(vfio_dev->dev);
+	iommu_dom = kiumd_iommu_get_dma_domain(dev);
 	if (!iommu_dom) {
-		pr_err("%s:%d Failed to get IOMMU DOMAIN VFIO\n",
+		pr_err("%s:%d Failed to get IOMMU DOMAIN\n",
 		       __func__, __LINE__);
 		return -EINVAL;
 	}

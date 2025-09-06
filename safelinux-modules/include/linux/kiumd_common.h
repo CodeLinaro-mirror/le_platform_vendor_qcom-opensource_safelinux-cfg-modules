@@ -275,7 +275,7 @@ struct smmu_map_data {
 	int ptselect;
 	int is_iova_zero;
 	bool is_fixed_map;
-	struct vfio_device *vfio_dev;
+	struct device *dev;
 	void *context;
 	struct hlist_node node;
 };
@@ -298,8 +298,6 @@ struct hyp_map_data {
 	struct hlist_node node;
 };
 
-struct vfio_device *kiumd_get_vfio_device(int fd);
-
 struct iommu_domain *kiumd_iommu_get_dma_domain(struct device *dev);
 
 int kiumd_set_pgtble_ttbr0_context(struct iommu_domain *iommu_dom,
@@ -310,7 +308,7 @@ int kiumd_set_pgtble_ttbr1_context(struct iommu_domain *iommu_dom);
 struct pgtable_map *kiumd_get_pgtable_entry(struct kiumd_ctx *kiumd_ctx,
 					    unsigned long idx, bool is_process);
 
-bool check_pgtable_context(int vfio_fd, struct pgtable_map *pgtable_ctx);
+bool check_pgtable_context(struct device *dev, struct pgtable_map *pgtable_ctx);
 
 struct iommu_domain *kiumd_iommu_get_dma_domain(struct device *dev);
 
@@ -318,10 +316,9 @@ unsigned long get_shift_from_dt(struct device *dev);
 
 int kiumd_set_dma_addr_ranges(struct kiumd_ctx *kiumd_ctx, struct device *dev);
 
-unsigned long get_hash_key(int vfio_fd);
+unsigned long get_hash_key(struct device *dev);
 
-int init_and_allocate_iova(struct vfio_device *vfio_dev,
-			   struct kiumd_ctx *kiumd_ctx,
+int init_and_allocate_iova(struct device *dev, struct kiumd_ctx *kiumd_ctx,
 			   unsigned long idx, unsigned int size,
 			   unsigned long max_shift);
 
@@ -330,20 +327,18 @@ void add_to_smmu_table(struct kiumd_ctx *ctx, struct smmu_map_data *map_data);
 int free_allocated_iova(struct kiumd_ctx *kiumd_ctx, unsigned long iova,
 			unsigned long idx, bool is_process);
 
-struct iommu_domain *kiumd_get_iommu_domain(int vfio_fd);
-
 s64 get_map_offset(u64 size, int ptselect);
 
-int set_map_iova(u64 offset, struct vfio_device *vfio_dev, int ptselect);
+int set_map_iova(u64 offset, struct device *dev, int ptselect);
 
-uint64_t get_pgtble_and_alloc_iova(int vfio_fd,
+uint64_t get_pgtble_and_alloc_iova(struct device *dev,
 				   struct kiumd_ctx *kiumd_ctx,
 				   u64 size,
 				   unsigned int idx);
 
-bool is_fixed_mapping(struct vfio_device *vfio_dev);
+bool is_fixed_mapping(struct device *dev);
 
-int kiumd_configure_dma_cookie(struct vfio_device *vfio_dev,
+int kiumd_configure_dma_cookie(struct device *dev,
 			       enum iommu_dma_cookie_type cookie_type,
 			       dma_addr_t dma_addr);
 
@@ -352,11 +347,13 @@ int clear_map_iova(struct kiumd_ctx *kiumd_ctx, u64 iova, u64 size,
 
 bool check_ptselect(struct kiumd_user *kiusr);
 
-struct kiumd_iommu_dma_cookie *kiumd_get_dma_cookie(struct vfio_device *vfio_dev);
+struct kiumd_iommu_dma_cookie *kiumd_get_dma_cookie(struct device *dev);
 
 int kiumd_set_dma_cookie_unlocked(struct kiumd_iommu_dma_cookie *cookie,
 				  enum iommu_dma_cookie_type type,
 				  dma_addr_t iova);
+
+struct arm_smmu_domain *kiumd_get_smmu_domain(struct device *dev);
 
 int kiumd_acl_to_vmid_perms_list(unsigned int nr_acl_entries,
 				 const void __user *acl_entries,
@@ -369,7 +366,7 @@ int kiumd_hyp_assign_sg(struct sg_table *sgt, int *dest_vm_list,
 int kiumd_hyp_unassign_sg(struct sg_table *sgt, int *source_vm_list,
 			  int source_nelems, bool clear_page_private);
 
-int kiumd_get_pgd(struct vfio_device *vfio_dev, u64 *pgd);
+int kiumd_get_pgd(struct device *dev, u64 *pgd);
 
 int kiumd_io_pgtable_hyp_assign_page(u32 *vmid, u64 page, u32 nr_acl_entries);
 

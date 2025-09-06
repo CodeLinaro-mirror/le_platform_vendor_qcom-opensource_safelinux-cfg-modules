@@ -33,6 +33,53 @@ struct smmu_device_obj *head;
 struct kmem_cache *iommu_addr_cache;
 
 /**
+ * Added in kernel tag v6.12-rc1
+ */
+DEFINE_FREE(fput, struct file *, if (_T) fput(_T))
+
+/**
+ * @Brief: This function provide the device
+ * pointer for the given file descriptor
+ *
+ * Parameters:
+ * @fd: file descriptor
+ *
+ * Returns vfio device * upon success and NULL
+ * on failure
+ */
+static struct device *kiumd_vfio_get_device(unsigned int vfio_fd,
+					    struct file **vfio_file)
+{
+	struct vfio_device *vfio_dev;
+	struct vfio_device_file *df;
+	struct file *file;
+
+
+	file = fget(vfio_fd);
+	if (!file) {
+		pr_err("Failed to get file from vfio_fd\n");
+		return NULL;
+	}
+
+	*vfio_file = file;
+	if (!vfio_file_is_valid(file))
+		goto close_file;
+
+	df = (struct vfio_device_file *)file->private_data;
+	if (!df)
+		goto close_file;
+
+	vfio_dev = (struct vfio_device *)df->device;
+	if (!vfio_dev || !vfio_dev->dev)
+		goto close_file;
+
+	return vfio_dev->dev;
+close_file:
+	pr_err("Failed to get device from vfio_fd\n");
+	return NULL;
+}
+
+/**
  * kiumd_set_pgtbl_context - Set the page table context for an SMMU device.
  *
  * Parameters:
@@ -42,23 +89,21 @@ struct kmem_cache *iommu_addr_cache;
  */
 static int kiumd_set_pgtbl_context(char __user *arg, struct file *fp)
 {
+	struct file *vfio_file __free(fput) = NULL;
 	struct iommu_domain *iommu_dom;
-	struct vfio_device *vfio_dev;
 	struct kiumd_user pgtbl_ctx;
 	struct kiumd_ctx *kiumd_ctx;
-
+	struct device *dev;
 	int ret;
 
 	if (copy_from_user(&pgtbl_ctx, arg, sizeof(struct kiumd_user)))
 		return -EFAULT;
 
-	vfio_dev = kiumd_get_vfio_device(pgtbl_ctx.vfio_fd);
-	if (!vfio_dev) {
-		pr_err("%s: vfio_dev is NULL\n", __func__);
-		return -EINVAL;
-	}
+	dev = kiumd_vfio_get_device(pgtbl_ctx.vfio_fd, &vfio_file);
+	if (!dev)
+		return -EBADF;
 
-	iommu_dom = kiumd_iommu_get_dma_domain(vfio_dev->dev);
+	iommu_dom = kiumd_iommu_get_dma_domain(dev);
 	if (!iommu_dom) {
 		pr_err("%s: iommu domain is NULL\n", __func__);
 		return -EINVAL;
@@ -92,39 +137,29 @@ static int kiumd_set_pgtbl_context(char __user *arg, struct file *fp)
  */
 static  int kiumd_perprocess_pt_alloc(char __user *arg, struct file *fp)
 {
+	struct file *vfio_file __free(fput) = NULL;
 	struct kiumd_kgsl_context *kgsl_context;
 	struct arm_smmu_domain *smmu_dom;
-	struct iommu_domain *iommu_dom;
 	struct pgtable_map *pgtbl_ctx;
-	struct vfio_device *vfio_dev;
 	struct kiumd_ctx *kiumd_ctx;
 	struct io_pgtable *pgtable;
 	struct io_pgtable_cfg cfg;
 	struct kiumd_user kiusr;
+	struct device *dev;
 
 	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user)))
 		return -EFAULT;
 
-	vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
-	if (!vfio_dev) {
-		pr_err("%s:%d vfio_dev is NULL\n", __func__, __LINE__);
-		return -EINVAL;
-	}
+	dev = kiumd_vfio_get_device(kiusr.vfio_fd, &vfio_file);
+	if (!dev)
+		return -EBADF;
 
 	trace_kiumd_perprocess_pt_alloc_start(kiusr.vfio_fd);
-	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-	iommu_dom = kiumd_iommu_get_dma_domain(vfio_dev->dev);
-	if (!iommu_dom) {
-		pr_err("%s:%d iommu domain is NULL\n", __func__, __LINE__);
-		return -EINVAL;
-	}
 
-	smmu_dom = container_of(iommu_dom, struct arm_smmu_domain, domain);
-	if ((!smmu_dom) || (!(smmu_dom->pgtbl_ops))) {
-		pr_err("%s:%d smmu domain/pagetable ops is invalid\n",
-		       __func__, __LINE__);
+	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
+	smmu_dom = kiumd_get_smmu_domain(dev);
+	if (!smmu_dom)
 		return -EINVAL;
-	}
 
 	pgtable = kiumd_ctx->pgtable;
 	if (!pgtable) {
@@ -192,61 +227,32 @@ static  int kiumd_perprocess_pt_alloc(char __user *arg, struct file *fp)
  */
 static int kiumd_global_pgtble_set(char __user *arg, struct file *fp)
 {
-
+	struct file *vfio_file __free(fput) = NULL;
 	struct io_pgtable_ops *ki_pgtbl_ops;
 	struct arm_smmu_domain *smmu_dom;
 	struct kiumd_user kismmu_pproc;
-	struct iommu_domain *iommu_dom;
-	struct vfio_device *vfio_dev;
-	struct vfio_device_file *df;
 	struct kiumd_ctx *kiumd_ctx;
 	struct io_pgtable *pgtable;
-	struct file *file;
+	struct device *dev;
 
 	if (copy_from_user(&kismmu_pproc, arg, sizeof(struct kiumd_user)))
 		return -EFAULT;
 
 	trace_kiumd_global_pgtble_set_start(kismmu_pproc.vfio_fd);
 
-	if (kismmu_pproc.vfio_fd < 0) {
-		pr_err("%s: Invalid fd from user\n", __func__);
+	dev = kiumd_vfio_get_device(kismmu_pproc.vfio_fd, &vfio_file);
+	if (!dev)
 		return -EBADF;
-	}
-
-	file = fget(kismmu_pproc.vfio_fd);
-	if (!file) {
-		pr_err("%s:failed to get file from vfio fd\n", __func__);
-		return -EBADF;
-	}
-
-	df = (struct vfio_device_file *)file->private_data;
-	vfio_dev = (struct vfio_device *)df->device;
-	if (!vfio_dev) {
-		pr_err("%s:vfio_dev is NULL\n", __func__);
-		fput(file);
-		return -ENOTTY;
-	}
 
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-	iommu_dom = kiumd_iommu_get_dma_domain(vfio_dev->dev);
-	if (!iommu_dom) {
-		pr_err("%s:IOMMU domain is NULL\n", __func__);
-		fput(file);
-		return -ENOMEM;
-	}
-
-	smmu_dom = container_of(iommu_dom, struct arm_smmu_domain, domain);
-	if (!smmu_dom) {
-		pr_err("%s:SMMU domain is NULL\n", __func__);
-		fput(file);
-		return -ENOMEM;
-	}
+	smmu_dom = kiumd_get_smmu_domain(dev);
+	if (!smmu_dom)
+		return -EINVAL;
 
 	if (!kiumd_ctx->pgtable) {
 		kiumd_ctx->pgtable = io_pgtable_ops_to_pgtable(smmu_dom->pgtbl_ops);
 		if (!kiumd_ctx->pgtable) {
 			pr_err("%s:pagetable is NULL\n", __func__);
-			fput(file);
 			return -EINVAL;
 		}
 	}
@@ -255,15 +261,11 @@ static int kiumd_global_pgtble_set(char __user *arg, struct file *fp)
 	ki_pgtbl_ops = (struct io_pgtable_ops *) (&pgtable->ops);
 	if (!ki_pgtbl_ops) {
 		pr_err("%s:pagetable ops is NULL\n", __func__);
-		fput(file);
 		return -ENOMEM;
 	}
 
 	smmu_dom->pgtbl_ops = ki_pgtbl_ops;
-	fput(file);
-
 	trace_kiumd_global_pgtble_set_end(kismmu_pproc.vfio_fd);
-
 	return 0;
 }
 
@@ -278,13 +280,11 @@ static int kiumd_global_pgtble_set(char __user *arg, struct file *fp)
  */
 static int kiumd_perprocess_pgtble_set(char __user *arg)
 {
+	struct file *vfio_file __free(fput) = NULL;
 	struct io_pgtable_ops *ki_pgtbl_ops;
 	struct arm_smmu_domain *smmu_dom;
 	struct kiumd_user kismmu_pproc;
-	struct iommu_domain *iommu_dom;
-	struct vfio_device *vfio_dev;
-	struct vfio_device_file *df;
-	struct file *file;
+	struct device *dev;
 
 	if (copy_from_user(&kismmu_pproc, arg, sizeof(struct kiumd_user)))
 		return -EFAULT;
@@ -294,38 +294,13 @@ static int kiumd_perprocess_pgtble_set(char __user *arg)
 						kismmu_pproc.ttbr0,
 						kismmu_pproc.asid);
 
-	if (kismmu_pproc.vfio_fd < 0) {
-		pr_err("%s: Invalid fd from user\n", __func__);
+	dev = kiumd_vfio_get_device(kismmu_pproc.vfio_fd, &vfio_file);
+	if (!dev)
 		return -EBADF;
-	}
 
-	file = fget(kismmu_pproc.vfio_fd);
-	if (!file) {
-		pr_err("%s:failed to get file from vfio fd\n", __func__);
-		return -EBADF;
-	}
-
-	df = (struct vfio_device_file *)file->private_data;
-	vfio_dev = (struct vfio_device *)df->device;
-	if (!vfio_dev) {
-		pr_err("%s:vfio_dev is NULL\n", __func__);
-		fput(file);
+	smmu_dom = kiumd_get_smmu_domain(dev);
+	if (!smmu_dom)
 		return -EINVAL;
-	}
-
-	iommu_dom = kiumd_iommu_get_dma_domain(vfio_dev->dev);
-	if (!iommu_dom) {
-		pr_err("%s:IOMMU domain is NULL\n", __func__);
-		fput(file);
-		return -EINVAL;
-	}
-
-	smmu_dom = container_of(iommu_dom, struct arm_smmu_domain, domain);
-	if (!smmu_dom) {
-		pr_err("%s:SMMU domain is NULL\n", __func__);
-		fput(file);
-		return -EINVAL;
-	}
 
 	ki_pgtbl_ops = (struct io_pgtable_ops *)kismmu_pproc.pgtbl_ops_ptr;
 	if (!ki_pgtbl_ops) {
@@ -334,10 +309,7 @@ static int kiumd_perprocess_pgtble_set(char __user *arg)
 	}
 
 	smmu_dom->pgtbl_ops = ki_pgtbl_ops;
-	fput(file);
-
 	trace_kiumd_perprocess_pgtble_set_end(kismmu_pproc.vfio_fd);
-
 	return 0;
 }
 
@@ -352,11 +324,12 @@ static int kiumd_perprocess_pgtble_set(char __user *arg)
  */
 static int kiumd_perprocess_pgtble_free(char __user *arg, struct file *fp)
 {
-	struct kiumd_user kiusr;
-	struct vfio_device *vfio_dev;
+	struct file *vfio_file __free(fput) = NULL;
 	struct io_pgtable_ops *pgtable_ops;
 	struct pgtable_map *pgtble_ctx;
 	struct kiumd_ctx *kiumd_ctx;
+	struct kiumd_user kiusr;
+	struct device *dev;
 
 	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user)))
 		return -EFAULT;
@@ -366,11 +339,9 @@ static int kiumd_perprocess_pgtble_free(char __user *arg, struct file *fp)
 						 kiusr.ttbr0, kiusr.asid);
 
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-	vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
-	if (!vfio_dev) {
-		pr_err("%s:%d vfio_dev is NULL\n", __func__, __LINE__);
-		return -EINVAL;
-	}
+	dev = kiumd_vfio_get_device(kiusr.vfio_fd, &vfio_file);
+	if (!dev)
+		return -EBADF;
 
 	pgtble_ctx = kiumd_get_pgtable_entry(kiumd_ctx, kiusr.pt_id, true);
 	if (!pgtble_ctx) {
@@ -379,7 +350,7 @@ static int kiumd_perprocess_pgtble_free(char __user *arg, struct file *fp)
 		return -EINVAL;
 	}
 
-	if (!check_pgtable_context(kiusr.vfio_fd, pgtble_ctx)) {
+	if (!check_pgtable_context(dev, pgtble_ctx)) {
 		pr_err("%s:%d check_pgtable_context failed\n", __func__,
 			__LINE__);
 		return -EINVAL;
@@ -396,9 +367,7 @@ static int kiumd_perprocess_pgtble_free(char __user *arg, struct file *fp)
 	}
 
 	free_io_pgtable_ops(pgtable_ops);
-
 	trace_kiumd_perprocess_pgtble_free_end(kiusr.vfio_fd);
-
 	return 0;
 }
 
@@ -413,36 +382,34 @@ static int kiumd_perprocess_pgtble_free(char __user *arg, struct file *fp)
  */
 static int kiumd_manage_runtime_pm(char __user *arg)
 {
-	struct vfio_device *vfio_dev;
+	struct file *vfio_file __free(fput) = NULL;
 	struct kiumd_user kiusr;
-	int ret = 0;
+	struct device *dev;
+	int ret;
 
 	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user)))
 		return -EFAULT;
 
-	vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
-	if (!vfio_dev) {
-		pr_err("%s:vfio_dev is invalid\n", __func__);
-		return -EINVAL;
-	}
+	dev = kiumd_vfio_get_device(kiusr.vfio_fd, &vfio_file);
+	if (!dev)
+		return -EBADF;
 
 	switch (kiusr.pm_state) {
-
 	case DEV_PWR_OFF:
-		ret = pm_runtime_put_sync(vfio_dev->dev);
+		ret = pm_runtime_put_sync(dev);
 		break;
 	case DEV_PWR_ON:
-		ret = pm_runtime_resume_and_get(vfio_dev->dev);
+		ret = pm_runtime_resume_and_get(dev);
 		break;
 	default:
 		ret = -EINVAL;
-		dev_warn(vfio_dev->dev, "%s: Unsupported state(%d)\n", __func__,
+		dev_warn(dev, "%s: Unsupported state(%d)\n", __func__,
 			kiusr.pm_state);
 		break;
 	}
 
 	if (ret < 0)
-		dev_err(vfio_dev->dev, "%s: Operation(%d) failed with err=%d\n",
+		dev_err(dev, "%s: Operation(%d) failed with err=%d\n",
 			__func__, kiusr.pm_state, ret);
 
 	return ret;
@@ -460,16 +427,15 @@ static int kiumd_manage_runtime_pm(char __user *arg)
  */
 static int kiumd_dmabuf_custom_iova_init(char __user *arg, struct file *fp)
 {
+	struct file *vfio_file __free(fput) = NULL;
 	struct kiumd_iommu_dma_cookie *cookie;
 	struct iommu_resv_region *region;
-	struct vfio_device *vfio_dev;
-	struct vfio_device_file *df;
 	struct iommu_domain *domain;
 	struct kiumd_ctx *kiumd_ctx;
 	struct iova_domain *iovad;
 	struct kiumd_user kiusr;
 	unsigned long lo, hi;
-	struct file *file;
+	struct device *dev;
 	LIST_HEAD(resrvd);
 	int ret;
 
@@ -477,25 +443,9 @@ static int kiumd_dmabuf_custom_iova_init(char __user *arg, struct file *fp)
 		return -EFAULT;
 
 	trace_kiumd_dmabuf_custom_iova_init_start(kiusr.vfio_fd);
-
-	if (kiusr.vfio_fd < 0) {
-		pr_err("%s: Invalid fd from user\n", __func__);
+	dev = kiumd_vfio_get_device(kiusr.vfio_fd, &vfio_file);
+	if (!dev)
 		return -EBADF;
-	}
-
-	file = fget(kiusr.vfio_fd);
-	if (!file) {
-		pr_err("%s:Invalid vfio fd\n", __func__);
-		return -EBADF;
-	}
-
-	df = (struct vfio_device_file *)file->private_data;
-	vfio_dev = (struct vfio_device *)df->device;
-	if (!vfio_dev)  {
-		pr_err("%s:vfio_dev is NULL\n", __func__);
-		fput(file);
-		return -EINVAL;
-	}
 
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
 
@@ -503,45 +453,41 @@ static int kiumd_dmabuf_custom_iova_init(char __user *arg, struct file *fp)
 	 * Get the maximum shift from DT for managed_iova_map api to
 	 * determine alignment for large buffers
 	 */
-	kiumd_ctx->max_shift = get_shift_from_dt(vfio_dev->dev);
+	kiumd_ctx->max_shift = get_shift_from_dt(dev);
 
-	kiumd_set_dma_max_seg_size(vfio_dev->dev,
-				(unsigned int) DMA_BIT_MASK(32));
+	kiumd_set_dma_max_seg_size(dev, (unsigned int) DMA_BIT_MASK(32));
 
-	ret = kiumd_set_dma_addr_ranges(kiumd_ctx, vfio_dev->dev);
+	ret = kiumd_set_dma_addr_ranges(kiumd_ctx, dev);
 	if (ret) {
 		pr_err("%s:set dma addr ranges failed for %s\n", __func__,
-		       dev_name(vfio_dev->dev));
-		fput(file);
+		       dev_name(dev));
 		return -EINVAL;
 	}
 
-	domain = kiumd_iommu_get_dma_domain(vfio_dev->dev);
+	domain = kiumd_iommu_get_dma_domain(dev);
 	if (!domain) {
 		pr_err("%s:dma_domain is invalid\n", __func__);
-		fput(file);
 		return -EINVAL;
 	}
 
 	cookie = (struct kiumd_iommu_dma_cookie *)domain->iova_cookie;
 	iovad = &cookie->iovad;
 
-	qcom_iommu_generate_resv_regions(vfio_dev->dev, &resrvd);
+	qcom_iommu_generate_resv_regions(dev, &resrvd);
 	list_for_each_entry(region, &resrvd, list) {
 		lo = iova_pfn(iovad, region->start);
 		hi = iova_pfn(iovad, region->start + region->length - 1);
 		reserve_iova(iovad, lo, hi);
 	}
 
-	fput(file);
 	trace_kiumd_dmabuf_custom_iova_init_end(kiusr.vfio_fd);
 	return 0;
 }
 
 static int kiumd_dmabuf_managed_iova_map(char __user *arg, struct file *fp)
 {
+	struct file *vfio_file __free(fput) = NULL;
 	struct dma_buf_attachment *dmabufattach;
-	struct vfio_device *vfio_dev;
 	struct dma_buf *kiumd_dmabuf;
 	int kiumd_dma_direction, ret;
 	struct kiumd_ctx *kiumd_ctx;
@@ -549,18 +495,17 @@ static int kiumd_dmabuf_managed_iova_map(char __user *arg, struct file *fp)
 	struct kiumd_user kiusr;
 	unsigned long hash_id;
 	struct sg_table *sgt;
+	struct device *dev;
 
 	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user)))
 		return -EFAULT;
 
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-	vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
-	if (!vfio_dev) {
-		pr_err("%s: invalid vfio device fd\n", __func__);
-		return -EINVAL;
-	}
+	dev = kiumd_vfio_get_device(kiusr.vfio_fd, &vfio_file);
+	if (!dev)
+		return -EBADF;
 
-	hash_id = get_hash_key(kiusr.vfio_fd);
+	hash_id = get_hash_key(dev);
 	if (!hash_id) {
 		pr_err("%s:invalid domain\n", __func__);
 		return -EINVAL;
@@ -569,31 +514,26 @@ static int kiumd_dmabuf_managed_iova_map(char __user *arg, struct file *fp)
 	kiumd_dmabuf = dma_buf_get(kiusr.dma_buf_fd);
 	if (IS_ERR_OR_NULL(kiumd_dmabuf)) {
 		pr_err("%s:dma_buf_get failed with error: %ld, for device: %s\n",
-		       __func__, PTR_ERR(kiumd_dmabuf), dev_name(vfio_dev->dev));
+		       __func__, PTR_ERR(kiumd_dmabuf), dev_name(dev));
 		ret = (kiumd_dmabuf == NULL ? -EINVAL : PTR_ERR(kiumd_dmabuf));
 		return ret;
 	}
 
 	if (kiumd_ctx->max_shift) {
-		ret = init_and_allocate_iova(vfio_dev, kiumd_ctx, hash_id,
+		ret = init_and_allocate_iova(dev, kiumd_ctx, hash_id,
 					     kiumd_dmabuf->size,
 					     kiumd_ctx->max_shift);
 		if (ret) {
 			pr_err("%s: failed to allocate iova for: %s, ret: %d\n",
-			       __func__, dev_name(vfio_dev->dev), ret);
+			       __func__, dev_name(dev), ret);
 			return ret;
 		}
 	}
 
-	if (!(vfio_dev->dev)) {
-		pr_err("%s:vfio_dev->dev is NULL\n", __func__);
-		return -ENODEV;
-	}
-
-	dmabufattach = dma_buf_attach(kiumd_dmabuf, vfio_dev->dev);
+	dmabufattach = dma_buf_attach(kiumd_dmabuf, dev);
 	if (IS_ERR(dmabufattach)) {
 		pr_err("%s:dmabufattach failed with error: %ld, for device: %s\n",
-		       __func__, PTR_ERR(dmabufattach), dev_name(vfio_dev->dev));
+		       __func__, PTR_ERR(dmabufattach), dev_name(dev));
 		ret = PTR_ERR(dmabufattach);
 		goto fail_put;
 	}
@@ -619,7 +559,7 @@ static int kiumd_dmabuf_managed_iova_map(char __user *arg, struct file *fp)
 	sgt = dma_buf_map_attachment_unlocked(dmabufattach, kiumd_dma_direction);
 	if (IS_ERR_OR_NULL(sgt)) {
 		pr_err("%s: mapping failed with error: %ld, for device: %s\n",
-		       __func__, PTR_ERR(sgt), dev_name(vfio_dev->dev));
+		       __func__, PTR_ERR(sgt), dev_name(dev));
 		ret = (sgt == NULL ? -EINVAL : PTR_ERR(sgt));
 		goto fail_detach;
 	}
@@ -650,7 +590,6 @@ static int kiumd_dmabuf_managed_iova_map(char __user *arg, struct file *fp)
 
 fail_detach:
 	dma_buf_detach(kiumd_dmabuf, dmabufattach);
-
 fail_put:
 	dma_buf_put(kiumd_dmabuf);
 
@@ -659,6 +598,7 @@ fail_put:
 
 static int kiumd_dmabuf_managed_iova_unmap(char __user *arg, struct file *fp)
 {
+	struct file *vfio_file __free(fput) = NULL;
 	struct dma_buf_attachment *dmabufattach;
 	struct iommu_domain *iommu_dom;
 	int kiumd_dma_direction, ret;
@@ -667,18 +607,16 @@ static int kiumd_dmabuf_managed_iova_unmap(char __user *arg, struct file *fp)
 	struct smmu_map_data *smap;
 	struct kiumd_user kiusr;
 	unsigned long hash_id;
+	struct device *dev;
 	bool found = false;
 
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-
 	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user)))
 		return -EFAULT;
 
-	if (kiusr.id < 0) {
-		pr_err("%s:id passed from user should be positive value\n",
-			__func__);
-		return -EFAULT;
-	}
+	dev = kiumd_vfio_get_device(kiusr.vfio_fd, &vfio_file);
+	if (!dev)
+		return -EBADF;
 
 	spin_lock(&kiumd_ctx->smmu_lock);
 	hash_for_each_possible(kiumd_ctx->smmu_table, smap, node, kiusr.id) {
@@ -701,7 +639,7 @@ static int kiumd_dmabuf_managed_iova_unmap(char __user *arg, struct file *fp)
 		return -EINVAL;
 	}
 
-	hash_id = get_hash_key(kiusr.vfio_fd);
+	hash_id = get_hash_key(dev);
 	if (hash_id < 0) {
 		pr_err("%s:invalid domain\n", __func__);
 		return -EINVAL;
@@ -736,21 +674,19 @@ static int kiumd_dmabuf_managed_iova_unmap(char __user *arg, struct file *fp)
 					  (struct sg_table *)smap->sgt_ptr,
 					  kiumd_dma_direction);
 
-	iommu_dom = kiumd_get_iommu_domain(kiusr.vfio_fd);
+	iommu_dom = kiumd_iommu_get_dma_domain(dev);
 	if (!iommu_dom) {
 		pr_err("%s: iommu_dom is NULL\n", __func__);
 		return -EINVAL;
 	}
 
 	iommu_flush_iotlb_all(iommu_dom);
-
 	spin_lock(&kiumd_ctx->smmu_lock);
 	hash_del(&smap->node);
 	kfree(smap);
 	spin_unlock(&kiumd_ctx->smmu_lock);
 	dma_buf_detach(kiumd_dmabuf, dmabufattach);
 	dma_buf_put(kiumd_dmabuf);
-
 	return 0;
 }
 
@@ -767,17 +703,16 @@ static int kiumd_dmabuf_managed_iova_unmap(char __user *arg, struct file *fp)
 static int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 {
 	struct kiumd_dma_heap_attachment *dmaheapattachment;
+	struct file *vfio_file __free(fput) = NULL;
 	struct dma_buf_attachment *dmabufattach;
 	int kiumd_dma_direction, ret, prot;
 	struct iommu_domain *iommu_dom;
 	struct dma_buf *kiumd_dmabuf;
-	struct vfio_device *vfio_dev;
 	struct kiumd_ctx *kiumd_ctx;
-	struct vfio_device_file *df;
 	struct smmu_map_data *smap;
 	struct kiumd_user kiusr;
 	struct sg_table *sgt;
-	struct file *file;
+	struct device *dev;
 	s64 offset;
 	u64 size;
 
@@ -789,34 +724,20 @@ static int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user)))
 		return -EFAULT;
 
-	if (kiusr.vfio_fd < 0) {
-		pr_err("%s: Invalid fd from user\n", __func__);
+	dev = kiumd_vfio_get_device(kiusr.vfio_fd, &vfio_file);
+	if (!dev)
 		return -EBADF;
-	}
-
-	file = fget(kiusr.vfio_fd);
-	if (!file) {
-		pr_err("%s:failed to get file from vfio fd\n", __func__);
-		return -EBADF;
-	}
-	df = (struct vfio_device_file *)file->private_data;
-	vfio_dev = (struct vfio_device *)df->device;
-	if (!vfio_dev || !vfio_dev->dev) {
-		pr_err("%s:vfio_dev is NULL\n", __func__);
-		ret = -EINVAL;
-		goto fail_fput;
-	}
 
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
 	kiumd_dmabuf = dma_buf_get(kiusr.dma_buf_fd);
 	if (IS_ERR_OR_NULL(kiumd_dmabuf)) {
 		pr_err("%s:dma_buf_get failed with error: %ld, for device: %s\n",
-		       __func__, PTR_ERR(kiumd_dmabuf), vfio_dev->dev->kobj.name);
+		       __func__, PTR_ERR(kiumd_dmabuf), dev_name(dev));
 		ret = (kiumd_dmabuf == NULL ? -EINVAL : PTR_ERR(kiumd_dmabuf));
-		goto fail_fput;
+		return ret;
 	}
 
-	trace_kiumd_dmabuf_vfio_map_start(dev_name(vfio_dev->dev),
+	trace_kiumd_dmabuf_vfio_map_start(dev_name(dev),
 					  kiusr.vfio_fd, kiusr.dma_buf_fd,
 					  kiusr.dma_attr, kiusr.dma_direction,
 					  kiusr.ptselect, kiusr.is_iova_zero,
@@ -834,14 +755,14 @@ static int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 				goto fail_put;
 			}
 
-			ret = set_map_iova((u64)offset, vfio_dev, kiusr.ptselect);
+			ret = set_map_iova((u64)offset, dev, kiusr.ptselect);
 			if (ret < 0) {
 				pr_err("%s:%d failed to set offset\n",
 				       __func__, __LINE__);
 				goto fail_put;
 			}
 		} else {
-			offset = get_pgtble_and_alloc_iova(kiusr.vfio_fd,
+			offset = get_pgtble_and_alloc_iova(dev,
 							   kiumd_ctx, size,
 							   kiusr.pt_id);
 			if (!offset) {
@@ -850,7 +771,7 @@ static int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 				ret = -EINVAL;
 				goto fail_put;
 			}
-			ret = set_map_iova(offset, vfio_dev, kiusr.ptselect);
+			ret = set_map_iova(offset, dev, kiusr.ptselect);
 			if (ret < 0) {
 				pr_err("%s:%d failed to set offset\n",
 					__func__, __LINE__);
@@ -859,16 +780,10 @@ static int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 		}
 	}
 
-	if (!(vfio_dev->dev)) {
-		pr_err("%s:vfio_dev->dev is NULL\n", __func__);
-		ret = -ENODEV;
-		goto fail_put;
-	}
-
-	dmabufattach = dma_buf_attach(kiumd_dmabuf, vfio_dev->dev);
+	dmabufattach = dma_buf_attach(kiumd_dmabuf, dev);
 	if (IS_ERR(dmabufattach)) {
 		pr_err("%s:dmabufattach failed with error: %ld, for device: %s\n",
-		       __func__, PTR_ERR(dmabufattach), vfio_dev->dev->kobj.name);
+		       __func__, PTR_ERR(dmabufattach), dev_name(dev));
 		ret = PTR_ERR(dmabufattach);
 		goto fail_put;
 	}
@@ -907,12 +822,12 @@ static int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 			goto fail_detach;
 		}
 
-		ret = dma_map_sgtable(vfio_dev->dev, sgt, kiumd_dma_direction,
+		ret = dma_map_sgtable(dev, sgt, kiumd_dma_direction,
 				      DMA_ATTR_PRIVILEGED |
 				      DMA_ATTR_SKIP_CPU_SYNC);
 		if (ret) {
 			pr_err("%s:dma_map_sgtable failed with err: %d, for device: %s\n",
-			       __func__, ret, vfio_dev->dev->kobj.name);
+			       __func__, ret, dev_name(dev));
 			goto fail_detach;
 		}
 	} else {
@@ -926,7 +841,7 @@ static int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 						      kiumd_dma_direction);
 		if (IS_ERR_OR_NULL(sgt)) {
 			pr_err("%s: mapping failed with error: %ld, for device: %s\n",
-			       __func__, PTR_ERR(sgt), vfio_dev->dev->kobj.name);
+			       __func__, PTR_ERR(sgt), dev_name(dev));
 			ret = (sgt == NULL ? -EINVAL : PTR_ERR(sgt));
 			goto fail_detach;
 		}
@@ -937,11 +852,10 @@ static int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 			else
 				prot = IOMMU_CACHE | IOMMU_READ | IOMMU_WRITE;
 
-			iommu_dom = kiumd_iommu_get_dma_domain(vfio_dev->dev);
+			iommu_dom = kiumd_iommu_get_dma_domain(dev);
 			if (!iommu_dom) {
 				pr_err("%s:IOMMU domain is NULL\n", __func__);
-				ret = -EINVAL;
-				goto fail_fput;
+				return -EINVAL;
 			}
 
 #ifdef CONFIG_DMABUF_DEBUG
@@ -972,7 +886,7 @@ static int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 		}
 	}
 
-	if (is_fixed_mapping(vfio_dev))
+	if (is_fixed_mapping(dev))
 		smap->is_fixed_map = true;
 	else
 		smap->is_fixed_map = false;
@@ -983,7 +897,7 @@ static int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 	smap->dma_dir = kiumd_dma_direction;
 	smap->ptselect = kiusr.ptselect;
 	smap->is_iova_zero = kiusr.is_iova_zero;
-	smap->vfio_dev = vfio_dev;
+	smap->dev = dev;
 	spin_lock(&kiumd_ctx->smmu_lock);
 	smap->id = kiumd_ctx->id++;
 	hash_add(kiumd_ctx->smmu_table, &smap->node, smap->id);
@@ -1003,18 +917,12 @@ static int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 		goto fail_detach;
 	}
 	trace_kiumd_dmabuf_vfio_map_end(kiusr.vfio_fd, kiusr.id, kiusr.dma_addr);
-	fput(file);
 	return 0;
 
 fail_detach:
 	dma_buf_detach(kiumd_dmabuf, dmabufattach);
-
 fail_put:
 	dma_buf_put(kiumd_dmabuf);
-
-fail_fput:
-	fput(file);
-
 	return ret;
 }
 
@@ -1030,24 +938,21 @@ fail_fput:
  */
 static int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 {
-
 	struct kiumd_dma_heap_attachment *dmaheapattachment;
+	struct file *vfio_file __free(fput) = NULL;
 	struct dma_buf_attachment *dmabufattach;
 	struct iommu_domain *iommu_dom;
 	struct dma_buf *kiumd_dmabuf;
-	struct vfio_device *vfio_dev;
 	int kiumd_dma_direction, ret;
-	struct vfio_device_file *df;
 	struct kiumd_ctx *kiumd_ctx;
 	struct smmu_map_data *smap;
 	struct sg_table *sgtable;
 	struct kiumd_user kiusr;
-	struct file *file;
+	struct device *dev;
 	bool found = false;
 	u64 size;
 
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-
 	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user)))
 		return -EFAULT;
 
@@ -1077,21 +982,11 @@ static int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 		return -EINVAL;
 	}
 
-	file = fget(kiusr.vfio_fd);
-	if (!file) {
-		pr_err("%s:fget returns NULL\n", __func__);
-		return -EINVAL;
-	}
+	dev = kiumd_vfio_get_device(kiusr.vfio_fd, &vfio_file);
+	if (!dev)
+		return -EBADF;
 
-	df = (struct vfio_device_file *)file->private_data;
-	vfio_dev = (struct vfio_device *)df->device;
-	if (!vfio_dev) {
-		pr_err("%s:vfio dev returns NULL\n", __func__);
-		fput(file);
-		return -EINVAL;
-	}
-
-	trace_kiumd_dmabuf_vfio_unmap_start(dev_name(vfio_dev->dev),
+	trace_kiumd_dmabuf_vfio_unmap_start(dev_name(dev),
 					    kiusr.vfio_fd, kiusr.dma_buf_fd,
 					    kiusr.dma_addr, kiusr.dma_attr,
 					    kiusr.dma_direction,
@@ -1106,7 +1001,7 @@ static int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 
 	if (kiusr.ptselect == KGSL_GLOBAL_PT ||
 	    kiusr.ptselect == KGSL_PER_PROCESS_PT) {
-		ret = kiumd_configure_dma_cookie(vfio_dev,
+		ret = kiumd_configure_dma_cookie(dev,
 						 IOMMU_DMA_MSI_COOKIE,
 						 kiusr.dma_addr);
 		if (ret) {
@@ -1130,7 +1025,7 @@ static int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 		kiumd_dma_direction = 0;
 
 	if (smap->is_fixed_map) {
-		ret = kiumd_configure_dma_cookie(vfio_dev,
+		ret = kiumd_configure_dma_cookie(dev,
 						 IOMMU_DMA_MSI_COOKIE,
 						 kiusr.dma_addr);
 		if (ret) {
@@ -1144,25 +1039,22 @@ static int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 	    (kiusr.is_iova_zero != FIXED_IOVA_AT_ZERO)) {
 		if (!(dmabufattach->priv)) {
 			pr_err("%s:dmabufattach-priv is NULL\n", __func__);
-			fput(file);
 			return -EINVAL;
 		}
 
 		dmaheapattachment = (struct kiumd_dma_heap_attachment *)dmabufattach->priv;
 		if (!dmaheapattachment) {
 			pr_err("%s:dmaheapattachment is NULL\n", __func__);
-			fput(file);
 			return -EINVAL;
 		}
 
 		sgtable = dmaheapattachment->table;
 		if (!sgtable) {
 			pr_err("%s:sglist is NULL\n", __func__);
-			fput(file);
 			return -EINVAL;
 		}
 
-		dma_unmap_sgtable(vfio_dev->dev, sgtable, kiumd_dma_direction,
+		dma_unmap_sgtable(dev, sgtable, kiumd_dma_direction,
 				  DMA_ATTR_PRIVILEGED);
 	} else {
 		if (!smap->sgt_ptr) {
@@ -1173,7 +1065,7 @@ static int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 						  (struct sg_table *)smap->sgt_ptr,
 						  kiumd_dma_direction);
 		if (kiusr.is_iova_zero == FIXED_IOVA_AT_ZERO) {
-			iommu_dom = kiumd_get_iommu_domain(kiusr.vfio_fd);
+			iommu_dom = kiumd_iommu_get_dma_domain(dev);
 			if (!iommu_dom) {
 				pr_err("%s:iommu_dom is NULL\n", __func__);
 				return -EINVAL;
@@ -1188,7 +1080,7 @@ static int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 	}
 
 	if (check_ptselect(&kiusr) || smap->is_fixed_map) {
-		iommu_dom = kiumd_get_iommu_domain(kiusr.vfio_fd);
+		iommu_dom = kiumd_iommu_get_dma_domain(dev);
 		if (!iommu_dom) {
 			pr_err("%s:iommu_dom is NULL\n", __func__);
 			return -EINVAL;
@@ -1203,10 +1095,7 @@ static int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 	spin_unlock(&kiumd_ctx->smmu_lock);
 	dma_buf_detach(kiumd_dmabuf, dmabufattach);
 	dma_buf_put(kiumd_dmabuf);
-	fput(file);
-
 	trace_kiumd_dmabuf_vfio_unmap_end(kiusr.vfio_fd);
-
 	return 0;
 }
 
@@ -1221,11 +1110,11 @@ static int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
  */
 static int kiumd_iova_ctrl(char __user *arg)
 {
-	struct kiumd_iommu_dma_cookie *cookie;
+	struct file *vfio_file __free(fput) = NULL;
 	dma_addr_t iova_usr = IOVA_ZERO;
-	struct vfio_device *vfio_dev;
 	struct kiumd_iova iovausr;
 	int cookie_type, ret;
+	struct device *dev;
 
 	if (copy_from_user(&iovausr, arg, sizeof(struct kiumd_iova)))
 		return -EFAULT;
@@ -1242,25 +1131,16 @@ static int kiumd_iova_ctrl(char __user *arg)
 		iova_usr = iovausr.iova;
 	}
 
-	vfio_dev = kiumd_get_vfio_device(iovausr.vfio_fd);
-	if (!vfio_dev) {
-		pr_err("%s failed to get vfio device\n", __func__);
-		return -EINVAL;
-	}
+	dev = kiumd_vfio_get_device(iovausr.vfio_fd, &vfio_file);
+	if (!dev)
+		return -EBADF;
 
-	cookie = kiumd_get_dma_cookie(vfio_dev);
-	if (!cookie) {
-		pr_err("%s failed to get cookie\n", __func__);
-		return -EINVAL;
-	}
-
-	ret = kiumd_set_dma_cookie_unlocked(cookie, cookie_type, iova_usr);
+	ret = kiumd_configure_dma_cookie(dev, cookie_type, iova_usr);
 	if (ret)
-		pr_err("%s failed to set cookie\n", __func__);
+		dev_err(dev, "%s failed to set cookie\n", __func__);
 
 	trace_kiumd_iova_ctrl_end(iovausr.vfio_fd);
-
-	return ret;
+	return 0;
 }
 
 /**
@@ -1275,29 +1155,27 @@ static int kiumd_iova_ctrl(char __user *arg)
  */
 static int kiumd_dmabuf_assign_buf(char __user *arg, struct file *fp)
 {
-	struct dma_buf_attachment *dmabufattach;
+	struct file *vfio_file __free(fput) = NULL;
 	struct kiumd_secure_map_context *map_ctx;
-	struct vfio_device *vfio_dev;
+	struct dma_buf_attachment *dmabufattach;
 	struct dma_buf *kiumd_dmabuf;
 	struct kiumd_ctx *kiumd_ctx;
 	struct hyp_map_data *smap;
 	struct kiumd_user kiusr;
 	struct sg_table *sgt;
 	int *vmids, *perms;
+	struct device *dev;
 	int ret;
 
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-
 	if (copy_from_user(&kiusr, arg, sizeof(kiusr))) {
 		pr_err("%s:%d invalid args from user\n", __func__, __LINE__);
 		return -EFAULT;
 	}
 
-	vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
-	if (!vfio_dev) {
-		pr_err("%s:%d invalid vfio device fd\n", __func__, __LINE__);
-		return -EINVAL;
-	}
+	dev = kiumd_vfio_get_device(kiusr.vfio_fd, &vfio_file);
+	if (!dev)
+		return -EBADF;
 
 	kiumd_dmabuf = dma_buf_get(kiusr.dma_buf_fd);
 	if (IS_ERR_OR_NULL(kiumd_dmabuf)) {
@@ -1314,7 +1192,7 @@ static int kiumd_dmabuf_assign_buf(char __user *arg, struct file *fp)
 		return ret;
 	}
 
-	dmabufattach = dma_buf_attach(kiumd_dmabuf, vfio_dev->dev);
+	dmabufattach = dma_buf_attach(kiumd_dmabuf, dev);
 	if (IS_ERR(dmabufattach)) {
 		pr_err("%s:%d dmabufattach is invalid\n", __func__, __LINE__);
 		ret = PTR_ERR(dmabufattach);
@@ -1376,7 +1254,7 @@ static int kiumd_dmabuf_assign_buf(char __user *arg, struct file *fp)
 
 	mutex_unlock(&kiumd_ctx->hyp_lock);
 
-	pr_debug("maping attachment sgt:%lx attachmemt:%lx dmabuf:%lx, id: %d\n",
+	pr_debug("mapping attachment sgt:%pK attachmemt:%pK dmabuf:%pK, id: %d\n",
 		 smap->sgt_ptr, smap->dmabufattach, smap->dmabuf_ptr, smap->id);
 	kiusr.hyp_id = smap->id;
 	kiusr.dma_addr = sg_dma_address(sgt->sgl);
@@ -1504,17 +1382,16 @@ err:
 
 static int kiumd_dmabuf_vfio_secure_map(char __user *arg, struct file *fp)
 {
+	struct file *vfio_file __free(fput) = NULL;
 	struct dma_buf_attachment *dmabufattach;
-	struct vfio_device *vfio_dev;
 	struct dma_buf *kiumd_dmabuf;
-	struct vfio_device_file *df;
 	struct kiumd_ctx *kiumd_ctx;
 	struct smmu_map_data *smap;
 	struct kiumd_user kiusr;
 	int kiumd_dma_direction;
 	struct sg_table *sgt;
+	struct device *dev;
 	int *vmids, *perms;
-	struct file *file;
 	u64 pgd;
 	int ret;
 
@@ -1524,37 +1401,13 @@ static int kiumd_dmabuf_vfio_secure_map(char __user *arg, struct file *fp)
 		return -EFAULT;
 	}
 
-	if (kiusr.vfio_fd < 0) {
-		pr_err("%s:%d invalid fd from user\n", __func__, __LINE__);
+	dev = kiumd_vfio_get_device(kiusr.vfio_fd, &vfio_file);
+	if (!dev)
 		return -EBADF;
-	}
 
-	file = fget(kiusr.vfio_fd);
-	if (!file) {
-		pr_err("%s:%d failed to get file from vfio fd\n",
-		       __func__, __LINE__);
-		return -EBADF;
-	}
-
-	df = (struct vfio_device_file *)file->private_data;
-	vfio_dev = (struct vfio_device *)df->device;
-	if (!vfio_dev) {
-		pr_err("%s:%d vfio_dev is NULL\n", __func__, __LINE__);
-		ret = -EINVAL;
-		goto close_file;
-	}
-
-	if (!vfio_dev->dev) {
-		ret = -EINVAL;
-		pr_err("%s:%d invalid device\n", __func__, __LINE__);
-		goto close_file;
-	}
-
-	ret = kiumd_get_pgd(vfio_dev, &pgd);
-	if (ret) {
-		pr_err("%s:%d invalid params\n", __func__, __LINE__);
-		goto close_file;
-	}
+	ret = kiumd_get_pgd(dev, &pgd);
+	if (ret)
+		return -EINVAL;
 
 	pr_debug("Kiumd VM page table ttbr:%llx\n", pgd);
 
@@ -1562,7 +1415,7 @@ static int kiumd_dmabuf_vfio_secure_map(char __user *arg, struct file *fp)
 	if (IS_ERR_OR_NULL(kiumd_dmabuf)) {
 		pr_err("%s:%d invalid params\n", __func__, __LINE__);
 		ret = !kiumd_dmabuf ? -EINVAL : PTR_ERR(kiumd_dmabuf);
-		goto close_file;
+		return ret;
 	}
 
 	trace_kiumd_dmabuf_vfio_secure_map_start(kiusr.vfio_fd,
@@ -1572,14 +1425,12 @@ static int kiumd_dmabuf_vfio_secure_map(char __user *arg, struct file *fp)
 	ret = kiumd_acl_to_vmid_perms_list(kiusr.mem_parcel.nr_acl_entries,
 					   (void *)kiusr.mem_parcel.acl_list,
 					   &vmids, &perms);
-	if (ret) {
-		pr_err("%s:%d Invalid params\n", __func__, __LINE__);
-		goto close_file;
-	}
+	if (ret)
+		return ret;
 
-	dmabufattach = dma_buf_attach(kiumd_dmabuf, vfio_dev->dev);
+	dmabufattach = dma_buf_attach(kiumd_dmabuf, dev);
 	if (IS_ERR(dmabufattach)) {
-		pr_err("%s:%d dmabufattach is invalid\n", __func__, __LINE__);
+		dev_err(dev, "%s:%d dmabufattach is invalid\n", __func__, __LINE__);
 		ret = PTR_ERR(dmabufattach);
 		goto free_mem;
 	}
@@ -1635,12 +1486,12 @@ static int kiumd_dmabuf_vfio_secure_map(char __user *arg, struct file *fp)
 	}
 
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-
 	smap = kzalloc(sizeof(*smap), GFP_KERNEL);
 	if (!smap) {
 		ret = -ENOMEM;
-		goto close_file;
+		goto hyp_unassign_sg;
 	}
+
 	smap->dmabufattach = (long)dmabufattach;
 	smap->sgt_ptr = (long)sgt;
 	smap->dmabuf_ptr = (long)kiumd_dmabuf;
@@ -1659,7 +1510,6 @@ static int kiumd_dmabuf_vfio_secure_map(char __user *arg, struct file *fp)
 
 	kfree(vmids);
 	kfree(perms);
-	fput(file);
 	pr_debug("returning from ioctl ret:%d\n", ret);
 	trace_kiumd_dmabuf_vfio_secure_map_end(kiusr.vfio_fd, kiusr.id,
 						kiusr.dma_addr);
@@ -1679,8 +1529,6 @@ detach:
 free_mem:
 	kfree(vmids);
 	kfree(perms);
-close_file:
-	fput(file);
 	return ret;
 }
 
@@ -1697,16 +1545,15 @@ close_file:
  */
 static int kiumd_dmabuf_vfio_secure_unmap(char __user *arg, struct file *fp)
 {
+	struct file *vfio_file __free(fput) = NULL;
 	struct dma_buf_attachment *dmabufattach;
 	struct dma_buf *kiumd_dmabuf;
-	struct vfio_device *vfio_dev;
 	struct kiumd_ctx *kiumd_ctx;
-	struct vfio_device_file *df;
 	struct smmu_map_data *smap;
 	struct kiumd_user kiusr;
 	int *vmids, *perms;
 	bool found = false;
-	struct file *file;
+	struct device *dev;
 	u64 pgd;
 	int ret;
 
@@ -1740,46 +1587,20 @@ static int kiumd_dmabuf_vfio_secure_unmap(char __user *arg, struct file *fp)
 		return -ENOENT;
 	}
 	spin_unlock(&kiumd_ctx->smmu_lock);
-	if (kiusr.vfio_fd < 0) {
-		pr_err("%s:%d invalid vfio fd\n", __func__, __LINE__);
+	dev = kiumd_vfio_get_device(kiusr.vfio_fd, &vfio_file);
+	if (!dev)
 		return -EBADF;
-	}
 
-	file = fget(kiusr.vfio_fd);
-	if (!file) {
-		pr_err("%s:%d failed to get file from vfio fd\n", __func__,
-			__LINE__);
-		return -EBADF;
-	}
-
-	df = (struct vfio_device_file *)file->private_data;
-	vfio_dev = (struct vfio_device *)df->device;
-	if (!vfio_dev) {
-		pr_err("%s:%d vfio_dev is NULL\n", __func__, __LINE__);
-		ret = -EINVAL;
-		goto close_file;
-	}
-
-	if (!vfio_dev->dev) {
-		pr_err("%s:%d invalid params\n", __func__, __LINE__);
-		ret = -EINVAL;
-		goto close_file;
-	}
-
-	ret = kiumd_get_pgd(vfio_dev, &pgd);
-	if (ret) {
-		pr_err("%s:%d invalid params\n", __func__, __LINE__);
-		goto close_file;
-	}
+	ret = kiumd_get_pgd(dev, &pgd);
+	if (ret)
+		return ret;
 
 	/*Input param error checking for ACL happens in kiumd_acl_to_vmid_perms*/
 	ret = kiumd_acl_to_vmid_perms_list(kiusr.mem_parcel.nr_acl_entries,
 					   (void *)kiusr.mem_parcel.acl_list,
 					   &vmids, &perms);
-	if (ret) {
-		pr_err("%s:%d invalid params\n", __func__, __LINE__);
-		goto close_file;
-	}
+	if (ret)
+		return ret;
 
 	dmabufattach = (struct dma_buf_attachment *)smap->dmabufattach;
 	if (!dmabufattach) {
@@ -1833,9 +1654,6 @@ static int kiumd_dmabuf_vfio_secure_unmap(char __user *arg, struct file *fp)
 free_mem:
 	kfree(vmids);
 	kfree(perms);
-close_file:
-	fput(file);
-
 	trace_kiumd_dmabuf_vfio_secure_unmap_end(kiusr.vfio_fd, kiusr.dma_buf_fd);
 	return ret;
 }
@@ -1898,20 +1716,19 @@ static int kiumd_smmu_fault_handler(struct iommu_domain *iomm_domain,
 static int kiumd_smmu_fault_handler_deregister(char __user *arg)
 {
 	struct smmu_device_obj *prev = NULL, *temp = head;
-	struct vfio_device *vfio_dev;
+	struct file *vfio_file __free(fput) = NULL;
 	struct kiumd_user kiusr;
+	struct device *dev;
 
 	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user)))
 		return -EFAULT;
 
-	vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
-	if (!vfio_dev) {
-		pr_err("%s:vfio_dev is NULL\n", __func__);
-		return -ENOTTY;
-	}
+	dev = kiumd_vfio_get_device(kiusr.vfio_fd, &vfio_file);
+	if (!dev)
+		return -EBADF;
 
 	if (temp != NULL &&
-	    !strcmp(temp->kobj->name, vfio_dev->dev->kobj.name)) {
+	    !strcmp(temp->kobj->name, dev_name(dev))) {
 		head = head->next;
 		temp->next = NULL;
 		kobject_put(temp->kobj);
@@ -1919,7 +1736,7 @@ static int kiumd_smmu_fault_handler_deregister(char __user *arg)
 	} else {
 		while (temp != NULL &&
 		       strcmp(temp->kobj->name,
-			      vfio_dev->dev->kobj.name)) {
+			      dev_name(dev))) {
 			prev = temp;
 			temp = temp->next;
 		}
@@ -1989,32 +1806,31 @@ static struct kobj_attribute fsr_iova_attribute = {
  */
 static int kiumd_smmu_fault_handler_register(char __user *arg)
 {
-	struct vfio_device *vfio_dev;
+	struct file *vfio_file __free(fput) = NULL;
 	struct smmu_device_obj *temp;
 	struct iommu_domain *domain;
 	struct smmu_device_obj *ptr;
 	struct kiumd_user kiusr;
+	struct device *dev;
 	int ret;
 
 	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user)))
 		return -EFAULT;
 
-	vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
-	if (!vfio_dev) {
-		pr_err("%s:vfio_dev is NULL\n", __func__);
-		return -ENOTTY;
-	}
+	dev = kiumd_vfio_get_device(kiusr.vfio_fd, &vfio_file);
+	if (!dev)
+		return -EBADF;
 
-	domain = kiumd_iommu_get_dma_domain(vfio_dev->dev);
+	domain = kiumd_iommu_get_dma_domain(dev);
 	if (!domain) {
-		pr_err("%s:iommu domain is NULL\n", __func__);
+		dev_err(dev, "%s:iommu domain is NULL\n", __func__);
 		return -EINVAL;
 	}
 
-	device_obj = kobject_create_and_add(vfio_dev->dev->kobj.name, smmu_obj);
+	device_obj = kobject_create_and_add(dev_name(dev), smmu_obj);
 	if (!device_obj) {
 		pr_err("/sys/kernel/smmu_fault/%s creation failed\n",
-		       vfio_dev->dev->kobj.name);
+		       dev_name(dev));
 		return -ENOMEM;
 	}
 
@@ -2060,15 +1876,16 @@ static int kiumd_smmu_fault_handler_register(char __user *arg)
  */
 static int kiumd_mmio_smmu_map(char __user *arg, struct file *fp)
 {
+	struct file *vfio_file __free(fput) = NULL;
 	struct kiumd_iommu_dma_cookie *cookie;
 	struct kiumd_smmu_mmio_ctx *mmio_ctx;
 	struct kiumd_smmu_mmio_map kiusr;
-	struct vfio_device *vfio_dev;
 	struct kiumd_ctx *kiumd_ctx;
 	struct smmu_map_data *smap;
 	int ret, iter, retval = 0;
 	struct resource *res;
 	dma_addr_t dma_addr;
+	struct device *dev;
 	char *reg_name;
 	u64 addr, size;
 
@@ -2081,17 +1898,16 @@ static int kiumd_mmio_smmu_map(char __user *arg, struct file *fp)
 
 	trace_kiumd_mmio_smmu_map_start(kiusr.vfio_fd, kiusr.fixed_iova, kiusr.iova);
 
-	vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
-	if (!vfio_dev) {
-		pr_err("%s:%d invalid vfio device fd\n", __func__, __LINE__);
-		return -EINVAL;
-	}
+	dev = kiumd_vfio_get_device(kiusr.vfio_fd, &vfio_file);
+	if (!dev)
+		return -EBADF;
 
-	cookie = kiumd_get_dma_cookie(vfio_dev);
+	cookie = kiumd_get_dma_cookie(dev);
 	if (!cookie) {
 		pr_err("%s:cookie not found\n", __func__);
 		return -EINVAL;
 	}
+
 	spin_lock(&kiumd_ctx->smmu_lock);
 	if (!hash_empty(kiumd_ctx->smmu_table)) {
 		hash_for_each(kiumd_ctx->smmu_table, iter, smap, node) {
@@ -2127,13 +1943,13 @@ static int kiumd_mmio_smmu_map(char __user *arg, struct file *fp)
 		goto smap_free;
 	}
 
-	if (!dev_is_platform(vfio_dev->dev)) {
+	if (!dev_is_platform(dev)) {
 		pr_err("%s:%d not platform device\n", __func__, __LINE__);
 		ret = -EINVAL;
 		goto reg_free;
 	}
 
-	res = platform_get_resource_byname(to_platform_device(vfio_dev->dev),
+	res = platform_get_resource_byname(to_platform_device(dev),
 					   IORESOURCE_MEM, reg_name);
 	if (!res) {
 		ret = -EINVAL;
@@ -2154,8 +1970,8 @@ static int kiumd_mmio_smmu_map(char __user *arg, struct file *fp)
 		}
 	}
 
-	dma_addr = dma_map_resource(vfio_dev->dev, addr, size, 0, 0);
-	ret = dma_mapping_error(vfio_dev->dev, dma_addr);
+	dma_addr = dma_map_resource(dev, addr, size, 0, 0);
+	ret = dma_mapping_error(dev, dma_addr);
 	if (kiusr.fixed_iova) {
 		retval = kiumd_set_dma_cookie(cookie, IOMMU_DMA_IOVA_COOKIE, 0);
 		mutex_unlock(&cookie->mutex);
@@ -2176,7 +1992,7 @@ static int kiumd_mmio_smmu_map(char __user *arg, struct file *fp)
 	hash_add(kiumd_ctx->smmu_table, &smap->node, smap->id);
 	mmio_ctx->iova = dma_addr;
 	mmio_ctx->size = size;
-	mmio_ctx->dev = vfio_dev->dev;
+	mmio_ctx->dev = dev;
 	smap->context = mmio_ctx;
 	spin_unlock(&kiumd_ctx->smmu_lock);
 
@@ -2193,7 +2009,7 @@ static int kiumd_mmio_smmu_map(char __user *arg, struct file *fp)
 	kfree(reg_name);
 	return 0;
 smap_del:
-	dma_unmap_resource(vfio_dev->dev, dma_addr, size, 0, 0);
+	dma_unmap_resource(dev, dma_addr, size, 0, 0);
 	spin_lock(&kiumd_ctx->smmu_lock);
 	hash_del(&smap->node);
 	spin_unlock(&kiumd_ctx->smmu_lock);
@@ -2362,8 +2178,7 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 
 				if (smap->is_fixed_map) {
 					ret = kiumd_configure_dma_cookie(
-						smap->vfio_dev,
-						IOMMU_DMA_MSI_COOKIE,
+						smap->dev, IOMMU_DMA_MSI_COOKIE,
 						smap->dmabuf_ptr);
 					if (ret) {
 						pr_err("%s %d failed to configure cookie\n", __func__, __LINE__);
@@ -2380,7 +2195,7 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 				pr_debug("kiumd_debug: unmap dmabufatach:%lx\n",
 						smap->dmabufattach);
 				if (smap->is_iova_zero == FIXED_IOVA_AT_ZERO) {
-					iommu_dom = kiumd_iommu_get_dma_domain(smap->vfio_dev->dev);
+					iommu_dom = kiumd_iommu_get_dma_domain(smap->dev);
 					if (!iommu_dom) {
 						pr_err("%s:IOMMU domain is NULL\n", __func__);
 						continue;
@@ -2399,9 +2214,9 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 
 				if (smap->is_fixed_map) {
 					ret = kiumd_configure_dma_cookie(
-							smap->vfio_dev,
-							IOMMU_DMA_IOVA_COOKIE,
-							smap->dmabuf_ptr);
+						smap->dev,
+						IOMMU_DMA_IOVA_COOKIE,
+						smap->dmabuf_ptr);
 					if (ret) {
 						pr_err("%s %d failed to configure cookie\n", __func__, __LINE__);
 						break;
@@ -2436,12 +2251,13 @@ static int kiumd_close(struct inode *inode, struct file *filp)
  */
 static int kiumd_vfio_ctx_init(char __user *arg, struct file *fp)
 {
+	struct file *vfio_file __free(fput) = NULL;
 	struct kiumd_dev_mem_info kiusr;
-	struct vfio_device *vfio_dev;
 	struct kiumd_ctx *kiumd_ctx;
 	struct device_node *mem_np;
 	struct reserved_mem *rmem;
 	struct device_node *np;
+	struct device *dev;
 
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
 
@@ -2451,19 +2267,13 @@ static int kiumd_vfio_ctx_init(char __user *arg, struct file *fp)
 	}
 
 	trace_kiumd_vfio_ctx_init_start(kiusr.vfio_fd);
+	dev = kiumd_vfio_get_device(kiusr.vfio_fd, &vfio_file);
+	if (!dev)
+		return -EBADF;
 
-	vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
-	if (!vfio_dev) {
-		pr_err("%s:%d invalid vfio device fd\n", __func__, __LINE__);
-		return -EINVAL;
-	}
-
-	if (!vfio_dev->dev)
-		return -EINVAL;
-
-	np = dev_of_node(vfio_dev->dev);
+	np = dev_of_node(dev);
 	if (!np) {
-		pr_err("%s:No memory-region specified\n", __func__);
+		dev_err(dev, "%s:No memory-region specified\n", __func__);
 		return -EINVAL;
 	}
 
@@ -2490,7 +2300,7 @@ static int kiumd_vfio_ctx_init(char __user *arg, struct file *fp)
 	}
 
 	for (u64 i = 0; i < kiusr.num_regions; i++) {
-		mem_np = of_parse_phandle(vfio_dev->dev->of_node, "memory-region", i);
+		mem_np = of_parse_phandle(dev->of_node, "memory-region", i);
 		if (!mem_np) {
 			pr_debug("%s:cant find phandle\n", __func__);
 			continue;
