@@ -8,6 +8,8 @@
 #ifndef __KIUMD_COMMON_H__
 #define __KIUMD_COMMON_H__
 
+#include <linux/dma-buf.h>
+#include <linux/dma-direction.h>
 #include <linux/firmware/qcom/qcom_scm.h>
 #include <linux/hashtable.h>
 #include <linux/iommu_iova_map.h>
@@ -21,23 +23,30 @@
 #include "arm-smmu.h"
 #endif
 
-/*No.of pages for 6GB IOVA space with 4K page size*/
-#define KGSL_PT_MEM_PAGES 0x180000
-#define KGSL_GLOBAL_PT_BASE_IOVA 0xFFFFFF8000000000
-#define KGSL_PER_PROCESS_PT_BASE_IOVA 0x60000000
-#define KGSL_PER_PROCESS_PT_END_IOVA 0x240000000
+#define SMMU_MAPTABLE_SIZE		(10)
+#define MAX_KIUMD_ACL_ENTRIES		(64)
+#define KIUMD_MAX_VMID			(64)
+#define KIUMD_MAX_PERMS			(8)
 
-#define SMMU_MAPTABLE_SIZE (10)
+//KGSL related global variables
+//No.of pages for 6GB IOVA space with 4K page size//
+#define KGSL_PT_MEM_PAGES		(0x180000)
+#define KGSL_GLOBAL_PT_BASE_IOVA	(0xFFFFFF8000000000)
+#define KGSL_PER_PROCESS_PT_BASE_IOVA	(0x60000000)
+#define KGSL_PER_PROCESS_PT_END_IOVA	(0x240000000)
 
-#define MAX_KIUMD_ACL_ENTRIES 64
-#define KIUMD_MAX_VMID        64
-#define KIUMD_MAX_PERMS       8
+#define KIUSR_IS_KGSL(kiusr)		(kiusr.ptselect == KGSL_GLOBAL_PT ||  \
+					 kiusr.ptselect == KGSL_PER_PROCESS_PT)
 
-#define KIUMD_MAX_REG_NAME_LEN (100)
-#define KIUMD_INDEX_OFFSET     (40)
+#define KIUSR_IS_PRIV(kiusr)		(kiusr.dma_attr == DMA_ATTR_PRIVILEGED)
+#define KIUSR_IS_IOVA_ZERO(kiusr)	(kiusr.is_iova_zero == FIXED_IOVA_AT_ZERO)
 
-#define KIUMD_32BIT_START_IOVA 0x1000
-#define KIUMD_32BIT_END_IOVA 0xFFFFFFFF
+#define IOVA_ZERO			((dma_addr_t)0)
+#define KIUMD_MAX_REG_NAME_LEN		(100)
+#define KIUMD_INDEX_OFFSET		(40)
+
+#define KIUMD_32BIT_START_IOVA		(0x1000)
+#define KIUMD_32BIT_END_IOVA		(0xFFFFFFFF)
 
 extern struct kmem_cache *iommu_addr_cache;
 extern struct smmu_device_obj *head;
@@ -54,6 +63,12 @@ struct kiumd_smmu_mmio_ctx {
 	struct device *dev;
 	dma_addr_t iova;
 	size_t size;
+};
+
+struct kiumd_smmu_kgsl_ctx {
+	u64 iova;
+	int pt_id;
+	int ptselect;
 };
 
 enum iommu_dma_cookie_type {
@@ -265,7 +280,6 @@ struct iommu_addr_entry {
  * @node: hlist_node
  *
  */
-
 struct smmu_map_data {
 	int id;
 	struct sg_table *sgt_ptr;
@@ -273,9 +287,14 @@ struct smmu_map_data {
 	struct dma_buf_attachment *dmabufattach;
 	int dma_dir;
 	int ptselect;
-	int is_iova_zero;
+	bool is_iova_zero;
+	bool is_priv_map;
 	bool is_fixed_map;
 	struct device *dev;
+	u64 size;
+	bool is_kgsl_map;
+	bool is_kgsl_ctx;
+	struct kiumd_smmu_kgsl_ctx kgsl_ctx;
 	struct kiumd_smmu_mmio_ctx *context;
 	struct hlist_node node;
 };
@@ -316,6 +335,11 @@ unsigned long get_shift_from_dt(struct device *dev);
 
 int kiumd_set_dma_addr_ranges(struct kiumd_ctx *kiumd_ctx, struct device *dev);
 
+int clear_kgsl_map_iova(struct kiumd_ctx *kiumd_ctx, struct smmu_map_data *smap);
+
+int set_kgsl_map_iova(struct kiumd_ctx *kiumd_ctx, struct kiumd_user kiusr,
+		 struct smmu_map_data *smap);
+
 unsigned long get_hash_key(struct device *dev);
 
 int init_and_allocate_iova(struct device *dev, struct kiumd_ctx *kiumd_ctx,
@@ -324,26 +348,31 @@ int init_and_allocate_iova(struct device *dev, struct kiumd_ctx *kiumd_ctx,
 
 void add_to_smmu_table(struct kiumd_ctx *ctx, struct smmu_map_data *map_data);
 
-int free_allocated_iova(struct kiumd_ctx *kiumd_ctx, unsigned long iova,
-			unsigned long idx, bool is_process);
-
-s64 get_map_offset(u64 size, int ptselect);
-
-int set_map_iova(u64 offset, struct device *dev, int ptselect);
-
-uint64_t get_pgtble_and_alloc_iova(struct device *dev,
-				   struct kiumd_ctx *kiumd_ctx,
-				   u64 size,
-				   unsigned int idx);
+u64 kiumd_get_dmabuf_size(int dmabuf_fd);
 
 bool is_fixed_mapping(struct device *dev);
+
+struct smmu_map_data *allocate_init_smap(struct kiumd_user kiusr,
+					 struct device *dev, u64 size);
+
+int kiumd_dmabuf_zero_map(struct smmu_map_data *smap);
+
+int kiumd_dmabuf_priv_map(struct smmu_map_data *smap);
+
+int kiumd_dmabuf_map(struct smmu_map_data *smap);
+
+void kiumd_dmabuf_zero_unmap(struct smmu_map_data *smap);
+
+void kiumd_dmabuf_priv_unmap(struct smmu_map_data *smap);
+
+void kiumd_dmabuf_unmap(struct smmu_map_data *smap);
+
+int free_allocated_iova(struct kiumd_ctx *kiumd_ctx, unsigned long iova,
+			unsigned long idx, bool is_process);
 
 int kiumd_configure_dma_cookie(struct device *dev,
 			       enum iommu_dma_cookie_type cookie_type,
 			       dma_addr_t dma_addr);
-
-int clear_map_iova(struct kiumd_ctx *kiumd_ctx, u64 iova, u64 size,
-		   int ptselect, unsigned int idx);
 
 bool check_ptselect(struct kiumd_user *kiusr);
 

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 
-#include <linux/dma-buf.h>
 #include <linux/kiumd_common.h>
 #include <linux/miscdevice.h>
 #include <linux/of_reserved_mem.h>
@@ -689,6 +688,57 @@ static int kiumd_dmabuf_managed_iova_unmap(char __user *arg, struct file *fp)
 	return 0;
 }
 
+static void clean_map(struct kiumd_ctx *kiumd_ctx, struct smmu_map_data *smap)
+{
+	if (smap->is_kgsl_ctx)
+		(void)clear_kgsl_map_iova(kiumd_ctx, smap);
+
+	if (smap->is_iova_zero)
+		kiumd_dmabuf_zero_unmap(smap);
+	else if (smap->is_priv_map)
+		kiumd_dmabuf_priv_unmap(smap);
+	else
+		kiumd_dmabuf_unmap(smap);
+}
+
+static int __kiumd_dmabuf_vfio_map(struct kiumd_ctx *kiumd_ctx,
+				   struct kiumd_user kiusr,
+				   struct smmu_map_data *smap)
+{
+	int ret;
+
+	ret = set_kgsl_map_iova(kiumd_ctx, kiusr, smap);
+	if (ret)
+		return ret;
+
+	smap->dmabuf_ptr = dma_buf_get(kiusr.dma_buf_fd);
+	if (IS_ERR_OR_NULL(smap->dmabuf_ptr)) {
+		ret = -EBADF;
+		goto kgsl_iova_clear;
+	}
+
+	if (KIUSR_IS_IOVA_ZERO(kiusr))
+		ret = kiumd_dmabuf_zero_map(smap);
+	else if (KIUSR_IS_PRIV(kiusr))
+		ret = kiumd_dmabuf_priv_map(smap);
+	else
+		ret = kiumd_dmabuf_map(smap);
+
+	if (ret)
+		goto dmabuf_put;
+
+	add_to_smmu_table(kiumd_ctx, smap);
+	return 0;
+
+dmabuf_put:
+	dma_buf_put(smap->dmabuf_ptr);
+kgsl_iova_clear:
+	if (smap->is_kgsl_ctx)
+		(void)clear_kgsl_map_iova(kiumd_ctx, smap);
+
+	return ret;
+}
+
 /**
  * kiumd_dmabuf_vfio_map - Facilitates the mapping of a DMA-BUF based buffer
  * to a SMMU backed device represented via a vfio_device.
@@ -701,228 +751,106 @@ static int kiumd_dmabuf_managed_iova_unmap(char __user *arg, struct file *fp)
  */
 static int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 {
-	struct kiumd_dma_heap_attachment *dmaheapattachment;
 	struct file *vfio_file __free(fput) = NULL;
-	struct dma_buf_attachment *dmabufattach;
-	int kiumd_dma_direction, ret, prot;
-	struct iommu_domain *iommu_dom;
-	struct dma_buf *kiumd_dmabuf;
 	struct kiumd_ctx *kiumd_ctx;
 	struct smmu_map_data *smap;
 	struct kiumd_user kiusr;
-	struct sg_table *sgt;
 	struct device *dev;
-	s64 offset;
 	u64 size;
+	int ret;
 
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-	smap = kzalloc(sizeof(*smap), GFP_KERNEL);
-	if (!smap)
-		return -ENOMEM;
 
-	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user)))
+	if (copy_from_user(&kiusr, arg, sizeof(kiusr)))
 		return -EFAULT;
 
 	dev = kiumd_vfio_get_device(kiusr.vfio_fd, &vfio_file);
 	if (!dev)
 		return -EBADF;
 
-	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-	kiumd_dmabuf = dma_buf_get(kiusr.dma_buf_fd);
-	if (IS_ERR_OR_NULL(kiumd_dmabuf)) {
-		pr_err("%s:dma_buf_get failed with error: %ld, for device: %s\n",
-		       __func__, PTR_ERR(kiumd_dmabuf), dev_name(dev));
-		ret = (kiumd_dmabuf == NULL ? -EINVAL : PTR_ERR(kiumd_dmabuf));
-		return ret;
-	}
+	size = kiumd_get_dmabuf_size(kiusr.dma_buf_fd);
+	if (!size)
+		return -EBADF;
 
-	trace_kiumd_dmabuf_vfio_map_start(dev_name(dev),
-					  kiusr.vfio_fd, kiusr.dma_buf_fd,
-					  kiusr.dma_attr, kiusr.dma_direction,
-					  kiusr.ptselect, kiusr.is_iova_zero,
-					  kiumd_dmabuf->size, kiumd_ctx);
+	if (kiusr.dma_direction < DMA_BIDIRECTIONAL ||
+	    kiusr.dma_direction > DMA_NONE)
+		return -EINVAL;
 
-	if ((kiusr.ptselect == KGSL_GLOBAL_PT) ||
-	    (kiusr.ptselect == KGSL_PER_PROCESS_PT)) {
-		size = kiumd_dmabuf->size;
-		if (kiusr.ptselect == KGSL_GLOBAL_PT) {
-			offset = get_map_offset(size, kiusr.ptselect);
-			if (offset < 0) {
-				pr_err("%s:%d failed to get offset\n",
-				       __func__, __LINE__);
-				ret = offset;
-				goto fail_put;
-			}
+	trace_kiumd_dmabuf_vfio_map_start(dev_name(dev), kiusr.vfio_fd,
+					  kiusr.dma_buf_fd, kiusr.dma_attr,
+					  kiusr.dma_direction, kiusr.ptselect,
+					  kiusr.is_iova_zero, size, kiumd_ctx);
 
-			ret = set_map_iova((u64)offset, dev, kiusr.ptselect);
-			if (ret < 0) {
-				pr_err("%s:%d failed to set offset\n",
-				       __func__, __LINE__);
-				goto fail_put;
-			}
-		} else {
-			offset = get_pgtble_and_alloc_iova(dev,
-							   kiumd_ctx, size,
-							   kiusr.pt_id);
-			if (!offset) {
-				pr_err("%s:%d get_pgtble_and_alloc_iova failed\n",
-					__func__, __LINE__);
-				ret = -EINVAL;
-				goto fail_put;
-			}
-			ret = set_map_iova(offset, dev, kiusr.ptselect);
-			if (ret < 0) {
-				pr_err("%s:%d failed to set offset\n",
-					__func__, __LINE__);
-				goto fail_put;
-			}
-		}
-	}
+	smap = allocate_init_smap(kiusr, dev, size);
+	if (!smap)
+		return -ENOMEM;
 
-	dmabufattach = dma_buf_attach(kiumd_dmabuf, dev);
-	if (IS_ERR(dmabufattach)) {
-		pr_err("%s:dmabufattach failed with error: %ld, for device: %s\n",
-		       __func__, PTR_ERR(dmabufattach), dev_name(dev));
-		ret = PTR_ERR(dmabufattach);
-		goto fail_put;
-	}
-
-	if ((kiusr.dma_direction < DMA_BIDIRECTIONAL) ||
-	    (kiusr.dma_direction > DMA_NONE)) {
-		pr_err("%s:Invalid DMA direction: %d\n", __func__, kiusr.dma_direction);
-		ret = -EINVAL;
-		goto fail_detach;
-	}
-
-	if (kiusr.dma_direction == DMA_TO_DEVICE)
-		kiumd_dma_direction = kiusr.dma_direction;
-	else
-		kiumd_dma_direction = DMA_BIDIRECTIONAL;
-
-	if ((kiusr.dma_attr == DMA_ATTR_PRIVILEGED) &&
-	    (kiusr.is_iova_zero != FIXED_IOVA_AT_ZERO)) {
-		if (!(dmabufattach->priv)) {
-			pr_err("%s:dmabufattach-priv is NULL\n", __func__);
-			ret = -EINVAL;
-			goto fail_detach;
-		}
-
-		dmaheapattachment = (struct kiumd_dma_heap_attachment *)dmabufattach->priv;
-		if (!dmaheapattachment) {
-			pr_err("%s:dmaheapattachment is NULL\n", __func__);
-			ret = -EINVAL;
-			goto fail_detach;
-		}
-
-		sgt = dmaheapattachment->table;
-		if (!sgt) {
-			pr_err("%s:sglist is NULL\n", __func__);
-			ret = -EINVAL;
-			goto fail_detach;
-		}
-
-		ret = dma_map_sgtable(dev, sgt, kiumd_dma_direction,
-				      DMA_ATTR_PRIVILEGED |
-				      DMA_ATTR_SKIP_CPU_SYNC);
-		if (ret) {
-			pr_err("%s:dma_map_sgtable failed with err: %d, for device: %s\n",
-			       __func__, ret, dev_name(dev));
-			goto fail_detach;
-		}
-	} else {
-
-		if (IS_ERR_OR_NULL(dmabufattach->dmabuf)) {
-			pr_err("%s:dmabuf is NULL\n", __func__);
-			return -EINVAL;
-		}
-
-		sgt = dma_buf_map_attachment_unlocked(dmabufattach,
-						      kiumd_dma_direction);
-		if (IS_ERR_OR_NULL(sgt)) {
-			pr_err("%s: mapping failed with error: %ld, for device: %s\n",
-			       __func__, PTR_ERR(sgt), dev_name(dev));
-			ret = (sgt == NULL ? -EINVAL : PTR_ERR(sgt));
-			goto fail_detach;
-		}
-
-		if (kiusr.is_iova_zero == FIXED_IOVA_AT_ZERO) {
-			if (kiusr.dma_attr == DMA_ATTR_PRIVILEGED)
-				prot = IOMMU_CACHE | IOMMU_READ | IOMMU_WRITE | IOMMU_PRIV;
-			else
-				prot = IOMMU_CACHE | IOMMU_READ | IOMMU_WRITE;
-
-			iommu_dom = kiumd_iommu_get_dma_domain(dev);
-			if (!iommu_dom) {
-				pr_err("%s:IOMMU domain is NULL\n", __func__);
-				return -EINVAL;
-			}
-
-#ifdef CONFIG_DMABUF_DEBUG
-			/*
-			 * For debug builds there is a mangling done in the
-			 * regular buffer map path, so iommu_map_sg is
-			 * expecting a mangled physical address of the buffer
-			 */
-
-			kiumd_mangle_sg_table(sgt);
-#endif
-
-			/*
-			 * For mapping at 0x0 we create a mapping using
-			 * dma_buf_map_attachment_unlocked and then take the sg list
-			 * and map it at iova - 0x0
-			 */
-
-			size = iommu_map_sg(iommu_dom, IOVA_ZERO, sgt->sgl,
-					    sgt->orig_nents, prot, GFP_ATOMIC);
-			if (size < 0) {
-				pr_err("%s:iommu_map_sg failed\n", __func__);
-				dma_buf_unmap_attachment_unlocked(dmabufattach,
-						sgt, kiumd_dma_direction);
-				ret = -EFAULT;
-				goto fail_detach;
-			}
-		}
-	}
-
-	if (is_fixed_mapping(dev))
-		smap->is_fixed_map = true;
-	else
-		smap->is_fixed_map = false;
-
-	smap->dmabufattach = dmabufattach;
-	smap->sgt_ptr = sgt;
-	smap->dmabuf_ptr = kiumd_dmabuf;
-	smap->dma_dir = kiumd_dma_direction;
-	smap->ptselect = kiusr.ptselect;
-	smap->is_iova_zero = kiusr.is_iova_zero;
-	smap->dev = dev;
-	spin_lock(&kiumd_ctx->smmu_lock);
-	smap->id = kiumd_ctx->id++;
-	hash_add(kiumd_ctx->smmu_table, &smap->node, smap->id);
-	spin_unlock(&kiumd_ctx->smmu_lock);
+	ret = __kiumd_dmabuf_vfio_map(kiumd_ctx, kiusr, smap);
+	if (ret)
+		goto smap_free;
 
 	kiusr.id = smap->id;
-	if (kiusr.is_iova_zero == FIXED_IOVA_AT_ZERO)
+	if (smap->is_iova_zero)
 		kiusr.dma_addr = (unsigned long) IOVA_ZERO;
 	else
-		kiusr.dma_addr = (unsigned long) sg_dma_address(sgt->sgl);
+		kiusr.dma_addr = (unsigned long) sg_dma_address(smap->sgt_ptr->sgl);
 
-	if (copy_to_user(arg, &kiusr, sizeof(kiusr))) {
-		pr_err("%s: copy_to_user failed...\n", __func__);
-		dma_buf_unmap_attachment_unlocked(dmabufattach, sgt,
-						  kiumd_dma_direction);
-		ret = -EFAULT;
-		goto fail_detach;
-	}
 	trace_kiumd_dmabuf_vfio_map_end(kiusr.vfio_fd, kiusr.id, kiusr.dma_addr);
+	if (copy_to_user(arg, &kiusr, sizeof(kiusr))) {
+		ret = -EFAULT;
+		goto clean_map_res;
+	}
+
 	return 0;
 
-fail_detach:
-	dma_buf_detach(kiumd_dmabuf, dmabufattach);
-fail_put:
-	dma_buf_put(kiumd_dmabuf);
+clean_map_res:
+	clean_map(kiumd_ctx, smap);
+smap_free:
+	kfree(smap);
 	return ret;
+}
+
+static int __kiumd_dmabuf_vfio_unmap(struct kiumd_ctx *kiumd_ctx,
+				     struct smmu_map_data *smap)
+{
+	struct iommu_domain *iommu_dom;
+	unsigned long dma_addr;
+	int ret;
+
+	dma_addr = smap->is_iova_zero ?
+		   IOVA_ZERO : sg_dma_address(smap->sgt_ptr->sgl);
+
+	if (smap->is_fixed_map) {
+		ret = kiumd_configure_dma_cookie(smap->dev, IOMMU_DMA_MSI_COOKIE,
+						 dma_addr);
+		if (ret)
+			return -ENODEV;
+	}
+
+	if (smap->is_kgsl_ctx) {
+		ret = clear_kgsl_map_iova(kiumd_ctx, smap);
+		if (ret)
+			return -ENOENT;
+	}
+
+	if (smap->is_iova_zero)
+		kiumd_dmabuf_zero_unmap(smap);
+	else if (smap->is_priv_map)
+		kiumd_dmabuf_priv_unmap(smap);
+	else
+		kiumd_dmabuf_unmap(smap);
+
+	if (smap->is_kgsl_map || smap->is_fixed_map) {
+		iommu_dom = kiumd_iommu_get_dma_domain(smap->dev);
+		if (!iommu_dom) {
+			dev_err(smap->dev, "%s:iommu_dom is NULL, Can't flush GPU TLB\n",
+				__func__);
+			return -EINVAL;
+		}
+		iommu_flush_iotlb_all(iommu_dom);
+	}
+
+	return 0;
 }
 
 /**
@@ -937,29 +865,15 @@ fail_put:
  */
 static int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 {
-	struct kiumd_dma_heap_attachment *dmaheapattachment;
-	struct file *vfio_file __free(fput) = NULL;
-	struct dma_buf_attachment *dmabufattach;
-	struct iommu_domain *iommu_dom;
-	struct dma_buf *kiumd_dmabuf;
-	int kiumd_dma_direction, ret;
+	struct smmu_map_data *smap __free(kfree) = NULL;
 	struct kiumd_ctx *kiumd_ctx;
-	struct smmu_map_data *smap;
-	struct sg_table *sgtable;
 	struct kiumd_user kiusr;
-	struct device *dev;
 	bool found = false;
-	u64 size;
+	int ret;
 
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user)))
+	if (copy_from_user(&kiusr, arg, sizeof(kiusr)))
 		return -EFAULT;
-
-	if (kiusr.id < 0) {
-		pr_err("%s:id passed from user should be positive value\n",
-			__func__);
-		return -EFAULT;
-	}
 
 	spin_lock(&kiumd_ctx->smmu_lock);
 	hash_for_each_possible(kiumd_ctx->smmu_table, smap, node, kiusr.id) {
@@ -969,131 +883,27 @@ static int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 		}
 	}
 
+	if (found)
+		hash_del(&smap->node);
+	spin_unlock(&kiumd_ctx->smmu_lock);
+
 	if (!found) {
-		spin_unlock(&kiumd_ctx->smmu_lock);
+		smap = NULL;
 		return -ENOENT;
 	}
 
-	spin_unlock(&kiumd_ctx->smmu_lock);
-	kiumd_dmabuf = smap->dmabuf_ptr;
-	if (!kiumd_dmabuf) {
-		pr_err("%s:kiumd_dmabuf is NULL\n", __func__);
-		return -EINVAL;
-	}
-
-	dev = kiumd_vfio_get_device(kiusr.vfio_fd, &vfio_file);
-	if (!dev)
-		return -EBADF;
-
-	trace_kiumd_dmabuf_vfio_unmap_start(dev_name(dev),
-					    kiusr.vfio_fd, kiusr.dma_buf_fd,
-					    kiusr.dma_addr, kiusr.dma_attr,
-					    kiusr.dma_direction,
+	trace_kiumd_dmabuf_vfio_unmap_start(dev_name(smap->dev), kiusr.vfio_fd,
+					    kiusr.dma_buf_fd, kiusr.dma_addr,
+					    kiusr.dma_attr, kiusr.dma_direction,
 					    kiusr.ptselect, kiusr.is_iova_zero,
-					    kiumd_dmabuf->size, kiumd_ctx);
+					    smap->size, kiumd_ctx);
 
-	dmabufattach = smap->dmabufattach;
-	if (!dmabufattach) {
-		pr_err("%s:dmabufattach is NULL\n", __func__);
-		return -EINVAL;
-	}
+	ret = __kiumd_dmabuf_vfio_unmap(kiumd_ctx, smap);
+	if (ret)
+		return ret;
 
-	if (kiusr.ptselect == KGSL_GLOBAL_PT ||
-	    kiusr.ptselect == KGSL_PER_PROCESS_PT) {
-		ret = kiumd_configure_dma_cookie(dev,
-						 IOMMU_DMA_MSI_COOKIE,
-						 kiusr.dma_addr);
-		if (ret) {
-			pr_err("%s %d failed to configure cookie\n",
-			       __func__, __LINE__);
-			return -EINVAL;
-		}
-
-		ret = clear_map_iova(kiumd_ctx, kiusr.dma_addr,
-				     kiumd_dmabuf->size, kiusr.ptselect,
-				     kiusr.pt_id);
-		if (ret) {
-			pr_err("%s:clear_map_iova failed\n", __func__);
-			return -EINVAL;
-		}
-	}
-
-	if (kiusr.dma_direction == 1)
-		kiumd_dma_direction = kiusr.dma_direction;
-	else
-		kiumd_dma_direction = 0;
-
-	if (smap->is_fixed_map) {
-		ret = kiumd_configure_dma_cookie(dev,
-						 IOMMU_DMA_MSI_COOKIE,
-						 kiusr.dma_addr);
-		if (ret) {
-			pr_err("%s %d failed to configure cookie\n",
-			       __func__, __LINE__);
-			return -EINVAL;
-		}
-	}
-
-	if ((kiusr.dma_attr == DMA_ATTR_PRIVILEGED) &&
-	    (kiusr.is_iova_zero != FIXED_IOVA_AT_ZERO)) {
-		if (!(dmabufattach->priv)) {
-			pr_err("%s:dmabufattach-priv is NULL\n", __func__);
-			return -EINVAL;
-		}
-
-		dmaheapattachment = (struct kiumd_dma_heap_attachment *)dmabufattach->priv;
-		if (!dmaheapattachment) {
-			pr_err("%s:dmaheapattachment is NULL\n", __func__);
-			return -EINVAL;
-		}
-
-		sgtable = dmaheapattachment->table;
-		if (!sgtable) {
-			pr_err("%s:sglist is NULL\n", __func__);
-			return -EINVAL;
-		}
-
-		dma_unmap_sgtable(dev, sgtable, kiumd_dma_direction,
-				  DMA_ATTR_PRIVILEGED);
-	} else {
-		if (!smap->sgt_ptr) {
-			pr_err("%s: smap->sgt_ptr is NULL\n", __func__);
-			return -EINVAL;
-		}
-		dma_buf_unmap_attachment_unlocked(dmabufattach, smap->sgt_ptr,
-						  kiumd_dma_direction);
-		if (kiusr.is_iova_zero == FIXED_IOVA_AT_ZERO) {
-			iommu_dom = kiumd_iommu_get_dma_domain(dev);
-			if (!iommu_dom) {
-				pr_err("%s:iommu_dom is NULL\n", __func__);
-				return -EINVAL;
-			}
-
-			size = iommu_unmap(iommu_dom, IOVA_ZERO, kiumd_dmabuf->size);
-			if (size != kiumd_dmabuf->size) {
-				pr_err("%s:iommu_unmap failed\n", __func__);
-				return -EINVAL;
-			}
-		}
-	}
-
-	if (check_ptselect(&kiusr) || smap->is_fixed_map) {
-		iommu_dom = kiumd_iommu_get_dma_domain(dev);
-		if (!iommu_dom) {
-			pr_err("%s:iommu_dom is NULL\n", __func__);
-			return -EINVAL;
-		}
-
-		iommu_flush_iotlb_all(iommu_dom);
-	}
-
-	spin_lock(&kiumd_ctx->smmu_lock);
-	hash_del(&smap->node);
-	kfree(smap);
-	spin_unlock(&kiumd_ctx->smmu_lock);
-	dma_buf_detach(kiumd_dmabuf, dmabufattach);
-	dma_buf_put(kiumd_dmabuf);
 	trace_kiumd_dmabuf_vfio_unmap_end(kiusr.vfio_fd);
+
 	return 0;
 }
 
@@ -2190,7 +2000,7 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 
 				pr_debug("kiumd_debug: unmap dmabufatach:%pK\n",
 						smap->dmabufattach);
-				if (smap->is_iova_zero == FIXED_IOVA_AT_ZERO) {
+				if (smap->is_iova_zero) {
 					iommu_dom = kiumd_iommu_get_dma_domain(smap->dev);
 					if (!iommu_dom) {
 						pr_err("%s:IOMMU domain is NULL\n", __func__);
