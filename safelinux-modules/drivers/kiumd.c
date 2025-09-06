@@ -570,9 +570,9 @@ static int kiumd_dmabuf_managed_iova_map(char __user *arg, struct file *fp)
 		goto fail_detach;
 	}
 
-	smap->dmabufattach = (long)dmabufattach;
-	smap->sgt_ptr = (long)sgt;
-	smap->dmabuf_ptr = (long)kiumd_dmabuf;
+	smap->dmabufattach = dmabufattach;
+	smap->sgt_ptr = sgt;
+	smap->dmabuf_ptr = kiumd_dmabuf;
 	add_to_smmu_table(kiumd_ctx, smap);
 
 	kiusr.id = smap->id;
@@ -633,7 +633,7 @@ static int kiumd_dmabuf_managed_iova_unmap(char __user *arg, struct file *fp)
 
 	spin_unlock(&kiumd_ctx->smmu_lock);
 
-	kiumd_dmabuf = (struct dma_buf *)smap->dmabuf_ptr;
+	kiumd_dmabuf = smap->dmabuf_ptr;
 	if (!kiumd_dmabuf) {
 		pr_err("%s:kiumd_dmabuf is NULL\n", __func__);
 		return -EINVAL;
@@ -654,7 +654,7 @@ static int kiumd_dmabuf_managed_iova_unmap(char __user *arg, struct file *fp)
 		}
 	}
 
-	dmabufattach = (struct dma_buf_attachment *)smap->dmabufattach;
+	dmabufattach = smap->dmabufattach;
 	if (!dmabufattach) {
 		pr_err("%s:dmabufattach is NULL\n", __func__);
 		return -EINVAL;
@@ -670,8 +670,7 @@ static int kiumd_dmabuf_managed_iova_unmap(char __user *arg, struct file *fp)
 		return -EINVAL;
 	}
 
-	dma_buf_unmap_attachment_unlocked(dmabufattach,
-					  (struct sg_table *)smap->sgt_ptr,
+	dma_buf_unmap_attachment_unlocked(dmabufattach, smap->sgt_ptr,
 					  kiumd_dma_direction);
 
 	iommu_dom = kiumd_iommu_get_dma_domain(dev);
@@ -891,9 +890,9 @@ static int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 	else
 		smap->is_fixed_map = false;
 
-	smap->dmabufattach = (long)dmabufattach;
-	smap->sgt_ptr = (long)sgt;
-	smap->dmabuf_ptr = (long)kiumd_dmabuf;
+	smap->dmabufattach = dmabufattach;
+	smap->sgt_ptr = sgt;
+	smap->dmabuf_ptr = kiumd_dmabuf;
 	smap->dma_dir = kiumd_dma_direction;
 	smap->ptselect = kiusr.ptselect;
 	smap->is_iova_zero = kiusr.is_iova_zero;
@@ -976,7 +975,7 @@ static int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 	}
 
 	spin_unlock(&kiumd_ctx->smmu_lock);
-	kiumd_dmabuf = (struct dma_buf *)smap->dmabuf_ptr;
+	kiumd_dmabuf = smap->dmabuf_ptr;
 	if (!kiumd_dmabuf) {
 		pr_err("%s:kiumd_dmabuf is NULL\n", __func__);
 		return -EINVAL;
@@ -993,7 +992,7 @@ static int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 					    kiusr.ptselect, kiusr.is_iova_zero,
 					    kiumd_dmabuf->size, kiumd_ctx);
 
-	dmabufattach = (struct dma_buf_attachment *)smap->dmabufattach;
+	dmabufattach = smap->dmabufattach;
 	if (!dmabufattach) {
 		pr_err("%s:dmabufattach is NULL\n", __func__);
 		return -EINVAL;
@@ -1061,8 +1060,7 @@ static int kiumd_dmabuf_vfio_unmap(char __user *arg, struct file *fp)
 			pr_err("%s: smap->sgt_ptr is NULL\n", __func__);
 			return -EINVAL;
 		}
-		dma_buf_unmap_attachment_unlocked(dmabufattach,
-						  (struct sg_table *)smap->sgt_ptr,
+		dma_buf_unmap_attachment_unlocked(dmabufattach, smap->sgt_ptr,
 						  kiumd_dma_direction);
 		if (kiusr.is_iova_zero == FIXED_IOVA_AT_ZERO) {
 			iommu_dom = kiumd_iommu_get_dma_domain(dev);
@@ -1232,9 +1230,9 @@ static int kiumd_dmabuf_assign_buf(char __user *arg, struct file *fp)
 		ret = -ENOMEM;
 		goto hyp_unassign_sg;
 	}
-	smap->dmabufattach = (long)dmabufattach;
-	smap->sgt_ptr = (long)sgt;
-	smap->dmabuf_ptr = (long)kiumd_dmabuf;
+	smap->dmabufattach = dmabufattach;
+	smap->sgt_ptr = sgt;
+	smap->dmabuf_ptr = kiumd_dmabuf;
 
 	mutex_lock(&kiumd_ctx->hyp_lock);
 	smap->id = kiumd_ctx->hyp_idx++;
@@ -1342,7 +1340,7 @@ static int kiumd_dmabuf_unassign_buf(char __user *arg, struct file *fp)
 		goto err;
 	}
 
-	ret = kiumd_hyp_unassign_sg((struct sg_table *)smap->sgt_ptr, vmids,
+	ret = kiumd_hyp_unassign_sg(smap->sgt_ptr, vmids,
 				    map_ctx->nr_acl_entries, true);
 	if (ret < 0) {
 		pr_err("%s:%d memory ownership transfer error:%d\n", __func__, __LINE__, ret);
@@ -1353,7 +1351,7 @@ static int kiumd_dmabuf_unassign_buf(char __user *arg, struct file *fp)
 	kfree(vmids);
 	kfree(perms);
 
-	dmabufattach = (struct dma_buf_attachment *)smap->dmabufattach;
+	dmabufattach = smap->dmabufattach;
 	if (!dmabufattach) {
 		pr_err("%s:%d invalid params:%d\n", __func__, __LINE__, ret);
 		ret = -EINVAL;
@@ -1362,7 +1360,7 @@ static int kiumd_dmabuf_unassign_buf(char __user *arg, struct file *fp)
 	pr_debug("kiumd secure unmap:sgt from attachment:%p\n",
 		 ((struct kiumd_dma_heap_attachment *)(dmabufattach->priv))->table);
 
-	kiumd_dmabuf = (struct dma_buf *)smap->dmabuf_ptr;
+	kiumd_dmabuf = smap->dmabuf_ptr;
 	if (!kiumd_dmabuf) {
 		pr_err("%s:%d invalid params:%d\n", __func__, __LINE__, ret);
 		ret = -EINVAL;
@@ -1492,9 +1490,9 @@ static int kiumd_dmabuf_vfio_secure_map(char __user *arg, struct file *fp)
 		goto hyp_unassign_sg;
 	}
 
-	smap->dmabufattach = (long)dmabufattach;
-	smap->sgt_ptr = (long)sgt;
-	smap->dmabuf_ptr = (long)kiumd_dmabuf;
+	smap->dmabufattach = dmabufattach;
+	smap->sgt_ptr = sgt;
+	smap->dmabuf_ptr = kiumd_dmabuf;
 	spin_lock(&kiumd_ctx->smmu_lock);
 	smap->id = kiumd_ctx->id++;
 	hash_add(kiumd_ctx->smmu_table, &smap->node, smap->id);
@@ -1602,7 +1600,7 @@ static int kiumd_dmabuf_vfio_secure_unmap(char __user *arg, struct file *fp)
 	if (ret)
 		return ret;
 
-	dmabufattach = (struct dma_buf_attachment *)smap->dmabufattach;
+	dmabufattach = smap->dmabufattach;
 	if (!dmabufattach) {
 		pr_err("%s:%d invalid params:%d\n", __func__, __LINE__, ret);
 		ret = -EINVAL;
@@ -1615,11 +1613,10 @@ static int kiumd_dmabuf_vfio_secure_unmap(char __user *arg, struct file *fp)
 		goto free_mem;
 	}
 
-	dma_buf_unmap_attachment_unlocked(dmabufattach,
-					  (struct sg_table *)smap->sgt_ptr,
+	dma_buf_unmap_attachment_unlocked(dmabufattach, smap->sgt_ptr,
 					  DMA_BIDIRECTIONAL);
 
-	ret = kiumd_hyp_unassign_sg((struct sg_table *)smap->sgt_ptr, vmids,
+	ret = kiumd_hyp_unassign_sg(smap->sgt_ptr, vmids,
 				    kiusr.mem_parcel.nr_acl_entries, true);
 	if (ret < 0) {
 		pr_err("%s:%d memory ownership transfer error:%d\n", __func__,
@@ -1638,7 +1635,7 @@ static int kiumd_dmabuf_vfio_secure_unmap(char __user *arg, struct file *fp)
 
 	pr_debug("memory ownership transfer success\n");
 
-	kiumd_dmabuf = (struct dma_buf *)smap->dmabuf_ptr;
+	kiumd_dmabuf = smap->dmabuf_ptr;
 	if (!kiumd_dmabuf) {
 		pr_err("%s:%d invalid params:%d\n", __func__, __LINE__, ret);
 		ret = -EINVAL;
@@ -1914,10 +1911,9 @@ static int kiumd_mmio_smmu_map(char __user *arg, struct file *fp)
 			if (!smap->context)
 				continue;
 			pr_debug("mmio ctx%p iova:%llx size:%lx\n", smap->context,
-				 ((struct kiumd_smmu_mmio_ctx *)smap->context)->iova,
-				 ((struct kiumd_smmu_mmio_ctx *)smap->context)->size);
+				 smap->context->iova, smap->context->size);
 			if (kiusr.fixed_iova &&
-			    ((struct kiumd_smmu_mmio_ctx *)smap->context)->iova == kiusr.iova) {
+			    smap->context->iova == kiusr.iova) {
 				spin_unlock(&kiumd_ctx->smmu_lock);
 				pr_err("%s:error IOVA:%llx exists..\n", __func__, kiusr.iova);
 				return -EINVAL;
@@ -2068,7 +2064,7 @@ static int kiumd_mmio_smmu_unmap(char __user *arg, struct file *fp)
 		return -ENOENT;
 	}
 
-	mmio_ctx = (struct kiumd_smmu_mmio_ctx *)smap->context;
+	mmio_ctx = smap->context;
 	if (!mmio_ctx) {
 		pr_err("%s:invalid context:%d\n", __func__, __LINE__);
 		return -EINVAL;
@@ -2166,9 +2162,9 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 			}
 
 			if (smap->dmabuf_ptr) {
-				kiumd_dmabuf = (struct dma_buf *)smap->dmabuf_ptr;
+				kiumd_dmabuf = smap->dmabuf_ptr;
 
-				pr_debug("kiumd_debug: Driver close : unmap sgt_ptr:%lx\n",
+				pr_debug("kiumd_debug: Driver close : unmap sgt_ptr:%pK\n",
 					 smap->sgt_ptr);
 
 				if (smap->ptselect == KGSL_GLOBAL_PT ||
@@ -2178,8 +2174,9 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 
 				if (smap->is_fixed_map) {
 					ret = kiumd_configure_dma_cookie(
-						smap->dev, IOMMU_DMA_MSI_COOKIE,
-						smap->dmabuf_ptr);
+							smap->dev,
+							IOMMU_DMA_MSI_COOKIE,
+							(dma_addr_t)smap->dmabuf_ptr);
 					if (ret) {
 						pr_err("%s %d failed to configure cookie\n", __func__, __LINE__);
 						break;
@@ -2187,12 +2184,11 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 				}
 
 				if (smap->dmabufattach && smap->sgt_ptr)
-					dma_buf_unmap_attachment_unlocked((struct dma_buf_attachment *)
-									  smap->dmabufattach,
-									  (struct sg_table *)smap->sgt_ptr,
+					dma_buf_unmap_attachment_unlocked(smap->dmabufattach,
+									  smap->sgt_ptr,
 									  smap->dma_dir);
 
-				pr_debug("kiumd_debug: unmap dmabufatach:%lx\n",
+				pr_debug("kiumd_debug: unmap dmabufatach:%pK\n",
 						smap->dmabufattach);
 				if (smap->is_iova_zero == FIXED_IOVA_AT_ZERO) {
 					iommu_dom = kiumd_iommu_get_dma_domain(smap->dev);
@@ -2214,9 +2210,9 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 
 				if (smap->is_fixed_map) {
 					ret = kiumd_configure_dma_cookie(
-						smap->dev,
-						IOMMU_DMA_IOVA_COOKIE,
-						smap->dmabuf_ptr);
+							smap->dev,
+							IOMMU_DMA_IOVA_COOKIE,
+							(dma_addr_t)smap->dmabuf_ptr);
 					if (ret) {
 						pr_err("%s %d failed to configure cookie\n", __func__, __LINE__);
 						break;

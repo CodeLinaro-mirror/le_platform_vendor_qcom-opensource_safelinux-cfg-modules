@@ -268,15 +268,15 @@ struct iommu_addr_entry {
 
 struct smmu_map_data {
 	int id;
-	long sgt_ptr;
-	long dmabuf_ptr;
-	long dmabufattach;
+	struct sg_table *sgt_ptr;
+	struct dma_buf *dmabuf_ptr;
+	struct dma_buf_attachment *dmabufattach;
 	int dma_dir;
 	int ptselect;
 	int is_iova_zero;
 	bool is_fixed_map;
 	struct device *dev;
-	void *context;
+	struct kiumd_smmu_mmio_ctx *context;
 	struct hlist_node node;
 };
 
@@ -291,9 +291,9 @@ struct smmu_map_data {
  */
 struct hyp_map_data {
 	unsigned int id;
-	long sgt_ptr;
-	long dmabuf_ptr;
-	long dmabufattach;
+	struct sg_table *sgt_ptr;
+	struct dma_buf *dmabuf_ptr;
+	struct dma_buf_attachment *dmabufattach;
 	struct kiumd_secure_map_context *secure_ctx;
 	struct hlist_node node;
 };
