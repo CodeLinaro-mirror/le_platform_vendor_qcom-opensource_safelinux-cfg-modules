@@ -30,6 +30,9 @@ iommu_iova_map-objs := drivers/iommu_iova_map.o
 obj-m += qcom_vdev.o
 qcom_vdev-objs := drivers/qcom_vdev.o
 
+obj-m += dmabuf_share.o
+dmabuf_share-objs := drivers/dmabuf_share.o
+
 obj-m += vfio_iommu_qcom.o
 vfio_iommu_qcom-objs := drivers/vfio_iommu_qcom.o
 

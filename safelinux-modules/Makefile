@@ -20,6 +20,8 @@ INSTALL_HDR=$(shell mkdir -p $(HDR_INSTAL_PATH)/linux; \
 			 $(KDIR)/scripts/headers_install.sh \
 			 $(PWD)/include/uapi/misc/kiumd.h $(HDR_INSTAL_PATH)/uapi/misc/kiumd.h; \
 			 $(KDIR)/scripts/headers_install.sh \
+			 $(PWD)/include/uapi/misc/dmabuf_share.h $(HDR_INSTAL_PATH)/uapi/misc/dmabuf_share.h; \
+			 $(KDIR)/scripts/headers_install.sh \
 			 $(PWD)/include/uapi/misc/scm_user_intf.h $(HDR_INSTAL_PATH)/uapi/misc/scm_user_intf.h; \
 			 $(KDIR)/scripts/headers_install.sh \
 			 $(PWD)/include/uapi/misc/vendor_uscmi.h $(HDR_INSTAL_PATH)/uapi/misc/vendor_uscmi.h; \
