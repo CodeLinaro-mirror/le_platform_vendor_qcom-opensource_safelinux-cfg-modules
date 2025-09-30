@@ -85,9 +85,10 @@ static const struct svc_cmd_list sip_tbl[] = {
 					  QCOM_SCM_INFO_BW_PROF_ID),
 
 	[QCOM_SCM_SVC_MP] = SVC_CMD_GRP(QCOM_SCM_SVC_MP,
-					5,
+					6,
 					QCOM_SCM_MP_VIDEO_VAR,
 					QCOM_SCM_MP_ASSIGN,
+					QCOM_SCM_MP_CP_SMMU_APERTURE_ID,
 					QCOM_SCM_MP_SHM_BRIDGE_ENABLE,
 					QCOM_SCM_MP_SHM_BRIDGE_DELETE,
 					QCOM_SCM_MP_SHM_BRIDGE_CREATE),
@@ -361,6 +362,7 @@ static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	struct platform_device *scm_pdev = dev_data->scm_pdev;
 	struct qcom_scm_desc desc;
 	struct qcom_scm_res res = {0};
+	int id;
 #else
 	struct scm_user_res res = {0};
 	u64 res1 = 0;
@@ -469,6 +471,10 @@ static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			break;
 		case QCOM_SCM_MP_ASSIGN:
 			scm_data.ret = qcom_scm_intf_assign_mem(dev_data, scm_data);
+			break;
+		case QCOM_SCM_MP_CP_SMMU_APERTURE_ID:
+			scm_data.ret = qcom_scm_kgsl_set_smmu_gos_aperture(scm_data.args_buffer[0],
+									  scm_data.args_buffer[1]);
 			break;
 		}
 		break;
