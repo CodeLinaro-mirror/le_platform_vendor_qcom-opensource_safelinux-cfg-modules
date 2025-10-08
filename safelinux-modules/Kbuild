@@ -24,6 +24,9 @@ pinctrl_fusa-objs := drivers/pinctrl_fusa.o
 obj-m += arm-smmu-qcom-fusa.o
 arm-smmu-qcom-fusa-objs := drivers/arm-smmu-qcom-fusa.o
 
+obj-m += qcom_io_mem.o
+qcom_io_mem-objs := drivers/qcom_io_mem.o drivers/kiumd_common.o
+
 obj-m += iommu_iova_map.o
 iommu_iova_map-objs := drivers/iommu_iova_map.o
 

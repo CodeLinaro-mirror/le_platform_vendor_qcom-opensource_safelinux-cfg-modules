@@ -471,28 +471,13 @@ static int kiumd_dmabuf_custom_iova_init(char __user *arg, struct file *fp)
 	return 0;
 }
 
-static void clean_map(struct kiumd_ctx *kiumd_ctx, struct smmu_map_data *smap)
-{
-
-	if (smap->is_iova_zero)
-		kiumd_dmabuf_zero_unmap(smap);
-	else if (smap->is_priv_map)
-		kiumd_dmabuf_priv_unmap(smap);
-	else
-		kiumd_dmabuf_unmap(smap);
-
-	dma_buf_put(smap->dmabuf_ptr);
-	if (smap->is_kgsl_ctx)
-		(void)clear_kgsl_map_iova(kiumd_ctx, smap);
-}
-
 static int __kiumd_dmabuf_vfio_map(struct kiumd_ctx *kiumd_ctx,
 				   struct kiumd_user kiusr,
 				   struct smmu_map_data *smap)
 {
 	int ret;
 
-	ret = set_kgsl_map_iova(kiumd_ctx, kiusr, smap);
+	ret = set_kgsl_map_iova(iommu_addr_cache, kiumd_ctx, kiusr, smap);
 	if (ret)
 		return ret;
 
@@ -521,7 +506,7 @@ dmabuf_put:
 	dma_buf_put(smap->dmabuf_ptr);
 kgsl_iova_clear:
 	if (smap->is_kgsl_ctx)
-		(void)clear_kgsl_map_iova(kiumd_ctx, smap);
+		(void)clear_kgsl_map_iova(iommu_addr_cache, kiumd_ctx, smap);
 
 	return ret;
 }
@@ -588,7 +573,7 @@ static int kiumd_dmabuf_vfio_map(char __user *arg, struct file *fp)
 
 	return 0;
 clean_map_res:
-	clean_map(kiumd_ctx, smap);
+	clean_map(iommu_addr_cache, kiumd_ctx, smap);
 smap_free:
 	kfree(smap);
 	return ret;
@@ -618,7 +603,7 @@ static int __kiumd_dmabuf_vfio_unmap(struct kiumd_ctx *kiumd_ctx,
 		kiumd_dmabuf_unmap(smap);
 
 	if (smap->is_kgsl_ctx) {
-		ret = clear_kgsl_map_iova(kiumd_ctx, smap);
+		ret = clear_kgsl_map_iova(iommu_addr_cache, kiumd_ctx, smap);
 		if (ret)
 			return -ENOENT;
 	}
@@ -747,7 +732,7 @@ int kiumd_dmabuf_managed_iova_map(char __user *arg, struct file *fp)
 	/* Need to review/remove this lock after cookie change removed */
 	mutex_lock(&kiumd_ctx->map_lock);
 	if (!kiusr.is_iova_zero) {
-		ret = init_and_allocate_iova(dev, kiumd_ctx, smap,
+		ret = init_and_allocate_iova(iommu_addr_cache, dev, kiumd_ctx, smap,
 					     kiumd_ctx->max_shift, fixed_iova, kiusr.is_fix_map);
 		if (ret) {
 			pr_err("%s: failed to allocate iova for: %s, ret: %d\n",
@@ -778,10 +763,10 @@ int kiumd_dmabuf_managed_iova_map(char __user *arg, struct file *fp)
 	return 0;
 
 clean_map_res:
-	clean_map(kiumd_ctx, smap);
+	clean_map(iommu_addr_cache, kiumd_ctx, smap);
 smap_free:
 	if (!kiusr.is_iova_zero && smap->iova_rb) {
-		if (free_allocated_iova(kiumd_ctx, smap->iova_rb))
+		if (free_allocated_iova(iommu_addr_cache, kiumd_ctx, smap->iova_rb))
 			pr_err("%s:unable to free iova\n", __func__);
 	}
 
@@ -850,7 +835,7 @@ int kiumd_dmabuf_managed_iova_unmap(char __user *arg, struct file *fp)
 		return ret;
 
 	if (!smap->is_iova_zero && smap->iova_rb) {
-		ret = free_allocated_iova(kiumd_ctx, smap->iova_rb);
+		ret = free_allocated_iova(iommu_addr_cache, kiumd_ctx, smap->iova_rb);
 		if (ret) {
 			pr_err("%s:unable to free iova\n", __func__);
 			return ret;
@@ -1491,7 +1476,7 @@ static int kiumd_mmio_smmu_map(char __user *arg, struct file *fp)
 	addr = res->start;
 	size = resource_size(res);
 	smap->size = size;
-	ret = init_and_allocate_iova(dev, kiumd_ctx, smap,
+	ret = init_and_allocate_iova(iommu_addr_cache, dev, kiumd_ctx, smap,
 				     PAGE_SHIFT, kiusr.iova, kiusr.fixed_iova);
 	if (ret) {
 		pr_err("%s: failed to allocate iova for: %s, ret: %d\n",
@@ -1505,7 +1490,7 @@ static int kiumd_mmio_smmu_map(char __user *arg, struct file *fp)
 
 	if (ret) {
 		pr_err("%s:Failed to map with error: %d\n", __func__, ret);
-		ret = free_allocated_iova(kiumd_ctx, smap->iova_rb);
+		ret = free_allocated_iova(iommu_addr_cache, kiumd_ctx, smap->iova_rb);
 		if (ret) {
 			pr_err("%s:unable to free iova\n", __func__);
 			ret = -ENOMEM;
@@ -1622,7 +1607,7 @@ static int kiumd_mmio_smmu_unmap(char __user *arg, struct file *fp)
 	pr_debug("%s:mapping found:%d mmio_ctx:%p iova:%llx size:%lx\n",
 		 __func__, kiusr.id, mmio_ctx, mmio_ctx->iova, mmio_ctx->size);
 
-	ret = free_allocated_iova(kiumd_ctx, mmio_ctx->iova);
+	ret = free_allocated_iova(iommu_addr_cache, kiumd_ctx, mmio_ctx->iova);
 	if (ret) {
 		pr_err("%s:unable to free iova\n", __func__);
 		return ret;
@@ -1775,7 +1760,8 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 				}
 
 				if (ki_ctx->pgtable_ctx && !smap->is_iova_zero && smap->iova_rb)
-					free_iova_range(ki_ctx->pgtable_ctx, smap->iova_rb);
+					free_iova_range(iommu_addr_cache,
+							ki_ctx->pgtable_ctx, smap->iova_rb);
 
 				dma_buf_detach(kiumd_dmabuf,
 						(struct dma_buf_attachment *)smap->dmabufattach);
