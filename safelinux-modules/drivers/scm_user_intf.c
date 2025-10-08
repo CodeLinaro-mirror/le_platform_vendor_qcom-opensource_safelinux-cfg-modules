@@ -174,11 +174,12 @@ static int qcom_scm_intf_assign_mem(struct scm_dev_data *dev_data,
 	struct device_node *node;
 	struct resource of_res;
 	char name[DT_LABEL_LENGTH];
+	u64 srcVM [2] = {0};
 	int ret = 0;
 
 	void __user *destVM_arr = (void __user *)scm_data.args_buffer[DEST_VMS_LIST_INDEX];
-	u64 srcVM = BIT(scm_data.args_buffer[SRC_VMS_LIST_INDEX]);
 	u64 destVM_cnt = scm_data.args_buffer[DEST_VMS_SIZE_INDEX];
+	srcVM[0] = BIT(scm_data.args_buffer[SRC_VMS_LIST_INDEX]);
 
 	if (!destVM_cnt || destVM_cnt > MAX_VM_SIZE)
 		return -EFAULT;
@@ -214,7 +215,7 @@ static int qcom_scm_intf_assign_mem(struct scm_dev_data *dev_data,
 		return -EFAULT;
 
 	ret = qcom_scm_assign_mem(of_res.start, resource_size(&of_res),
-					   &srcVM, destVM, destVM_cnt);
+					   &srcVM[0], destVM, destVM_cnt);
 
 	return ret;
 }
