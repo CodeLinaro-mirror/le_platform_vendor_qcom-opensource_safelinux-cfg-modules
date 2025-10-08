@@ -10,6 +10,7 @@
 #define TRACE_SAFELINUX_MODULES
 #include <linux/tracepoint.h>
 
+#if defined(TRACE_SAFELINUX_COMMON)
 TRACE_EVENT(kiumd_smmuv2_write_context_bank_start,
 
 	TP_PROTO(int idx, int cbndx, int cbar),
@@ -48,6 +49,169 @@ TRACE_EVENT(kiumd_smmuv2_write_context_bank_end,
 	TP_printk("idx=%d", __entry->idx)
 );
 
+TRACE_EVENT(kiumd_io_pgtable_hyp_assign_page_start,
+
+	TP_PROTO(u32 *vmid, u64 page, u32 nr_acl_entries),
+
+	TP_ARGS(vmid, page, nr_acl_entries),
+
+	TP_STRUCT__entry(
+		__dynamic_array(u32, vmid_arr, nr_acl_entries)
+		__field(u32, page)
+		__field(u32, nr_acl_entries)
+	),
+
+	TP_fast_assign(
+		unsigned int i;
+		u32 *vmid_ptr = __get_dynamic_array(vmid_arr);
+
+		__entry->page = page;
+		__entry->nr_acl_entries = nr_acl_entries;
+		for (i = 0; i < __entry->nr_acl_entries; i++)
+			vmid_ptr[i] = vmid[i];
+	),
+
+	TP_printk("vmid=%s, page=%u, nr_acl_entries=%d",
+		  __print_array(__get_dynamic_array(vmid_arr),
+		  __entry->nr_acl_entries, sizeof(u32)), __entry->page,
+		  __entry->nr_acl_entries)
+);
+
+TRACE_EVENT(kiumd_io_pgtable_hyp_assign_page_end,
+
+	TP_PROTO(u64 page, u32 nr_acl_entries),
+
+	TP_ARGS(page, nr_acl_entries),
+
+	TP_STRUCT__entry(
+		__field(u32, page)
+		__field(u32, nr_acl_entries)
+	),
+
+	TP_fast_assign(
+		__entry->page = page;
+		__entry->nr_acl_entries = nr_acl_entries;
+	),
+
+	TP_printk("page=%u, nr_acl_entries=%d", __entry->page, __entry->nr_acl_entries)
+);
+
+TRACE_EVENT(kiumd_io_pgtable_hyp_unassign_page_start,
+
+	TP_PROTO(u32 *vmid, u64 page, u32 nr_acl_entries),
+
+	TP_ARGS(vmid, page, nr_acl_entries),
+
+	TP_STRUCT__entry(
+		__dynamic_array(u32, vmid_arr, nr_acl_entries)
+		__field(u32, page)
+		__field(u32, nr_acl_entries)
+	),
+
+	TP_fast_assign(
+		unsigned int i;
+		u32 *vmid_ptr = __get_dynamic_array(vmid_arr);
+
+		__entry->page = page;
+		__entry->nr_acl_entries = nr_acl_entries;
+		for (i = 0; i < __entry->nr_acl_entries; i++)
+			vmid_ptr[i] = vmid[i];
+	),
+
+	TP_printk("vmid=%s, page=%u, nr_acl_entries=%d",
+		  __print_array(__get_dynamic_array(vmid_arr),
+		  __entry->nr_acl_entries, sizeof(u32)), __entry->page,
+		  __entry->nr_acl_entries)
+);
+
+TRACE_EVENT(kiumd_io_pgtable_hyp_unassign_page_end,
+
+	TP_PROTO(u64 page, u32 nr_acl_entries),
+
+	TP_ARGS(page, nr_acl_entries),
+
+	TP_STRUCT__entry(
+		__field(u32, page)
+		__field(u32, nr_acl_entries)
+	),
+
+	TP_fast_assign(
+		__entry->page = page;
+		__entry->nr_acl_entries = nr_acl_entries;
+	),
+
+	TP_printk("page=%u, nr_acl_entries=%d", __entry->page, __entry->nr_acl_entries)
+);
+
+TRACE_EVENT(kiumd_hyp_unassign_sg_start,
+
+	TP_PROTO(struct sg_table *sgt),
+
+	TP_ARGS(sgt),
+
+	TP_STRUCT__entry(
+		__field(unsigned int, nents)
+	),
+
+	TP_fast_assign(
+		__entry->nents = sgt->nents;
+	),
+
+	TP_printk("nents=%d", __entry->nents)
+);
+
+TRACE_EVENT(kiumd_hyp_unassign_sg_end,
+
+	TP_PROTO(struct sg_table *sgt),
+
+	TP_ARGS(sgt),
+
+	TP_STRUCT__entry(
+		__field(unsigned int, nents)
+	),
+
+	TP_fast_assign(
+		__entry->nents = sgt->nents;
+	),
+
+	TP_printk("nents=%d", __entry->nents)
+);
+
+TRACE_EVENT(kiumd_hyp_assign_sg_start,
+
+	TP_PROTO(struct sg_table *sgt),
+
+	TP_ARGS(sgt),
+
+	TP_STRUCT__entry(
+		__field(unsigned int, nents)
+	),
+
+	TP_fast_assign(
+		__entry->nents = sgt->nents;
+	),
+
+	TP_printk("nents=%d", __entry->nents)
+);
+
+TRACE_EVENT(kiumd_hyp_assign_sg_end,
+
+	TP_PROTO(struct sg_table *sgt),
+
+	TP_ARGS(sgt),
+
+	TP_STRUCT__entry(
+		__field(unsigned int, nents)
+	),
+
+	TP_fast_assign(
+		__entry->nents = sgt->nents;
+	),
+
+	TP_printk("nents=%d", __entry->nents)
+);
+
+#else    // TRACE_SAFELINUX_COMMON
 
 TRACE_EVENT(kiumd_perprocess_pt_alloc_start,
 
@@ -86,7 +250,9 @@ TRACE_EVENT(kiumd_perprocess_pt_alloc_end,
 		__entry->asid = asid;
 	),
 
-	TP_printk("vfio_fd=%d, pgtbl_ops_ptr=0x%lx, ttbr0=0x%llx, asid=%u", __entry->vfio_fd, __entry->pgtbl_ops_ptr, __entry->ttbr0, __entry->asid)
+	TP_printk("vfio_fd=%d, pgtbl_ops_ptr=0x%lx, ttbr0=0x%llx, asid=%u",
+		  __entry->vfio_fd, __entry->pgtbl_ops_ptr, __entry->ttbr0,
+		  __entry->asid)
 );
 
 TRACE_EVENT(kiumd_global_pgtble_set_start,
@@ -143,7 +309,9 @@ TRACE_EVENT(kiumd_perprocess_pgtble_set_start,
 		__entry->asid = asid;
 	),
 
-	TP_printk("vfio_fd=%d, pgtbl_ops_ptr=0x%lx, ttbr0=0x%llx, asid=%u", __entry->vfio_fd, __entry->pgtbl_ops_ptr, __entry->ttbr0, __entry->asid)
+	TP_printk("vfio_fd=%d, pgtbl_ops_ptr=0x%lx, ttbr0=0x%llx, asid=%u",
+		  __entry->vfio_fd, __entry->pgtbl_ops_ptr, __entry->ttbr0,
+		  __entry->asid)
 );
 
 TRACE_EVENT(kiumd_perprocess_pgtble_set_end,
@@ -183,7 +351,9 @@ TRACE_EVENT(kiumd_perprocess_pgtble_free_start,
 		__entry->asid = asid;
 	),
 
-	TP_printk("vfio_fd=%d, pgtbl_ops_ptr=0x%lx, ttbr0=0x%llx, asid=%u", __entry->vfio_fd, __entry->pgtbl_ops_ptr, __entry->ttbr0, __entry->asid)
+	TP_printk("vfio_fd=%d, pgtbl_ops_ptr=0x%lx, ttbr0=0x%llx, asid=%u",
+		  __entry->vfio_fd, __entry->pgtbl_ops_ptr, __entry->ttbr0,
+		  __entry->asid)
 );
 
 TRACE_EVENT(kiumd_perprocess_pgtble_free_end,
@@ -242,7 +412,8 @@ TRACE_EVENT(kiumd_dmabuf_vfio_map_start,
 	TP_PROTO(const char *device_name, int vfio_fd, int dma_buf_fd, int dma_attr,
 		int dma_direction, int ptselect, int is_iova_zero, u64 size, void *kiumd_ctx),
 
-	TP_ARGS(device_name, vfio_fd, dma_buf_fd, dma_attr, dma_direction, ptselect, is_iova_zero, size, kiumd_ctx),
+	TP_ARGS(device_name, vfio_fd, dma_buf_fd, dma_attr, dma_direction, ptselect,
+		is_iova_zero, size, kiumd_ctx),
 
 	TP_STRUCT__entry(
 		__string(str, device_name)
@@ -269,8 +440,9 @@ TRACE_EVENT(kiumd_dmabuf_vfio_map_start,
 	),
 
 	TP_printk("device_name=%s, vfio_fd=%d, dma_buf_fd=%d, dma_attr=%d, dma_direction=%d, ptselect=%d, is_iova_zero=%d, size=%llu, kiumd_ctx=%p",
-		   __get_str(str), __entry->vfio_fd, __entry->dma_buf_fd, __entry->dma_attr, __entry->dma_direction,
-		   __entry->ptselect, __entry->is_iova_zero, __entry->size, __entry->kiumd_ctx)
+		   __get_str(str), __entry->vfio_fd, __entry->dma_buf_fd, __entry->dma_attr,
+		   __entry->dma_direction, __entry->ptselect, __entry->is_iova_zero,
+		   __entry->size, __entry->kiumd_ctx)
 );
 
 TRACE_EVENT(kiumd_dmabuf_vfio_map_end,
@@ -291,15 +463,18 @@ TRACE_EVENT(kiumd_dmabuf_vfio_map_end,
 		__entry->dma_addr = dma_addr;
 	),
 
-	TP_printk("vfio_fd=%d,id=%d, dma_addr=0x%lx", __entry->vfio_fd,  __entry->id, __entry->dma_addr)
+	TP_printk("vfio_fd=%d,id=%d, dma_addr=0x%lx", __entry->vfio_fd,
+		   __entry->id, __entry->dma_addr)
 );
 
 TRACE_EVENT(kiumd_dmabuf_vfio_unmap_start,
 
-	TP_PROTO(const char * device_name, int vfio_fd, int dma_buf_fd, unsigned long dma_addr, int dma_attr, int dma_direction,
-	         int ptselect, int is_iova_zero, size_t size, void *kiumd_ctx),
+	TP_PROTO(const char *device_name, int vfio_fd, int dma_buf_fd,
+		 unsigned long dma_addr, int dma_attr, int dma_direction, int ptselect,
+		 int is_iova_zero, size_t size, void *kiumd_ctx),
 
-	TP_ARGS(device_name, vfio_fd, dma_buf_fd, dma_addr, dma_attr, dma_direction, ptselect, is_iova_zero, size, kiumd_ctx),
+	TP_ARGS(device_name, vfio_fd, dma_buf_fd, dma_addr, dma_attr, dma_direction,
+		ptselect, is_iova_zero, size, kiumd_ctx),
 
 	TP_STRUCT__entry(
 		__string(str, device_name)
@@ -328,8 +503,9 @@ TRACE_EVENT(kiumd_dmabuf_vfio_unmap_start,
 	),
 
 	TP_printk("device_name=%s, vfio_fd=%d, dma_buf_fd=%d, dma_addr=0x%lx, dma_attr=%d, dma_direction=%d, ptselect=%d, is_iova_zero=%d size=%zu kiumd_ctx=%p",
-		   __get_str(str), __entry->vfio_fd, __entry->dma_buf_fd, __entry->dma_addr, __entry->dma_attr, __entry->dma_direction,
-		   __entry->ptselect, __entry->is_iova_zero, __entry->size, __entry->kiumd_ctx)
+		   __get_str(str), __entry->vfio_fd, __entry->dma_buf_fd, __entry->dma_addr,
+		   __entry->dma_attr, __entry->dma_direction, __entry->ptselect,
+		   __entry->is_iova_zero, __entry->size, __entry->kiumd_ctx)
 );
 
 TRACE_EVENT(kiumd_dmabuf_vfio_unmap_end,
@@ -367,7 +543,8 @@ TRACE_EVENT(kiumd_iova_ctrl_start,
 		__entry->iova = iova;
 	),
 
-	TP_printk("vfio_fd=%d, iova_flag=%d, iova=0x%lx", __entry->vfio_fd, __entry->iova_flag, __entry->iova)
+	TP_printk("vfio_fd=%d, iova_flag=%d, iova=0x%lx", __entry->vfio_fd,
+		  __entry->iova_flag, __entry->iova)
 );
 
 TRACE_EVENT(kiumd_iova_ctrl_end,
@@ -472,164 +649,6 @@ TRACE_EVENT(kiumd_fd_dmabuf_handler_end,
 					__entry->dma_buf_fd, __entry->ret)
 );
 
-TRACE_EVENT(kiumd_io_pgtable_hyp_assign_page_start,
-
-	TP_PROTO(u32 *vmid, u64 page, u32 nr_acl_entries),
-
-	TP_ARGS(vmid, page, nr_acl_entries),
-
-	TP_STRUCT__entry(
-		__dynamic_array(u32, vmid_arr, nr_acl_entries)
-		__field(u32, page)
-		__field(u32, nr_acl_entries)
-	),
-
-	TP_fast_assign(
-		unsigned int i;
-		u32 *vmid_ptr = __get_dynamic_array(vmid_arr);
-		__entry->page = page;
-		__entry->nr_acl_entries = nr_acl_entries;
-		for(i = 0; i < __entry->nr_acl_entries; i++) {
-			vmid_ptr[i] = vmid[i];
-		}
-	),
-
-	TP_printk("vmid=%s, page=%u, nr_acl_entries=%d", __print_array(__get_dynamic_array(vmid_arr),
-		 __entry->nr_acl_entries, sizeof(u32)), __entry->page, __entry->nr_acl_entries)
-);
-
-TRACE_EVENT(kiumd_io_pgtable_hyp_assign_page_end,
-
-	TP_PROTO(u64 page, u32 nr_acl_entries),
-
-	TP_ARGS(page, nr_acl_entries),
-
-	TP_STRUCT__entry(
-		__field(u32, page)
-		__field(u32, nr_acl_entries)
-	),
-
-	TP_fast_assign(
-		__entry->page = page;
-		__entry->nr_acl_entries = nr_acl_entries;
-	),
-
-	TP_printk("page=%u, nr_acl_entries=%d", __entry->page, __entry->nr_acl_entries)
-);
-
-TRACE_EVENT(kiumd_io_pgtable_hyp_unassign_page_start,
-
-	TP_PROTO(u32 *vmid, u64 page, u32 nr_acl_entries),
-
-	TP_ARGS(vmid, page, nr_acl_entries),
-
-	TP_STRUCT__entry(
-		__dynamic_array(u32, vmid_arr, nr_acl_entries)
-		__field(u32, page)
-		__field(u32, nr_acl_entries)
-	),
-
-	TP_fast_assign(
-		unsigned int i;
-		u32 *vmid_ptr = __get_dynamic_array(vmid_arr);
-		__entry->page = page;
-		__entry->nr_acl_entries = nr_acl_entries;
-		for(i = 0; i < __entry->nr_acl_entries; i++) {
-			vmid_ptr[i] = vmid[i];
-		}
-	),
-
-	TP_printk("vmid=%s, page=%u, nr_acl_entries=%d", __print_array(__get_dynamic_array(vmid_arr),
-		__entry->nr_acl_entries, sizeof(u32)), __entry->page, __entry->nr_acl_entries)
-);
-
-TRACE_EVENT(kiumd_io_pgtable_hyp_unassign_page_end,
-
-	TP_PROTO(u64 page, u32 nr_acl_entries),
-
-	TP_ARGS(page, nr_acl_entries),
-
-	TP_STRUCT__entry(
-		__field(u32, page)
-		__field(u32, nr_acl_entries)
-	),
-
-	TP_fast_assign(
-		__entry->page = page;
-		__entry->nr_acl_entries = nr_acl_entries;
-	),
-
-	TP_printk("page=%u, nr_acl_entries=%d", __entry->page, __entry->nr_acl_entries)
-);
-
-TRACE_EVENT(kiumd_hyp_unassign_sg_start,
-
-	TP_PROTO(struct sg_table *sgt),
-
-	TP_ARGS(sgt),
-
-	TP_STRUCT__entry(
-		__field(unsigned int, nents)
-	),
-
-	TP_fast_assign(
-		__entry->nents = sgt->nents;
-	),
-
-	TP_printk("nents=%d", __entry->nents)
-);
-
-TRACE_EVENT(kiumd_hyp_unassign_sg_end,
-
-	TP_PROTO(struct sg_table *sgt),
-
-	TP_ARGS(sgt),
-
-	TP_STRUCT__entry(
-		__field(unsigned int, nents)
-	),
-
-	TP_fast_assign(
-		__entry->nents = sgt->nents;
-	),
-
-	TP_printk("nents=%d", __entry->nents)
-);
-
-TRACE_EVENT(kiumd_hyp_assign_sg_start,
-
-	TP_PROTO(struct sg_table *sgt),
-
-	TP_ARGS(sgt),
-
-	TP_STRUCT__entry(
-		__field(unsigned int, nents)
-	),
-
-	TP_fast_assign(
-		__entry->nents = sgt->nents;
-	),
-
-	TP_printk("nents=%d", __entry->nents)
-);
-
-TRACE_EVENT(kiumd_hyp_assign_sg_end,
-
-	TP_PROTO(struct sg_table *sgt),
-
-	TP_ARGS(sgt),
-
-	TP_STRUCT__entry(
-		__field(unsigned int, nents)
-	),
-
-	TP_fast_assign(
-		__entry->nents = sgt->nents;
-	),
-
-	TP_printk("nents=%d", __entry->nents)
-);
-
 TRACE_EVENT(kiumd_dmabuf_vfio_secure_map_start,
 
 	TP_PROTO(int vfio_fd, int dma_buf_fd, size_t size),
@@ -648,12 +667,13 @@ TRACE_EVENT(kiumd_dmabuf_vfio_secure_map_start,
 		__entry->size = size;
 	),
 
-	TP_printk("vfio_fd=%d, dma_buf_fd=%d, size=%d", __entry->vfio_fd, __entry->dma_buf_fd, __entry->size)
+	TP_printk("vfio_fd=%d, dma_buf_fd=%d, size=%d", __entry->vfio_fd,
+		  __entry->dma_buf_fd, __entry->size)
 );
 
 TRACE_EVENT(kiumd_dmabuf_vfio_secure_map_end,
 
-	TP_PROTO(int vfio_fd, int id,unsigned long dma_addr),
+	TP_PROTO(int vfio_fd, int id, unsigned long dma_addr),
 
 	TP_ARGS(vfio_fd, id, dma_addr),
 
@@ -669,7 +689,8 @@ TRACE_EVENT(kiumd_dmabuf_vfio_secure_map_end,
 		__entry->dma_addr = dma_addr;
 	),
 
-	TP_printk("vfio_fd=%d, id=%d, dma_addr=0x%lx", __entry->vfio_fd, __entry->id, __entry->dma_addr)
+	TP_printk("vfio_fd=%d, id=%d, dma_addr=0x%lx", __entry->vfio_fd, __entry->id,
+		  __entry->dma_addr)
 );
 
 TRACE_EVENT(kiumd_dmabuf_vfio_secure_unmap_start,
@@ -694,7 +715,9 @@ TRACE_EVENT(kiumd_dmabuf_vfio_secure_unmap_start,
 		__entry->id = id;
 	),
 
-	TP_printk("vfio_fd=%d, dma_buf_fd=%d, ptselect=%d, dma_addr=0x%lx, id=%d", __entry->vfio_fd, __entry->dma_buf_fd, __entry->ptselect, __entry->dma_addr, __entry->id)
+	TP_printk("vfio_fd=%d, dma_buf_fd=%d, ptselect=%d, dma_addr=0x%lx, id=%d",
+		  __entry->vfio_fd, __entry->dma_buf_fd, __entry->ptselect, __entry->dma_addr,
+		  __entry->id)
 );
 
 TRACE_EVENT(kiumd_dmabuf_vfio_secure_unmap_end,
@@ -734,12 +757,13 @@ TRACE_EVENT(kiumd_mmio_smmu_map_start,
 		__entry->iova = iova;
 	),
 
-	TP_printk("vfio_fd=%d, fixed_iova=%u, iova=0x%llx", __entry->vfio_fd, __entry->fixed_iova, __entry->iova)
+	TP_printk("vfio_fd=%d, fixed_iova=%u, iova=0x%llx", __entry->vfio_fd,
+		  __entry->fixed_iova, __entry->iova)
 );
 
 TRACE_EVENT(kiumd_mmio_smmu_map_end,
 
-	TP_PROTO(char * reg_name, int vfio_fd, int id, __u64 iova, __u64 reg_len),
+	TP_PROTO(char *reg_name, int vfio_fd, int id, __u64 iova, __u64 reg_len),
 
 	TP_ARGS(reg_name, vfio_fd, id, iova, reg_len),
 
@@ -760,7 +784,9 @@ TRACE_EVENT(kiumd_mmio_smmu_map_end,
 		__entry->reg_len = reg_len;
 	),
 
-	TP_printk("reg_name=%s, vfio_fd=%d, id=%d, iova=%llx, reg_len=%llx", __get_str(str), __entry->vfio_fd, __entry->id, __entry->iova, __entry->reg_len)
+	TP_printk("reg_name=%s, vfio_fd=%d, id=%d, iova=%llx, reg_len=%llx",
+		  __get_str(str), __entry->vfio_fd, __entry->id, __entry->iova,
+		  __entry->reg_len)
 );
 
 TRACE_EVENT(kiumd_mmio_smmu_unmap_start,
@@ -781,7 +807,8 @@ TRACE_EVENT(kiumd_mmio_smmu_unmap_start,
 		__entry->id = id;
 	),
 
-	TP_printk("vfio_fd=%d, iova=%llx, id=%d", __entry->vfio_fd, __entry->iova, __entry->id)
+	TP_printk("vfio_fd=%d, iova=%llx, id=%d", __entry->vfio_fd, __entry->iova,
+		  __entry->id)
 );
 
 TRACE_EVENT(kiumd_mmio_smmu_unmap_end,
@@ -834,8 +861,8 @@ TRACE_EVENT(kiumd_vfio_ctx_init_end,
 
 	TP_printk("vfio_fd=%d", __entry->vfio_fd)
 );
-
-#endif /* _TRACE_SAFELINUX_MODULES_H */
+#endif    // TRACE_SAFELINUX_COMMON
+#endif /* TRACE_SAFELINUX_MODULES */
 
 /* This part must be outside protection */
 #undef TRACE_INCLUDE_PATH
