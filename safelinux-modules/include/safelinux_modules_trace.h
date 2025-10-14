@@ -452,21 +452,24 @@ TRACE_EVENT(kiumd_fd_dmabuf_handler_handle_to_fd,
 
 TRACE_EVENT(kiumd_fd_dmabuf_handler_end,
 
-	TP_PROTO(int handle, int dma_buf_fd),
+	TP_PROTO(int handle, int dma_buf_fd, int ret),
 
-	TP_ARGS(handle, dma_buf_fd),
+	TP_ARGS(handle, dma_buf_fd, ret),
 
 	TP_STRUCT__entry(
 		__field(int, handle)
 		__field(int, dma_buf_fd)
+		__field(int, ret)
 	),
 
 	TP_fast_assign(
 		__entry->handle = handle;
 		__entry->dma_buf_fd = dma_buf_fd;
+		__entry->ret = ret;
 	),
 
-	TP_printk("handle=%d, dma_buf_fd=%d", __entry->handle, __entry->dma_buf_fd)
+	TP_printk("handle=%d, dma_buf_fd=%d, ret=%d", __entry->handle,
+					__entry->dma_buf_fd, __entry->ret)
 );
 
 TRACE_EVENT(kiumd_io_pgtable_hyp_assign_page_start,
