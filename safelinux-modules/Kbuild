@@ -16,6 +16,9 @@ scm_user_intf-objs := drivers/scm_user_intf.o
 obj-m += qcom_dload_mode.o
 qcom_dload_mode-objs := drivers/qcom_dload_mode.o
 
+obj-m += pinctrl_fusa.o
+pinctrl_fusa-objs := drivers/pinctrl_fusa.o
+
 obj-m += arm-smmu-qcom-fusa.o
 arm-smmu-qcom-fusa-objs := drivers/arm-smmu-qcom-fusa.o
 
