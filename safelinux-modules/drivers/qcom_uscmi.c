@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only
- * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/module.h>
@@ -12,12 +12,14 @@
 #include <linux/pm_opp.h>
 #include <linux/reset.h>
 #include <linux/pm_domain.h>
+#include <linux/mutex.h>
 #include <uapi/misc/qcom_uscmi.h>
 
 struct qcom_uscmi_dev {
 	struct miscdevice miscdev;
 	struct device *dev;
 	const char *name;
+	struct mutex uscmi_lock;
 	struct dev_pm_domain_list *pd_list;
 };
 
@@ -223,6 +225,7 @@ static long qcom_uscmi_ioctl(struct file *file, unsigned int cmd,
 	if (err)
 		return -EFAULT;
 
+	guard(mutex)(&uscmi->uscmi_lock);
 	switch (cmd) {
 	  case SCMI_IOCTL_PRF:
 		err = do_performance_operation(&req, uscmi);
@@ -280,6 +283,7 @@ static int qcom_uscmi_probe(struct platform_device *pdev)
 	else
 		uscmi->name = devm_kasprintf(dev, GFP_KERNEL, "%pOFn", np);
 
+	mutex_init(&uscmi->uscmi_lock);
 	uscmi->miscdev.minor = MISC_DYNAMIC_MINOR;
 	uscmi->miscdev.name = uscmi->name;
 	uscmi->miscdev.fops = &qcom_uscmi_fops;
@@ -287,6 +291,7 @@ static int qcom_uscmi_probe(struct platform_device *pdev)
 	err = misc_register(&uscmi->miscdev);
 	if (err) {
 		dev_err(dev, "misc_register failed(ret=%d)\n", err);
+		mutex_destroy(&uscmi->uscmi_lock);
 		dev_pm_domain_detach_list(uscmi->pd_list);
 		return err;
 	}
