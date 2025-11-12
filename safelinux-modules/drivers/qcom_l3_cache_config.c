@@ -28,7 +28,6 @@
 #define CLUSTER_ACP_SID_EL1_MASK		GENMASK(3, 0)
 #define CLUSTER_STASH_SID_EL1_MASK		GENMASK(3, 0)
 #define CLUSTER_THREAD_SID_EL1_MASK		GENMASK(3, 0)
-#define CLUSTER_BUS_QOS_EL1_MASK		GENMASK(3, 0)
 #define L3_WAYS_SID_MASK(sid)			GENMASK((sid*BITS_PER_SID)+3, (sid*BITS_PER_SID))
 #define MAX_CACHE_WAYS_CONFIG			0x1111
 
@@ -274,8 +273,8 @@ static void set_cluster_sid_qos(void *info)
 	u64 regval = 0;
 
 	regval = read_sysreg_s(CLUSTER_BUS_QOS_EL1);
-	regval &= ~CLUSTER_BUS_QOS_EL1_MASK;
-	regval |= FIELD_PREP(CLUSTER_BUS_QOS_EL1_MASK, cdata->qos);
+	regval &= ~cdata->mask;
+	regval |= cdata->rvalue;
 	write_sysreg_s(regval, CLUSTER_BUS_QOS_EL1);
 
 	/* to synchronize cache settings*/
@@ -287,8 +286,7 @@ static void get_cluster_sid_qos(void *info)
 {
 	struct qcom_l3cc_cl_qos_config *cdata = info;
 
-	cdata->qos = read_sysreg_s(CLUSTER_BUS_QOS_EL1) &
-								CLUSTER_BUS_QOS_EL1_MASK;
+	cdata->rvalue = read_sysreg_s(CLUSTER_BUS_QOS_EL1);
 }
 
 static int qcom_l3cc_update_cluster_sid_qos(void __user *req, struct qcom_l3cc_drv *drv)
