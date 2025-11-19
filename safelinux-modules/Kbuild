@@ -75,3 +75,6 @@ ifdef CONFIG_QTI_SCMI_VENDOR_PROTOCOL
 obj-m += vendor_uscmi.o
 vendor_uscmi-objs := drivers/vendor_uscmi.o
 endif
+
+obj-m  += qcom_remote_virq.o
+qcom_remote_virq-objs := drivers/qcom_remote_virq.o
