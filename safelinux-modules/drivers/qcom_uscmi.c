@@ -25,8 +25,8 @@ struct qcom_uscmi_dev {
 	const char *name;
 	struct mutex uscmi_lock;
 	struct dev_pm_domain_list *pd_list;
-	u32 num_pds;
-	bool skip_system_pm;
+	bool domains_attached;
+	bool pm_domains_on_demand;
 };
 
 #define miscdev_to_data(d) container_of(d, struct qcom_uscmi_dev, miscdev)
@@ -140,10 +140,10 @@ static bool qcom_uscmi_all_pds_off(struct qcom_uscmi_dev *uscmi)
 {
 	int i;
 
-	if (!uscmi->num_pds || !uscmi->pd_list || !uscmi->pd_list->pd_devs)
+	if (!uscmi->pd_list || !uscmi->pd_list->pd_devs)
 		return true;
 
-	for (i = 0; i < uscmi->num_pds; i++) {
+	for (i = 0; i < uscmi->pd_list->num_pds; i++) {
 		if (unlikely(!uscmi->pd_list->pd_devs[i]))
 			continue;
 
@@ -163,6 +163,7 @@ static bool qcom_uscmi_all_pds_off(struct qcom_uscmi_dev *uscmi)
  * qcom_uscmi_attach_domains - Attach power domains if needed
  * @uscmi: USCMI device structure
  *
+ * Always called under ioctl mutex lock
  * Return: 0 on success, negative error code on failure
  */
 static int qcom_uscmi_attach_domains(struct qcom_uscmi_dev *uscmi)
@@ -171,19 +172,23 @@ static int qcom_uscmi_attach_domains(struct qcom_uscmi_dev *uscmi)
 	ktime_t start_time, end_time;
 	s64 duration_us = 0;
 
-	if (!uscmi->skip_system_pm || uscmi->num_pds)
+	if (!uscmi->pm_domains_on_demand || uscmi->domains_attached)
 		return 0;
 
+	/*
+	 * Control should never reach here if the device does not have any PM
+	 *
+	 */
 	start_time = ktime_get();
 	num_pds = dev_pm_domain_attach_list(uscmi->dev, NULL, &uscmi->pd_list);
-	if (num_pds < 0) {
-		dev_err(uscmi->dev, "multi domain attach failed (ret=%d)\n", num_pds);
-		trace_qcom_uscmi_pd_attach(dev_name(uscmi->dev), num_pds, 0, 0);
-		return num_pds;
+	if (num_pds <= 0) {
+		dev_err(uscmi->dev, "multi domain attach failed (ret=%d)%s\n", num_pds,
+		       !num_pds ? " (no power domains attached)" : "");
+		return num_pds ? num_pds : -ENODEV;
 	}
 
 	dev_dbg(uscmi->dev, "multi domain attach success (num_pds=%d)\n", num_pds);
-	uscmi->num_pds = num_pds;
+	uscmi->domains_attached = true;
 	end_time = ktime_get();
 	duration_us = ktime_to_us(ktime_sub(end_time, start_time));
 	trace_qcom_uscmi_pd_attach(dev_name(uscmi->dev), num_pds, 0, duration_us);
@@ -196,6 +201,7 @@ static int qcom_uscmi_attach_domains(struct qcom_uscmi_dev *uscmi)
  * @uscmi: USCMI device structure
  * @operation: Operation type for logging
  * @force: Force detach even if domains are on (e.g., on error)
+ * Always called under ioctl mutex lock
  */
 static void qcom_uscmi_detach_domains(struct qcom_uscmi_dev *uscmi,
 				      int operation, bool force)
@@ -203,7 +209,7 @@ static void qcom_uscmi_detach_domains(struct qcom_uscmi_dev *uscmi,
 	ktime_t start_time, end_time;
 	s64 duration_us = 0;
 
-	if (!uscmi->skip_system_pm || !uscmi->num_pds)
+	if (!uscmi->pm_domains_on_demand || !uscmi->domains_attached)
 		return;
 
 	start_time = ktime_get();
@@ -212,8 +218,8 @@ static void qcom_uscmi_detach_domains(struct qcom_uscmi_dev *uscmi,
 			dev_pm_domain_detach_list(uscmi->pd_list);
 		dev_dbg(uscmi->dev, "detached domains after operation %d force:%d\n",
 			operation, force);
+		uscmi->domains_attached = false;
 		uscmi->pd_list = NULL;
-		uscmi->num_pds = 0;
 		end_time = ktime_get();
 		duration_us = ktime_to_us(ktime_sub(end_time, start_time));
 		trace_qcom_uscmi_pd_detach(dev_name(uscmi->dev), operation, force, duration_us);
@@ -520,16 +526,9 @@ static int qcom_uscmi_probe(struct platform_device *pdev)
 
 	uscmi->dev = dev;
 
-	if (!dev->pm_domain) {
-		/* multiple domains used */
-		num_pds = dev_pm_domain_attach_list(dev, NULL, &uscmi->pd_list);
-		if (num_pds < 0) {
-			dev_err(dev, "multi domain attach failed(ret=%d)\n", num_pds);
-			return num_pds;
-		}
-		uscmi->num_pds = num_pds;
-	} else {
-		uscmi->num_pds = 1;
+	if (of_property_read_bool(uscmi->dev->of_node, "qcom,no-suspend")) {
+		dev_dbg(uscmi->dev, "delay detach and attach\n");
+		uscmi->pm_domains_on_demand = true;
 	}
 
 	if (!of_property_read_string(np, "qcom,dev-name", &name))
@@ -537,9 +536,14 @@ static int qcom_uscmi_probe(struct platform_device *pdev)
 	else
 		uscmi->name = devm_kasprintf(dev, GFP_KERNEL, "%pOFn", np);
 
-	if (of_property_read_bool(uscmi->dev->of_node, "qcom,no-suspend")) {
-		dev_info(uscmi->dev, "skip system pm cbs\n");
-		uscmi->skip_system_pm = true;
+	if (!dev->pm_domain && !uscmi->pm_domains_on_demand) {
+		/* multiple domains used */
+		num_pds = dev_pm_domain_attach_list(dev, NULL, &uscmi->pd_list);
+		if (num_pds < 0) {
+			dev_err(dev, "multi domain attach failed(ret=%d)\n", num_pds);
+			return num_pds;
+		}
+		uscmi->domains_attached = true;
 	}
 
 	mutex_init(&uscmi->uscmi_lock);
@@ -551,12 +555,17 @@ static int qcom_uscmi_probe(struct platform_device *pdev)
 	if (err) {
 		dev_err(dev, "misc_register failed(ret=%d)\n", err);
 		mutex_destroy(&uscmi->uscmi_lock);
-		if (uscmi->pd_list)
+		if (uscmi->pd_list) {
 			dev_pm_domain_detach_list(uscmi->pd_list);
+			uscmi->domains_attached = false;
+		}
 		return err;
 	}
 
-	if (!uscmi->pd_list) {
+	/*
+	 * Enable runtime PM for devices with a single power domain
+	 */
+	if (dev->pm_domain) {
 		pm_runtime_set_active(dev);
 		pm_runtime_enable(dev);
 	}
