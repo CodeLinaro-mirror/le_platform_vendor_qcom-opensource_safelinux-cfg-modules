@@ -40,7 +40,7 @@ obj-m += kiumd.o
 ifneq ($(KERNELRELEASE), "5.14.0")
 ccflags-y += -I$(KERNEL_SRC)/drivers/iommu/arm
 endif
-kiumd-objs := drivers/kiumd.o
+kiumd-objs := drivers/kiumd.o drivers/kiumd_common.o
 
 obj-m += qcom_uscmi.o
 qcom_uscmi-objs := drivers/qcom_uscmi.o
