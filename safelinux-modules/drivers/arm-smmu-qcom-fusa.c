@@ -3,8 +3,11 @@
  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
+#include <linux/completion.h>
 #include <linux/dev_printk.h>
 #include <linux/debugfs.h>
+#include <linux/dma-mapping.h>
+#include <linux/iommu.h>
 #include <linux/irq.h>
 #include <linux/irqdesc.h>
 #include <linux/of_address.h>
@@ -12,6 +15,7 @@
 #include <linux/of_irq.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
+#include <linux/poll.h>
 #include <linux/types.h>
 
 #define CREATE_TRACE_POINTS
@@ -19,6 +23,25 @@
 
 #define FUSA_TCU_ERROR_INJECT_REGISTER	0x18
 #define FUSA_QTC_INTSTS_REGISTER	0x8
+
+#define FUSA_TCU_IRQ_SET_REGISTER	0x10
+#define FUSA_TCU_ERR_MASK_SAIL		0x8
+#define FUSA_TCU_WRN_MASK_SAIL		0xC
+#define FUSA_TBU_ERROR_INJECT_REGISTER	0x30
+#define FUSA_TBU_IRQ_SET_REGISTER	0x20
+#define FUSA_TBU_ERR_MASK_SAIL		0x10
+#define FUSA_TBU_WRN_MASK_SAIL		0x18
+
+#define TCU_SRAM_PARITY_OFFSET		0x3
+#define TBU_SRAM_PARITY_OFFSET		0x2
+#define CSR_PARITY_OFFSET		0x1
+#define ARR_2D_OFFSET			0x0
+
+#define PA_ERR				0x4
+#define VA_ERR				0x3
+#define TBU_TCU_LINK_ERR		0x2
+#define WRBUF_ERR			0x1
+#define WRBUF_WRN			0x0
 
 #define FUSA_TCU500_NUM_ERR		0x4
 #define FUSA_TBU500_NUM_ERR		0x5
@@ -43,6 +66,10 @@
 #define FUSA_ERROR			0x2
 
 #define BUFFER_SZ			64
+#define USECASE_SWITCH_TIMEOUT_MSECS	(500)
+
+static bool smmu_fusa_inj_only_one = true;
+module_param(smmu_fusa_inj_only_one, bool, 0644);
 
 #define QSMMU_F_TBU500			BIT(1)
 #define QSMMU_F_QTB500			BIT(1) /* QTB500 uses same fault path as TBU500 */
@@ -51,6 +78,7 @@
 struct qsmmu_fusa_match_data {
 	u32 offset;
 	u32 flags;
+	bool enable_fault_injection;
 };
 
 struct qcom_smmu_safety_fault {
@@ -60,6 +88,16 @@ struct qcom_smmu_safety_fault {
 	bool fault_src_ready;
 	bool fault_code_ready;
 #endif
+};
+
+struct qsmmu_fusa_test {
+	/* for usecase under test */
+	struct device *test_dev;
+	struct iommu_domain *domain;
+	/* Protects test_dev */
+	struct mutex state_lock;
+	/* For waiting for child probe to complete */
+	struct completion probe_wait;
 };
 
 struct qsmmu_fusa {
@@ -74,6 +112,8 @@ struct qsmmu_fusa {
 	struct dentry *qcom_smmu_dir;
 	struct qcom_smmu_safety_fault hw_fault;
 	spinlock_t lock;
+	struct qsmmu_fusa_test *tdev;
+	bool tbu_fault_injection;
 #ifdef CONFIG_DEBUG_FS
 	wait_queue_head_t wq;
 #endif
@@ -398,6 +438,528 @@ err_irq:
 	return ret;
 }
 
+static void fusa_tcu_mask_sail_err_register(struct qsmmu_fusa *qsmmu_fusa, u32 offset)
+{
+	u32 tcu_fusa_sail_errmask;
+
+	tcu_fusa_sail_errmask = readl_relaxed(qsmmu_fusa->tcu_fusa_base + FUSA_TCU_ERR_MASK_SAIL);
+	tcu_fusa_sail_errmask |= offset;
+	writel(tcu_fusa_sail_errmask, qsmmu_fusa->tcu_fusa_base + FUSA_TCU_ERR_MASK_SAIL);
+}
+
+static void fusa_tcu_unmask_sail_err_register(struct qsmmu_fusa *qsmmu_fusa, u32 offset)
+{
+	u32 tcu_fusa_sail_errmask;
+
+	tcu_fusa_sail_errmask = readl_relaxed(qsmmu_fusa->tcu_fusa_base + FUSA_TCU_ERR_MASK_SAIL);
+	tcu_fusa_sail_errmask &= ~offset;
+	writel(tcu_fusa_sail_errmask, qsmmu_fusa->tcu_fusa_base + FUSA_TCU_ERR_MASK_SAIL);
+}
+
+static void fusa_tcu_mask_sail_wrn_register(struct qsmmu_fusa *qsmmu_fusa, u32 offset)
+{
+	u32 tcu_fusa_sail_wrnmask;
+
+	tcu_fusa_sail_wrnmask = readl_relaxed(qsmmu_fusa->tcu_fusa_base + FUSA_TCU_WRN_MASK_SAIL);
+	tcu_fusa_sail_wrnmask |= offset;
+	writel(tcu_fusa_sail_wrnmask, qsmmu_fusa->tcu_fusa_base + FUSA_TCU_WRN_MASK_SAIL);
+}
+
+static void fusa_tcu_unmask_sail_wrn_register(struct qsmmu_fusa *qsmmu_fusa, u32 offset)
+{
+	u32 tcu_fusa_sail_wrnmask;
+
+	tcu_fusa_sail_wrnmask = readl_relaxed(qsmmu_fusa->tcu_fusa_base + FUSA_TCU_WRN_MASK_SAIL);
+	tcu_fusa_sail_wrnmask &= ~offset;
+	writel(tcu_fusa_sail_wrnmask, qsmmu_fusa->tcu_fusa_base + FUSA_TCU_WRN_MASK_SAIL);
+}
+
+static void inject_tcu_fault(struct qsmmu_fusa *qsmmu_fusa, u32 fault_code, bool inject_enable)
+{
+	if (inject_enable)
+		writel(fault_code, qsmmu_fusa->tcu_fusa_base + FUSA_TCU_ERROR_INJECT_REGISTER);
+	else
+		writel(fault_code, qsmmu_fusa->tcu_fusa_base + FUSA_TCU_IRQ_SET_REGISTER);
+}
+
+static void clear_tcu_fusa_fault(struct qsmmu_fusa *qsmmu_fusa, u32 fault_code)
+{
+	writel(fault_code, qsmmu_fusa->tcu_fusa_base);
+}
+
+static int check_for_injected_tcu_fault(struct qsmmu_fusa *qsmmu_fusa, u32 fault_code)
+{
+	u32 tcu_fusa_intrsts = 0;
+
+	tcu_fusa_intrsts = readl(qsmmu_fusa->tcu_fusa_base);
+
+	if (tcu_fusa_intrsts & fault_code)
+		return 0;
+	return -EINVAL;
+}
+
+static int check_tcu_fault_injection(struct qsmmu_fusa *qsmmu_fusa,
+				     u32 fault_code, bool inject_enable)
+{
+	int res;
+
+	inject_tcu_fault(qsmmu_fusa, fault_code, inject_enable);
+
+	res = check_for_injected_tcu_fault(qsmmu_fusa, fault_code);
+	if (res) {
+		dev_err(qsmmu_fusa->dev, "TCU FuSa error injection failed\n");
+	} else {
+		if (inject_enable) {
+			writel(0, qsmmu_fusa->tcu_fusa_base + FUSA_TCU_ERROR_INJECT_REGISTER);
+			writel(0, qsmmu_fusa->tcu_fusa_base + FUSA_TCU_IRQ_SET_REGISTER);
+		} else {
+			writel(0, qsmmu_fusa->tcu_fusa_base + FUSA_TCU_IRQ_SET_REGISTER);
+		}
+		clear_tcu_fusa_fault(qsmmu_fusa, fault_code);
+	}
+
+	return res;
+}
+
+static int check_tcu_tcu_sram_injection(struct qsmmu_fusa *qsmmu_fusa, bool inject_enable)
+{
+	u32 offset;
+	int res;
+
+	offset = qsmmu_fusa->num_clients + TCU_SRAM_PARITY_OFFSET;
+	if (offset < 31U) {
+		offset = BIT(offset);
+		fusa_tcu_mask_sail_wrn_register(qsmmu_fusa, offset);
+		res = check_tcu_fault_injection(qsmmu_fusa, offset, inject_enable);
+		fusa_tcu_unmask_sail_wrn_register(qsmmu_fusa, offset);
+	} else {
+		res = -EINVAL;
+	}
+
+	return res;
+}
+
+/* TCU-TBU SRAM parity irq doesn't work when injected from this driver, hence skipping
+ * static int check_tcu_tbu_sram_injection(struct qsmmu_fusa *qsmmu_fusa, bool inject_enable)
+ * {
+ *	u32 offset;
+ *	int res;
+ *
+ *	offset = qsmmu_fusa->num_clients + TBU_SRAM_PARITY_OFFSET;
+ *	if (offset < 31U) {
+ *		offset = BIT(offset);
+ *		fusa_tcu_mask_sail_wrn_register(qsmmu_fusa, offset);
+ *		res = check_tcu_fault_injection(qsmmu_fusa, offset, inject_enable);
+ *		fusa_tcu_unmask_sail_wrn_register(qsmmu_fusa, offset);
+ *	} else {
+ *		res = -EINVAL;
+ *	}
+ *
+ *	return res;
+ * }
+ */
+
+static int check_tcu_csr_parity_injection(struct qsmmu_fusa *qsmmu_fusa, bool inject_enable)
+{
+	u32 offset;
+	int res;
+
+	offset = qsmmu_fusa->num_clients + CSR_PARITY_OFFSET;
+	if (offset < 31U) {
+		offset = BIT(offset);
+		fusa_tcu_mask_sail_err_register(qsmmu_fusa, offset);
+		res = check_tcu_fault_injection(qsmmu_fusa, offset, inject_enable);
+		fusa_tcu_unmask_sail_err_register(qsmmu_fusa, offset);
+	} else {
+		res = -EINVAL;
+	}
+
+	return res;
+}
+
+static int check_tcu_pfb_2d_arr_injection(struct qsmmu_fusa *qsmmu_fusa, bool inject_enable)
+{
+	u32 offset;
+	int res;
+
+	offset = qsmmu_fusa->num_clients + ARR_2D_OFFSET;
+	if (offset < 31U) {
+		offset = BIT(offset);
+		fusa_tcu_mask_sail_err_register(qsmmu_fusa, offset);
+		res = check_tcu_fault_injection(qsmmu_fusa, offset, inject_enable);
+		fusa_tcu_unmask_sail_err_register(qsmmu_fusa, offset);
+	} else {
+		res = -EINVAL;
+	}
+
+	return res;
+}
+
+static int fusa_fault_injection_tcu_test(struct qsmmu_fusa *qsmmu_fusa)
+{
+	int result = 0;
+
+	result = check_tcu_tcu_sram_injection(qsmmu_fusa, true);
+	if (result) {
+		dev_err(qsmmu_fusa->dev, "tcu_tcu_sram_injection failed\n");
+		return result;
+	}
+
+	/* Optimize boot KPI by running only one test to verify
+	 * FuSa H/W IRQ trigger working
+	 */
+	if (unlikely(smmu_fusa_inj_only_one))
+		return result;
+
+/* TCU-TBU SRAM parity irq doesn't work when injected from this driver, hence skipping
+ *	result = check_tcu_tbu_sram_injection(qsmmu_fusa, true);
+ *	if (result) {
+ *		dev_err(qsmmu_fusa->dev, "tcu_tbu_sram_injection failed\n");
+ *		return result;
+ *	}
+ */
+	result = check_tcu_csr_parity_injection(qsmmu_fusa, true);
+	if (result) {
+		dev_err(qsmmu_fusa->dev, "tcu_csr_parity_injection failed\n");
+		return result;
+	}
+
+	result = check_tcu_pfb_2d_arr_injection(qsmmu_fusa, false);
+	if (result) {
+		dev_err(qsmmu_fusa->dev, "tcu_sram_injection failed\n");
+		return result;
+	}
+
+	return result;
+}
+
+static void fusa_tbu_mask_sail_err_register(void __iomem *client_base, u32 offset)
+{
+	u32 tbu_fusa_sail_errmask;
+
+	tbu_fusa_sail_errmask = readl_relaxed(client_base + FUSA_TBU_ERR_MASK_SAIL);
+	tbu_fusa_sail_errmask |= offset;
+	writel(tbu_fusa_sail_errmask, client_base + FUSA_TBU_ERR_MASK_SAIL);
+}
+
+static void fusa_tbu_unmask_sail_err_register(void __iomem *client_base, u32 offset)
+{
+	u32 tbu_fusa_sail_errmask;
+
+	tbu_fusa_sail_errmask = readl_relaxed(client_base + FUSA_TBU_ERR_MASK_SAIL);
+	tbu_fusa_sail_errmask &= ~offset;
+	writel(tbu_fusa_sail_errmask, client_base + FUSA_TBU_ERR_MASK_SAIL);
+}
+
+static void fusa_tbu_mask_sail_wrn_register(void __iomem *client_base, u32 offset)
+{
+	u32 tbu_fusa_sail_wrnmask;
+
+	tbu_fusa_sail_wrnmask = readl_relaxed(client_base + FUSA_TBU_WRN_MASK_SAIL);
+	tbu_fusa_sail_wrnmask |= offset;
+	writel(tbu_fusa_sail_wrnmask, client_base + FUSA_TBU_WRN_MASK_SAIL);
+}
+
+static void fusa_tbu_unmask_sail_wrn_register(void __iomem *client_base, u32 offset)
+{
+	u32 tbu_fusa_sail_wrnmask;
+
+	tbu_fusa_sail_wrnmask = readl_relaxed(client_base + FUSA_TBU_WRN_MASK_SAIL);
+	tbu_fusa_sail_wrnmask &= ~offset;
+	writel(tbu_fusa_sail_wrnmask, client_base + FUSA_TBU_WRN_MASK_SAIL);
+}
+
+static void inject_tbu_fault(void __iomem *client_base, u32 fault_code)
+{
+	writel(fault_code, client_base + FUSA_TBU_IRQ_SET_REGISTER);
+}
+
+static void clear_tbu_fusa_fault(void __iomem *client_base, u32 fault_code)
+{
+	writel(fault_code, client_base);
+}
+
+static int check_for_injected_tbu_fault(void __iomem *client_base, u32 fault_code)
+{
+	u32 tbu_fusa_intrsts = 0;
+
+	tbu_fusa_intrsts = readl_relaxed(client_base);
+	if (tbu_fusa_intrsts & fault_code)
+		return 0;
+
+	return -EINVAL;
+}
+
+static int check_tbu_fault_injection(struct qsmmu_fusa *qsmmu_fusa,
+				     void __iomem *client_base,
+				     u32 fault_code)
+{
+	int res;
+
+	inject_tbu_fault(client_base, fault_code);
+
+	res = check_for_injected_tbu_fault(client_base, fault_code);
+	if (res) {
+		dev_err(qsmmu_fusa->dev, "TBU FuSa error injection failed\n");
+	} else {
+		writel(0, client_base + FUSA_TBU_IRQ_SET_REGISTER);
+		clear_tbu_fusa_fault(client_base, fault_code);
+	}
+
+	return res;
+}
+
+static int check_tbu_pa_err_injection(struct qsmmu_fusa *qsmmu_fusa, void __iomem *client_base)
+{
+	u32 offset;
+	int res;
+
+	offset = BIT(PA_ERR);
+	fusa_tbu_mask_sail_err_register(client_base, offset);
+	res = check_tbu_fault_injection(qsmmu_fusa, client_base, offset);
+	fusa_tbu_unmask_sail_err_register(client_base, offset);
+
+	return res;
+
+}
+static int check_tbu_va_err_injection(struct qsmmu_fusa *qsmmu_fusa, void __iomem *client_base)
+{
+	u32 offset;
+	int res;
+
+	offset = BIT(VA_ERR);
+	fusa_tbu_mask_sail_err_register(client_base, offset);
+	res = check_tbu_fault_injection(qsmmu_fusa, client_base, offset);
+	fusa_tbu_unmask_sail_err_register(client_base, offset);
+
+	return res;
+}
+static int check_tbu_wrbuf_err_injection(struct qsmmu_fusa *qsmmu_fusa,
+					 void __iomem *client_base)
+{
+	u32 offset;
+	int res;
+
+	offset = BIT(WRBUF_ERR);
+	fusa_tbu_mask_sail_err_register(client_base, offset);
+	res = check_tbu_fault_injection(qsmmu_fusa, client_base, offset);
+	fusa_tbu_unmask_sail_err_register(client_base, offset);
+
+	return res;
+}
+
+static int check_tbu_wrbuf_wrn_injection(struct qsmmu_fusa *qsmmu_fusa,
+					 void __iomem *client_base)
+{
+	u32 offset;
+	int res;
+
+	offset = BIT(WRBUF_WRN);
+	fusa_tbu_mask_sail_wrn_register(client_base, offset);
+	res = check_tbu_fault_injection(qsmmu_fusa, client_base, offset);
+	fusa_tbu_unmask_sail_wrn_register(client_base, offset);
+
+	return res;
+}
+
+static int check_tbu_tcu_link_err_injection(struct qsmmu_fusa *qsmmu_fusa,
+					    void __iomem *client_base)
+{
+	u32 offset;
+	int res;
+
+	offset = BIT(TBU_TCU_LINK_ERR);
+	fusa_tbu_mask_sail_err_register(client_base, offset);
+	res = check_tbu_fault_injection(qsmmu_fusa, client_base, offset);
+	fusa_tbu_unmask_sail_err_register(client_base, offset);
+
+	return res;
+}
+
+static int fusa_fault_injection_tbu_test(struct qsmmu_fusa *qsmmu_fusa, u32 client_id)
+{
+	void __iomem *client_base;
+	int result = 0;
+
+	if (client_id >= qsmmu_fusa->num_clients) {
+		dev_err(qsmmu_fusa->dev, "Invalid client_id %u (max: %u)\n",
+			client_id, qsmmu_fusa->num_clients - 1);
+		return -EINVAL;
+	}
+
+	client_base = (qsmmu_fusa->client_fusa_base +
+		      ((client_id + 1) * qsmmu_fusa->client_offset) +
+		      qsmmu_fusa->client_fusa_reg);
+
+	result = check_tbu_pa_err_injection(qsmmu_fusa, client_base);
+	if (result) {
+		dev_err(qsmmu_fusa->dev, "tbu_pa_err_injection failed\n");
+		return result;
+	}
+
+	/* Optimize boot KPI by running only one test to verify
+	 * FuSa H/W IRQ trigger working
+	 */
+	if (unlikely(smmu_fusa_inj_only_one))
+		return result;
+
+	result = check_tbu_va_err_injection(qsmmu_fusa, client_base);
+	if (result) {
+		dev_err(qsmmu_fusa->dev, "tbu_va_err_injection failed\n");
+		return result;
+	}
+
+	result = check_tbu_wrbuf_err_injection(qsmmu_fusa, client_base);
+	if (result) {
+		dev_err(qsmmu_fusa->dev, "tbu_wrbuf_err_injection failed\n");
+		return result;
+	}
+
+	result = check_tbu_wrbuf_wrn_injection(qsmmu_fusa, client_base);
+	if (result) {
+		dev_err(qsmmu_fusa->dev, "tbu_wrbuf_wrn_injection failed\n");
+		return result;
+	}
+
+	result = check_tbu_tcu_link_err_injection(qsmmu_fusa, client_base);
+	if (result) {
+		dev_err(qsmmu_fusa->dev, "tbu_tcu_link_err_injection failed\n");
+		return result;
+	}
+
+	return result;
+}
+
+static int dma_map_test(struct device *dev, dma_addr_t *iova, void **dma_buffer)
+{
+	size_t size = SZ_4K;
+
+	/* Make sure we can allocate and use a buffer */
+	*dma_buffer = kmalloc(size, GFP_KERNEL);
+	if (!*dma_buffer) {
+		dev_err(dev, "dma_map failed\n");
+		return -ENOMEM;
+	}
+	memset(*dma_buffer, 0xa5, size);
+	*iova = dma_map_single(dev, *dma_buffer, size, DMA_TO_DEVICE);
+
+	if (dma_mapping_error(dev, *iova)) {
+		dev_err(dev, "dma_map failed\n");
+		kfree(*dma_buffer);
+		*dma_buffer = NULL;
+		return -ENOMEM;
+	}
+
+	return 0;
+}
+
+static int qsmmu_fusa_test(struct qsmmu_fusa *qsmmu_fusa)
+{
+	struct platform_device *test_pdev;
+	struct device_node *child;
+	bool dma_mapped = false;
+	void *dma_buffer = NULL;
+	bool timedout = false;
+	dma_addr_t iova = 0;
+	u32 client_id = 0;
+	int ret = 0;
+
+
+	/* Find num of TBUs */
+	for_each_child_of_node(qsmmu_fusa->dev->of_node, child) {
+		reinit_completion(&qsmmu_fusa->tdev->probe_wait);
+
+		/*
+		 * Create platform_device for each TBU entry
+		 * This will create a iommu group mapping
+		 */
+		test_pdev = of_platform_device_create(child, NULL, qsmmu_fusa->dev);
+		if (!test_pdev) {
+			dev_err(qsmmu_fusa->dev, "Creating platform device failed\n");
+			of_node_put(child);
+			return -EINVAL;
+		}
+
+		/*
+		 * Wait for child device's probe function to be called.
+		 * Its very unlikely to be asynchonrous...
+		 */
+		ret = wait_for_completion_interruptible_timeout(&qsmmu_fusa->tdev->probe_wait,
+						msecs_to_jiffies(USECASE_SWITCH_TIMEOUT_MSECS));
+		if (ret <= 0) {
+			dev_err(qsmmu_fusa->dev, "Timed out waiting for test device probe\n");
+			if (ret == 0)
+				timedout = true;
+			goto out;
+		}
+		timedout = false;
+
+		if (!iommu_get_domain_for_dev(&test_pdev->dev))
+			dev_notice(qsmmu_fusa->dev, "Oops, usecase not associated with iommu\n");
+
+		/* map dummy dma data */
+		ret = dma_map_test(&test_pdev->dev, &iova, &dma_buffer);
+		if (ret)
+			goto out;
+		dma_mapped = true;
+
+		/* Inject and test faults for TBU */
+		mutex_lock(&qsmmu_fusa->tdev->state_lock);
+		qsmmu_fusa->tdev->test_dev = &test_pdev->dev;
+		mutex_unlock(&qsmmu_fusa->tdev->state_lock);
+		ret = fusa_fault_injection_tcu_test(qsmmu_fusa);
+		if (!ret && qsmmu_fusa->tbu_fault_injection)
+			ret = fusa_fault_injection_tbu_test(qsmmu_fusa, client_id);
+
+out:
+		/* unmap dma data */
+		if (dma_mapped) {
+			dma_unmap_single(&test_pdev->dev, iova, SZ_4K, DMA_TO_DEVICE);
+			kfree(dma_buffer);
+			dma_buffer = NULL;
+			dma_mapped = false;
+		}
+
+		/*
+		 * Destroy platform_device for each TBU entry
+		 * Clear test_dev pointer before destroying device
+		 */
+		mutex_lock(&qsmmu_fusa->tdev->state_lock);
+		qsmmu_fusa->tdev->test_dev = NULL;
+		mutex_unlock(&qsmmu_fusa->tdev->state_lock);
+		if (test_pdev)
+			of_platform_device_destroy(&test_pdev->dev, NULL);
+
+		if (ret || timedout) {
+			dev_err(qsmmu_fusa->dev, "qsmmu_fusa fault injection test failed. Exiting ...\n");
+			of_node_put(child);
+			return ret ? ret : -ETIMEDOUT;
+		}
+
+		client_id++;
+	}
+
+	return ret;
+}
+
+static int qsmmu_fusa_test_probe(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+	struct qsmmu_fusa *qsmmu_fusa;
+
+	if (!dev->parent)
+		return -EINVAL;
+
+	qsmmu_fusa = dev_get_drvdata(dev->parent);
+	if (!qsmmu_fusa)
+		return -EINVAL;
+
+	if (qsmmu_fusa->tdev)
+		complete(&qsmmu_fusa->tdev->probe_wait);
+
+	return 0;
+}
+
 static int qsmmu_fusa_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -405,11 +967,18 @@ static int qsmmu_fusa_probe(struct platform_device *pdev)
 	struct qsmmu_fusa *qsmmu_fusa;
 	struct resource *tcu_res, client_res;
 	resource_size_t tcu_sz;
-	int ret;
+	int ret = 0;
 
 	qsmmu_fusa = devm_kzalloc(dev, sizeof(*qsmmu_fusa), GFP_KERNEL);
 	if (!qsmmu_fusa)
 		return -ENOMEM;
+
+	qsmmu_fusa->tdev = devm_kzalloc(dev, sizeof(struct qsmmu_fusa_test), GFP_KERNEL);
+	if (!qsmmu_fusa->tdev)
+		return -ENOMEM;
+
+	init_completion(&qsmmu_fusa->tdev->probe_wait);
+	mutex_init(&qsmmu_fusa->tdev->state_lock);
 
 	qsmmu_fusa->dev = dev;
 	qsmmu_fusa->smmu_name = dev_name(dev);
@@ -453,12 +1022,33 @@ static int qsmmu_fusa_probe(struct platform_device *pdev)
 
 			if (!qsmmu_fusa->client_fusa_base)
 				return -ENOMEM;
+
+			qsmmu_fusa->tbu_fault_injection = true;
 		}
 	}
 
 	qsmmu_fusa->client_fusa_reg = qsmmu_fusa->md->offset;
 
 	platform_set_drvdata(pdev, qsmmu_fusa);
+
+	if (qsmmu_fusa->md->enable_fault_injection) {
+		ret = qsmmu_fusa_test(qsmmu_fusa);
+		if (ret) {
+			/* If the fault-injection test fails this module should
+			 * trigger a panic as occurrence of this failure signifies
+			 * a compromise in the system safety. Hence, we should not
+			 * continue system boot post failure of SMMU FuSa fault
+			 * injection test
+			 *
+			 * #ToDo : will be enabled once verified on all active platforms
+			 *
+			 * msleep(100);
+			 * panic();
+			 * return ret;
+			 */
+			dev_notice(dev, "qsmmu_fusa_test failed : %d\n", ret);
+		}
+	}
 
 	qsmmu_fusa->hw_fault.fault_source = devm_kzalloc(qsmmu_fusa->dev,
 							 BUFFER_SZ, GFP_KERNEL);
@@ -499,16 +1089,19 @@ static void qsmmu_fusa_remove(struct platform_device *pdev)
 static const struct qsmmu_fusa_match_data md_qsmmu_tbu500 = {
 	.offset = FUSA_TBU500_OFFSET,
 	.flags  = QSMMU_F_TBU500,
+	.enable_fault_injection = true,
 };
 
 static const struct qsmmu_fusa_match_data md_qsmmu_qtb500 = {
 	.offset = 0,
 	.flags  = QSMMU_F_QTB500,
+	.enable_fault_injection = true,
 };
 
 static const struct qsmmu_fusa_match_data md_qsmmu_qtb600 = {
 	.offset = 0,
 	.flags  = QSMMU_F_QTB600,
+	.enable_fault_injection = false,
 };
 
 static const struct of_device_id qsmmu_fusa_of_match[] = {
@@ -527,7 +1120,52 @@ static struct platform_driver qsmmu_fusa_driver = {
 	.remove_new = qsmmu_fusa_remove,
 };
 
-module_platform_driver(qsmmu_fusa_driver);
+static const struct of_device_id qsmmu_fusa_test_of_match[] = {
+	{.compatible = "qcom,tbu500-fusa-test"},
+	{.compatible = "qcom,qtb500-fusa-test"},
+	{}
+};
+
+static struct platform_driver qsmmu_fusa_test_driver = {
+	.driver = {
+		   .name = "qcom,qsmmu-fusa-test",
+		   .of_match_table = qsmmu_fusa_test_of_match,
+		   },
+	.probe = qsmmu_fusa_test_probe,
+};
+
+static int qcom_fusa_init(void)
+{
+	int ret;
+
+	ret = platform_driver_register(&qsmmu_fusa_test_driver);
+	if (ret)
+		return ret;
+
+	ret = platform_driver_register(&qsmmu_fusa_driver);
+	if (ret)
+		platform_driver_unregister(&qsmmu_fusa_test_driver);
+	return ret;
+}
+
+static void qcom_fusa_exit(void)
+{
+#ifdef CONFIG_DEBUG_FS
+	struct dentry *dir;
+#endif
+
+	platform_driver_unregister(&qsmmu_fusa_test_driver);
+	platform_driver_unregister(&qsmmu_fusa_driver);
+#ifdef CONFIG_DEBUG_FS
+	dir = debugfs_lookup("smmu_hw_faults", NULL);
+	debugfs_remove_recursive(dir);
+	if (dir)
+		dput(dir);
+#endif
+}
+
+module_init(qcom_fusa_init);
+module_exit(qcom_fusa_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Qualcomm Technologies Inc. SMMU Functional Safety driver");
