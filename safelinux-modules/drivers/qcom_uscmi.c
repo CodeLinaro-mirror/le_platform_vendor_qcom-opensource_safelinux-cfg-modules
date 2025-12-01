@@ -12,8 +12,12 @@
 #include <linux/pm_opp.h>
 #include <linux/reset.h>
 #include <linux/pm_domain.h>
+#include <linux/ktime.h>
 #include <linux/mutex.h>
 #include <uapi/misc/qcom_uscmi.h>
+
+#define CREATE_TRACE_POINTS
+#include "qcom_uscmi_trace.h"
 
 struct qcom_uscmi_dev {
 	struct miscdevice miscdev;
@@ -27,18 +31,40 @@ struct qcom_uscmi_dev {
 
 #define miscdev_to_data(d) container_of(d, struct qcom_uscmi_dev, miscdev)
 
+/**
+ * qcom_uscmi_open - Open handler for USCMI device
+ * @inode: inode structure
+ * @filp: file structure
+ *
+ * Return: 0 on success
+ */
 static int qcom_uscmi_open(struct inode *inode, struct file *filp)
 {
-	/* do nothing */
+	/* No initialization needed */
 	return 0;
 }
 
+/**
+ * qcom_uscmi_release - Release handler for USCMI device
+ * @inode: inode structure
+ * @filp: file structure
+ *
+ * Return: 0 on success
+ */
 static int qcom_uscmi_release(struct inode *inode, struct file *filp)
 {
-	/* do nothing */
-        return 0;
+	/* No cleanup needed */
+	return 0;
 }
 
+/**
+ * get_pd_dev - Get power domain device by name
+ * @uscmi: USCMI device structure
+ * @name: Power domain name to find
+ * @idx: Output parameter for domain index
+ *
+ * Return: Device pointer on success, NULL on failure
+ */
 static struct device * get_pd_dev(struct qcom_uscmi_dev *uscmi, char *name, int *idx)
 {
 	int index;
@@ -66,6 +92,12 @@ static struct device * get_pd_dev(struct qcom_uscmi_dev *uscmi, char *name, int 
 	return uscmi->pd_list->pd_devs[index];
 }
 
+/**
+ * is_genpd_on - Check if generic power domain is on
+ * @dev: Device structure
+ *
+ * Return: 1 if domain is on, 0 otherwise
+ */
 static int is_genpd_on(struct device *dev)
 {
 	struct generic_pm_domain *genpd;
@@ -78,6 +110,12 @@ static int is_genpd_on(struct device *dev)
 	return (genpd->status == GENPD_STATE_ON);
 }
 
+/**
+ * is_genpd_always_on - Check if generic power domain is always on
+ * @dev: Device structure
+ *
+ * Return: 1 if domain is always on, 0 otherwise
+ */
 static int is_genpd_always_on(struct device *dev)
 {
 	struct generic_pm_domain *genpd;
@@ -130,18 +168,25 @@ static bool qcom_uscmi_all_pds_off(struct qcom_uscmi_dev *uscmi)
 static int qcom_uscmi_attach_domains(struct qcom_uscmi_dev *uscmi)
 {
 	int num_pds;
+	ktime_t start_time, end_time;
+	s64 duration_us = 0;
 
 	if (!uscmi->skip_system_pm || uscmi->num_pds)
 		return 0;
 
+	start_time = ktime_get();
 	num_pds = dev_pm_domain_attach_list(uscmi->dev, NULL, &uscmi->pd_list);
 	if (num_pds < 0) {
 		dev_err(uscmi->dev, "multi domain attach failed (ret=%d)\n", num_pds);
+		trace_qcom_uscmi_pd_attach(dev_name(uscmi->dev), num_pds, 0, 0);
 		return num_pds;
 	}
 
 	dev_dbg(uscmi->dev, "multi domain attach success (num_pds=%d)\n", num_pds);
 	uscmi->num_pds = num_pds;
+	end_time = ktime_get();
+	duration_us = ktime_to_us(ktime_sub(end_time, start_time));
+	trace_qcom_uscmi_pd_attach(dev_name(uscmi->dev), num_pds, 0, duration_us);
 
 	return 0;
 }
@@ -155,9 +200,13 @@ static int qcom_uscmi_attach_domains(struct qcom_uscmi_dev *uscmi)
 static void qcom_uscmi_detach_domains(struct qcom_uscmi_dev *uscmi,
 				      int operation, bool force)
 {
+	ktime_t start_time, end_time;
+	s64 duration_us = 0;
+
 	if (!uscmi->skip_system_pm || !uscmi->num_pds)
 		return;
 
+	start_time = ktime_get();
 	if (force || qcom_uscmi_all_pds_off(uscmi)) {
 		if (uscmi->pd_list)
 			dev_pm_domain_detach_list(uscmi->pd_list);
@@ -165,6 +214,9 @@ static void qcom_uscmi_detach_domains(struct qcom_uscmi_dev *uscmi,
 			operation, force);
 		uscmi->pd_list = NULL;
 		uscmi->num_pds = 0;
+		end_time = ktime_get();
+		duration_us = ktime_to_us(ktime_sub(end_time, start_time));
+		trace_qcom_uscmi_pd_detach(dev_name(uscmi->dev), operation, force, duration_us);
 	} else {
 		dev_dbg(uscmi->dev, "detach skipped after operation %d, some domains are ON\n",
 			operation);
@@ -184,10 +236,14 @@ static int do_power_operation(scmi_oper_ioctl_t *req,
 	struct device *dev;
 	int ret = 0;
 	int index;
+	ktime_t start_time, end_time;
+	u64 duration_us;
+
+	start_time = ktime_get();
 
 	ret = qcom_uscmi_attach_domains(uscmi);
 	if (ret)
-		return ret;
+		goto out_detach;
 
 	dev = get_pd_dev(uscmi, req->name, &index);
 	if (!dev) {
@@ -226,6 +282,10 @@ out_detach:
 	if (ret < 0)
 		dev_err(uscmi->dev, "power operation(%d) failed with err=%d\n", req->oper, ret);
 
+	end_time = ktime_get();
+	duration_us = ktime_to_us(ktime_sub(end_time, start_time));
+
+	trace_qcom_uscmi_power_op(req->name, req->oper, ret, duration_us);
 	qcom_uscmi_detach_domains(uscmi, req->oper, ret < 0);
 
 	return ret >= 0 ? 0 : ret;
@@ -265,10 +325,14 @@ static int do_performance_operation(scmi_oper_ioctl_t *req,
 	struct device *dev;
 	int ret = 0;
 	int index;
+	ktime_t start_time, end_time;
+	u64 duration_us;
+
+	start_time = ktime_get();
 
 	ret = qcom_uscmi_attach_domains(uscmi);
 	if (ret)
-		return ret;
+		goto out_detach;
 
 	dev = get_pd_dev(uscmi, req->name, &index);
 	if (!dev) {
@@ -311,11 +375,22 @@ out_detach:
 		dev_err(uscmi->dev, "performance operation %d failed with error %d\n",
 			req->oper, ret);
 
+	end_time = ktime_get();
+	duration_us = ktime_to_us(ktime_sub(end_time, start_time));
+
+	trace_qcom_uscmi_perf_op(req->name, req->level, ret, duration_us);
 	qcom_uscmi_detach_domains(uscmi, req->oper, ret < 0);
 
 	return ret;
 }
 
+/**
+ * do_reset_operation - Execute reset operation
+ * @req: SCMI operation request
+ * @uscmi: USCMI device structure
+ *
+ * Return: 0 on success, negative error code on failure
+ */
 static int do_reset_operation(scmi_oper_ioctl_t *req,
 			      struct qcom_uscmi_dev *uscmi)
 {
@@ -324,19 +399,29 @@ static int do_reset_operation(scmi_oper_ioctl_t *req,
 	struct reset_control *rstc;
 	int ret = 0;
 	size_t len;
+	ktime_t start_time, end_time;
+	u64 duration_us;
 
-	if (req->proto != SCMI_PROTO_RESET)
-		return -EINVAL;
+	start_time = ktime_get();
+
+	if (req->proto != SCMI_PROTO_RESET) {
+		ret = -EINVAL;
+		goto out;
+	}
 
 	len = strnlen(req->name, NAME_LEN);
-	if (!len || len == NAME_LEN)
-		return -EINVAL;
+	if (!len || len == NAME_LEN) {
+		ret = -EINVAL;
+		goto out;
+	}
 
 	req->name[len] = '\0';
 	id = req->name;
 	rstc = devm_reset_control_get_optional(dev, id);
-	if (IS_ERR_OR_NULL(rstc))
-		return -ENODEV;
+	if (IS_ERR_OR_NULL(rstc)) {
+		ret = -ENODEV;
+		goto out;
+	}
 
 	switch(req->oper) {
 	  case SCMI_RST_ASSERT:
@@ -354,13 +439,25 @@ static int do_reset_operation(scmi_oper_ioctl_t *req,
 	}
 
 	reset_control_put(rstc);
-
+out:
 	if (ret)
 		dev_err(dev, "reset operation(%d) failed with err=%d\n", req->oper, ret);
 
+	end_time = ktime_get();
+	duration_us = ktime_to_us(ktime_sub(end_time, start_time));
+
+	trace_qcom_uscmi_reset_op(req->name, req->oper, ret, duration_us);
 	return ret;
 }
 
+/**
+ * qcom_uscmi_ioctl - IOCTL handler for USCMI device
+ * @file: File structure
+ * @cmd: IOCTL command
+ * @arg: IOCTL argument
+ *
+ * Return: 0 on success, negative error code on failure
+ */
 static long qcom_uscmi_ioctl(struct file *file, unsigned int cmd,
 				unsigned long arg)
 {
@@ -403,6 +500,12 @@ static const struct file_operations qcom_uscmi_fops = {
 	.compat_ioctl = compat_ptr_ioctl,
 };
 
+/**
+ * qcom_uscmi_probe - Probe function for USCMI driver
+ * @pdev: Platform device structure
+ *
+ * Return: 0 on success, negative error code on failure
+ */
 static int qcom_uscmi_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -466,6 +569,12 @@ static int qcom_uscmi_probe(struct platform_device *pdev)
 	return 0;
 }
 
+/**
+ * qcom_uscmi_runtime_nop - No-op runtime PM callback
+ * @dev: Device structure
+ *
+ * Return: 0
+ */
 static int qcom_uscmi_runtime_nop(struct device *dev)
 {
 	/* do nothing */
