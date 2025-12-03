@@ -167,7 +167,7 @@ static int bw_profiling_get(void __user *argp, struct tz_bw_svc_buf *bwbuf)
 static int bw_profiling_per_ip_get(void __user *argp, struct tz_bw_svc_buf *bwbuf)
 {
 	int ret = 0;
-	int ch, gc;
+	int ch = 0, gc = 0, hf = 0, sf = 0;
 	const int bufsize = sizeof(struct profiler_bw_cntrs_req)
 							- sizeof(uint32_t);
 	struct profiler_bw_cntrs_req cnt_buf;
@@ -215,6 +215,16 @@ static int bw_profiling_per_ip_get(void __user *argp, struct tz_bw_svc_buf *bwbu
 						+ offset_reg_values.gemnoc_offset[index]);
 		}
 	}
+
+
+	for (hf = 0; hf < dev_params.num_hf_metrics; hf++)
+		cnt_buf.mmnoc_hf_values[hf] = readl(profiler->mmnoc_base
+						+ offset_reg_values.mmnoc_hf_offset[hf]);
+
+	for (sf = 0; sf < dev_params.num_sf_metrics; sf++)
+		cnt_buf.mmnoc_sf_values[sf] = readl(profiler->mmnoc_base
+						+ offset_reg_values.mmnoc_sf_offset[sf]);
+
 
 	/* Populate request data */
 	bwbuf->bwreq.get_req.cmd_id = TZ_BW_SVC_GET_ID;
@@ -412,6 +422,11 @@ static int profiler_info_init(struct conf_data *desc, struct platform_device *pd
 						"Failed to ioremap gemnoc registers\n");
 	}
 
+	profiler->mmnoc_base = devm_platform_ioremap_resource(pdev,
+			(desc->num_llcc_channels + desc->gemnoc_channels));
+	if (IS_ERR(profiler->mmnoc_base))
+		return dev_err_probe(&pdev->dev, PTR_ERR(profiler->mmnoc_base),
+						"Failed to ioremap mmnoc registers\n");
 
 	for (int i = 0; i < desc->num_llcc_channels; i++) {
 		offset_reg_values.llcc_offset[i*2] = desc->llcc_offset
