@@ -21,6 +21,8 @@ struct qcom_uscmi_dev {
 	const char *name;
 	struct mutex uscmi_lock;
 	struct dev_pm_domain_list *pd_list;
+	u32 num_pds;
+	bool skip_system_pm;
 };
 
 #define miscdev_to_data(d) container_of(d, struct qcom_uscmi_dev, miscdev)
@@ -66,11 +68,116 @@ static struct device * get_pd_dev(struct qcom_uscmi_dev *uscmi, char *name, int 
 
 static int is_genpd_on(struct device *dev)
 {
-	struct generic_pm_domain *genpd = pd_to_genpd(dev->pm_domain);
+	struct generic_pm_domain *genpd;
+
+	if (!dev || !dev->pm_domain)
+		return 0;
+
+	genpd = pd_to_genpd(dev->pm_domain);
 
 	return (genpd->status == GENPD_STATE_ON);
 }
 
+static int is_genpd_always_on(struct device *dev)
+{
+	struct generic_pm_domain *genpd;
+
+	if (!dev || !dev->pm_domain)
+		return 0;
+
+	genpd = pd_to_genpd(dev->pm_domain);
+	dev_dbg(dev, "domain is %s\n", genpd->flags & GENPD_FLAG_ALWAYS_ON ?
+		"always on" : "not always on");
+
+	return (genpd->flags & GENPD_FLAG_ALWAYS_ON);
+}
+
+/**
+ * qcom_uscmi_all_pds_off - Check if all power domains are off
+ * @uscmi: USCMI device structure
+ *
+ * Return: true if all non-always-on domains are off, false otherwise
+ */
+static bool qcom_uscmi_all_pds_off(struct qcom_uscmi_dev *uscmi)
+{
+	int i;
+
+	if (!uscmi->num_pds || !uscmi->pd_list || !uscmi->pd_list->pd_devs)
+		return true;
+
+	for (i = 0; i < uscmi->num_pds; i++) {
+		if (unlikely(!uscmi->pd_list->pd_devs[i]))
+			continue;
+
+		/* If any non-DVFS domain is ON, we're not ready to detach */
+		if (is_genpd_always_on(uscmi->pd_list->pd_devs[i]))
+			continue;
+
+		if (is_genpd_on(uscmi->pd_list->pd_devs[i]))
+			return false;
+	}
+
+	dev_dbg(uscmi->dev, "all domains are off\n");
+	return true;
+}
+
+/**
+ * qcom_uscmi_attach_domains - Attach power domains if needed
+ * @uscmi: USCMI device structure
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+static int qcom_uscmi_attach_domains(struct qcom_uscmi_dev *uscmi)
+{
+	int num_pds;
+
+	if (!uscmi->skip_system_pm || uscmi->num_pds)
+		return 0;
+
+	num_pds = dev_pm_domain_attach_list(uscmi->dev, NULL, &uscmi->pd_list);
+	if (num_pds < 0) {
+		dev_err(uscmi->dev, "multi domain attach failed (ret=%d)\n", num_pds);
+		return num_pds;
+	}
+
+	dev_dbg(uscmi->dev, "multi domain attach success (num_pds=%d)\n", num_pds);
+	uscmi->num_pds = num_pds;
+
+	return 0;
+}
+
+/**
+ * qcom_uscmi_detach_domains - Detach power domains if all are off
+ * @uscmi: USCMI device structure
+ * @operation: Operation type for logging
+ * @force: Force detach even if domains are on (e.g., on error)
+ */
+static void qcom_uscmi_detach_domains(struct qcom_uscmi_dev *uscmi,
+				      int operation, bool force)
+{
+	if (!uscmi->skip_system_pm || !uscmi->num_pds)
+		return;
+
+	if (force || qcom_uscmi_all_pds_off(uscmi)) {
+		if (uscmi->pd_list)
+			dev_pm_domain_detach_list(uscmi->pd_list);
+		dev_dbg(uscmi->dev, "detached domains after operation %d force:%d\n",
+			operation, force);
+		uscmi->pd_list = NULL;
+		uscmi->num_pds = 0;
+	} else {
+		dev_dbg(uscmi->dev, "detach skipped after operation %d, some domains are ON\n",
+			operation);
+	}
+}
+
+/**
+ * do_power_operation - Execute power domain operation
+ * @req: SCMI operation request
+ * @uscmi: USCMI device structure
+ *
+ * Return: 0 on success, negative error code on failure
+ */
 static int do_power_operation(scmi_oper_ioctl_t *req,
 			      struct qcom_uscmi_dev *uscmi)
 {
@@ -78,15 +185,25 @@ static int do_power_operation(scmi_oper_ioctl_t *req,
 	int ret = 0;
 	int index;
 
+	ret = qcom_uscmi_attach_domains(uscmi);
+	if (ret)
+		return ret;
+
 	dev = get_pd_dev(uscmi, req->name, &index);
-	if (!dev)
-		return -EINVAL;
+	if (!dev) {
+		ret = -EINVAL;
+		goto out_detach;
+	}
 
-	if (req->proto != SCMI_PROTO_POWER)
-		return -EINVAL;
+	if (req->proto != SCMI_PROTO_POWER) {
+		ret = -EINVAL;
+		goto out_detach;
+	}
 
-	if (!dev->pm_domain)
-		return -EINVAL;
+	if (!dev->pm_domain) {
+		ret = -EINVAL;
+		goto out_detach;
+	}
 
 	switch(req->oper) {
 	  case SCMI_PWR_OFF:
@@ -101,16 +218,26 @@ static int do_power_operation(scmi_oper_ioctl_t *req,
 		  break;
 
 	  default:
-		dev_warn(dev, "power operation(%d) not supported\n", req->oper);
+		dev_warn(uscmi->dev, "power operation(%d) not supported\n", req->oper);
 		ret = -EINVAL;
 	}
 
+out_detach:
 	if (ret < 0)
-		dev_err(dev, "power operation(%d) failed with err=%d\n", req->oper, ret);
+		dev_err(uscmi->dev, "power operation(%d) failed with err=%d\n", req->oper, ret);
+
+	qcom_uscmi_detach_domains(uscmi, req->oper, ret < 0);
 
 	return ret >= 0 ? 0 : ret;
 }
 
+/**
+ * dev_pm_opp_apply_level - Apply OPP level to device
+ * @dev: Device structure
+ * @level: OPP level to apply
+ *
+ * Return: 0 on success, negative error code on failure
+ */
 static int dev_pm_opp_apply_level(struct device *dev, unsigned int level)
 {
 	struct dev_pm_opp *opp = dev_pm_opp_find_level_exact(dev, level);
@@ -125,6 +252,13 @@ static int dev_pm_opp_apply_level(struct device *dev, unsigned int level)
 	return ret;
 }
 
+/**
+ * do_performance_operation - Execute performance operation
+ * @req: SCMI operation request
+ * @uscmi: USCMI device structure
+ *
+ * Return: 0 on success, negative error code on failure
+ */
 static int do_performance_operation(scmi_oper_ioctl_t *req,
 				    struct qcom_uscmi_dev *uscmi)
 {
@@ -132,15 +266,25 @@ static int do_performance_operation(scmi_oper_ioctl_t *req,
 	int ret = 0;
 	int index;
 
+	ret = qcom_uscmi_attach_domains(uscmi);
+	if (ret)
+		return ret;
+
 	dev = get_pd_dev(uscmi, req->name, &index);
-	if (!dev)
-		return -EINVAL;
+	if (!dev) {
+		ret = -EINVAL;
+		goto out_detach;
+	}
 
-	if (req->proto != SCMI_PROTO_PERFORMANCE)
-		return -EINVAL;
+	if (req->proto != SCMI_PROTO_PERFORMANCE) {
+		ret = -EINVAL;
+		goto out_detach;
+	}
 
-	if (dev_pm_opp_get_opp_count(dev) <= 0)
-		return -EINVAL;
+	if (dev_pm_opp_get_opp_count(dev) <= 0) {
+		ret =  -EINVAL;
+		goto out_detach;
+	}
 
 	switch(req->oper) {
 	  case SCMI_PRF_LVL_SET:
@@ -162,8 +306,12 @@ static int do_performance_operation(scmi_oper_ioctl_t *req,
 			ret = pm_runtime_put_sync(dev);
 	}
 
-	if (ret)
-		dev_err(dev, "performance operation(%d) failed with err=%d\n", req->oper, ret);
+out_detach:
+	if (ret < 0)
+		dev_err(uscmi->dev, "performance operation %d failed with error %d\n",
+			req->oper, ret);
+
+	qcom_uscmi_detach_domains(uscmi, req->oper, ret < 0);
 
 	return ret;
 }
@@ -261,7 +409,7 @@ static int qcom_uscmi_probe(struct platform_device *pdev)
 	struct device_node *np = dev->of_node;
 	struct qcom_uscmi_dev *uscmi;
 	const char *name;
-	int err;
+	int err, num_pds = 0;
 
 	uscmi = devm_kzalloc(dev, sizeof(*uscmi), GFP_KERNEL);
 	if (!uscmi)
@@ -271,17 +419,25 @@ static int qcom_uscmi_probe(struct platform_device *pdev)
 
 	if (!dev->pm_domain) {
 		/* multiple domains used */
-		err = dev_pm_domain_attach_list(dev, NULL, &uscmi->pd_list);
-		if (err < 0) {
-			dev_err(dev, "multi domain attach failed(ret=%d)\n", err);
-			return err;
+		num_pds = dev_pm_domain_attach_list(dev, NULL, &uscmi->pd_list);
+		if (num_pds < 0) {
+			dev_err(dev, "multi domain attach failed(ret=%d)\n", num_pds);
+			return num_pds;
 		}
+		uscmi->num_pds = num_pds;
+	} else {
+		uscmi->num_pds = 1;
 	}
 
 	if (!of_property_read_string(np, "qcom,dev-name", &name))
 		uscmi->name = devm_kstrdup(dev, name, GFP_KERNEL);
 	else
 		uscmi->name = devm_kasprintf(dev, GFP_KERNEL, "%pOFn", np);
+
+	if (of_property_read_bool(uscmi->dev->of_node, "qcom,no-suspend")) {
+		dev_info(uscmi->dev, "skip system pm cbs\n");
+		uscmi->skip_system_pm = true;
+	}
 
 	mutex_init(&uscmi->uscmi_lock);
 	uscmi->miscdev.minor = MISC_DYNAMIC_MINOR;
@@ -292,7 +448,8 @@ static int qcom_uscmi_probe(struct platform_device *pdev)
 	if (err) {
 		dev_err(dev, "misc_register failed(ret=%d)\n", err);
 		mutex_destroy(&uscmi->uscmi_lock);
-		dev_pm_domain_detach_list(uscmi->pd_list);
+		if (uscmi->pd_list)
+			dev_pm_domain_detach_list(uscmi->pd_list);
 		return err;
 	}
 
@@ -305,6 +462,7 @@ static int qcom_uscmi_probe(struct platform_device *pdev)
 
 	dev_info(dev, "/dev/%s node created\n", uscmi->name);
 
+	platform_set_drvdata(pdev, uscmi);
 	return 0;
 }
 
