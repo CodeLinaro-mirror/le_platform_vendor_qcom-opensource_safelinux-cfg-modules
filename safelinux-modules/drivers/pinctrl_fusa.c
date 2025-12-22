@@ -12,11 +12,17 @@
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/types.h>
+#include <linux/iopoll.h>
 
 #define CREATE_TRACE_POINTS
 #include "pinctrl_fusa_trace.h"
 
-#define FUSA_ERR_RESET_VALUE	(1 << 14)
+/* TLMM FUSA reg value for error injection */
+#define FUSA_STATUS_REG_CDP_BIT		BIT(13)
+
+/* TLMM FUSA reg value for error state reset */
+#define FUSA_STATUS_REG_CMP_BIT		BIT(14)
+
 #define BUF_SZ	32
 
 struct tlmm_fusa {
@@ -222,7 +228,7 @@ static irqreturn_t pinctrl_fusa_irq(int irq, void *data)
 
 	spin_unlock_irqrestore(&pinctrl_fusa->lock, flags);
 	if (event.type != SPURIOUS)
-		writel_relaxed(FUSA_ERR_RESET_VALUE, event.reset_reg);
+		writel_relaxed(FUSA_STATUS_REG_CMP_BIT, event.reset_reg);
 
 	trace_tlmm_hw_safety_event(event.type == SPURIOUS ? "SPURIOUS" :
 			event.type == POR_ARES ? "POR_ARES" :
@@ -233,6 +239,38 @@ static irqreturn_t pinctrl_fusa_irq(int irq, void *data)
 #endif
 	return ret;
 }
+
+#if IS_ENABLED(CONFIG_PINCTRL_SA8797P)
+/* Boot-time TLMM FUSA Parity Error Validation */
+static void tlmm_fusa_validate_parity_errors(struct tlmm_fusa *pinctrl_fusa)
+{
+	u32 err_status;
+	int ret;
+
+	/* Trigger AHB HRESET error */
+	writel(FUSA_STATUS_REG_CDP_BIT, pinctrl_fusa->ahb_hreset_status);
+	ret = readl_poll_timeout(pinctrl_fusa->err_status, err_status,
+			(err_status && !(err_status & pinctrl_fusa->por_ares_bitmask)), 1, 1000);
+	if (ret) {
+		/* Give 100 ms delay for logging infra to come up to be able to capture the panic */
+		msleep(100);
+		panic("TLMM FUSA: AHB_HRESET parity error validation failed!");
+	}
+
+	writel_relaxed(FUSA_STATUS_REG_CMP_BIT, pinctrl_fusa->ahb_hreset_status);
+	/* Trigger POR ARES error */
+	writel(FUSA_STATUS_REG_CDP_BIT, pinctrl_fusa->por_ares_status);
+	ret = readl_poll_timeout(pinctrl_fusa->err_status, err_status,
+			(err_status & pinctrl_fusa->por_ares_bitmask), 1, 1000);
+	if (ret) {
+		/* Give 100 ms delay for logging infra to come up to be able to capture the panic */
+		msleep(100);
+		panic("TLMM FUSA: POR_ARES parity error validation failed!");
+	}
+
+	writel_relaxed(FUSA_STATUS_REG_CMP_BIT, pinctrl_fusa->por_ares_status);
+}
+#endif
 
 static int tlmm_fusa_probe(struct platform_device *pdev)
 {
@@ -259,7 +297,7 @@ static int tlmm_fusa_probe(struct platform_device *pdev)
 						resource_size(res));
 	if (!pinctrl_fusa->err_status) {
 		dev_err(dev, "Couldn't ioremap error_status register\n");
-		return PTR_ERR(pinctrl_fusa->err_status);
+		return -ENOMEM;
 	}
 
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM,
@@ -273,7 +311,7 @@ static int tlmm_fusa_probe(struct platform_device *pdev)
 							resource_size(res));
 	if (!pinctrl_fusa->ahb_hreset_status) {
 		dev_err(dev, "Couldn't ioremap ahb_hreset_status register\n");
-		return PTR_ERR(pinctrl_fusa->ahb_hreset_status);
+		return -ENOMEM;
 	}
 
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM,
@@ -287,7 +325,7 @@ static int tlmm_fusa_probe(struct platform_device *pdev)
 							resource_size(res));
 	if (!pinctrl_fusa->por_ares_status) {
 		dev_err(dev, "Couldn't ioremap por_ares_status register\n");
-		return PTR_ERR(pinctrl_fusa->por_ares_status);
+		return -ENOMEM;
 	}
 
 	ret = of_property_read_u32(dev->of_node, "qcom,por-ares-reset-bit",
@@ -305,6 +343,9 @@ static int tlmm_fusa_probe(struct platform_device *pdev)
 		return pinctrl_fusa->irq;
 	}
 
+#if IS_ENABLED(CONFIG_PINCTRL_SA8797P)
+	tlmm_fusa_validate_parity_errors(pinctrl_fusa);
+#endif
 	ret = devm_request_irq(dev, pinctrl_fusa->irq, pinctrl_fusa_irq,
 			       IRQF_TRIGGER_RISING | IRQF_NO_SUSPEND,
 			       "pinctrl_fusa", pinctrl_fusa);
