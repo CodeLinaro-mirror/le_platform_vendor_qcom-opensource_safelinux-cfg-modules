@@ -29,6 +29,7 @@
 #define KIUMD_SMMU_ASSIGN_BUF		_IOWR('R', 31, struct kiumd_user)
 #define KIUMD_SMMU_UNASSIGN_BUF		_IOWR('R', 32, struct kiumd_user)
 #define KIUMD_MANAGE_RUNTIME_PM        _IOWR('R', 33, struct kiumd_user)
+#define KIUMD_VFIO_CTX_GET_DATA               _IOWR('R', 34, struct kiumd_dev_mem_info)
 
 #define IOMMU_NOEXEC    (1 << 3)
 #define IOMMU_MMIO      (1 << 4)
@@ -52,7 +53,6 @@
 
 #define KIUMD_SMMU_SET_TTBR0_CONFIG    11
 #define KIUMD_SMMU_SET_TTBR1_CONFIG    12
-#define KIUMD_MAX_RESERVED_MEM_AREAS 10
 
 #define KIUMD_IOVA_SIZE_ALIGNED 6
 #define KIUMD_IOVA_PAGE_ALIGNED 7
@@ -131,7 +131,7 @@ struct kiumd_mem_info {
 struct kiumd_dev_mem_info {
 	int vfio_fd;
 	__u32 num_regions;
-	struct kiumd_mem_info mem_info[KIUMD_MAX_RESERVED_MEM_AREAS];
+	struct kiumd_mem_info *mem_info;
 };
 
 #endif /* __KIUMD_H__ */

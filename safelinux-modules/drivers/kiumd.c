@@ -101,6 +101,11 @@ static DECLARE_BITMAP(perprocess_map, KGSL_PT_MEM_PAGES);
 #define IOVA_ALLOC_FAILURE 9
 #define IOVA_ZERO      ((dma_addr_t)0)
 
+/**
+ * Added in kernel tag v6.12-rc1
+ */
+DEFINE_FREE(fput, struct file *, if (_T) fput(_T))
+
 struct kiumd_smmu_mmio_ctx {
 	struct device *dev;
 	dma_addr_t iova;
@@ -303,6 +308,7 @@ struct kiumd_ctx {
 	struct xarray kiumd_xa;
 	struct mutex kiumd_xa_mutex;
 	struct mutex hyp_lock;
+	struct mutex resmem_lock;
 	unsigned long pt_start_iova;
 	unsigned long pt_end_iova;
 	DECLARE_HASHTABLE(kgsl_page_table, SMMU_MAPTABLE_SIZE);
@@ -361,6 +367,48 @@ struct hyp_map_data {
 	struct kiumd_secure_map_context *secure_ctx;
 	struct hlist_node node;
 };
+
+/**
+ * @Brief: This function provide the device
+ * pointer for the given file descriptor
+ *
+ * Parameters:
+ * @fd: file descriptor
+ *
+ * Returns vfio device * upon success and NULL
+ * on failure
+ */
+static struct device *kiumd_vfio_get_device(unsigned int vfio_fd,
+                                            struct file **vfio_file)
+{
+        struct vfio_device *vfio_dev;
+        struct vfio_device_file *df;
+        struct file *file;
+
+
+        file = fget(vfio_fd);
+        if (!file) {
+                pr_err("Failed to get file from vfio_fd\n");
+                return NULL;
+        }
+
+        *vfio_file = file;
+        if (!vfio_file_is_valid(file))
+                goto close_file;
+
+        df = (struct vfio_device_file *)file->private_data;
+        if (!df)
+                goto close_file;
+
+        vfio_dev = (struct vfio_device *)df->device;
+        if (!vfio_dev || !vfio_dev->dev)
+                goto close_file;
+
+        return vfio_dev->dev;
+close_file:
+        pr_err("Failed to get device from vfio_fd\n");
+        return NULL;
+}
 
 /**
 * @Brief: This function find the
@@ -4549,6 +4597,7 @@ static int kiumd_open(struct inode *inode, struct file *filp)
 	xa_init(&kictx->kiumd_xa);
 	mutex_init(&kictx->kiumd_xa_mutex);
 	mutex_init(&kictx->hyp_lock);
+	mutex_init(&kictx->resmem_lock);
 	xa_init_flags(&kictx->kiumd_xa, XA_FLAGS_ALLOC);
 	filp->private_data = kictx;
 
@@ -4678,39 +4727,25 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 }
 
 /**
-* @Brief: This function facilitates to
-* initialise the context of the device.
-* Currently it reads the Device tree to check if the
-* device has any reserved regions and stores the information
-* of reserved memory regions internally.
-*
-* Parameters:
-* @arg: User space argument ptr
-* @fp: file ptr for device context
-*
-* return value is errno in failure cases
-* or 0 in case of success
-*/
+ * kiumd_vfio_ctx_init - Facilitate to initialise the context of the device
+ *
+ * Parameters:
+ * @arg: User space argument ptr
+ * @fp: file ptr for device context
+ *
+ * Return: value is errno in failure cases or 0 in case of success
+ */
 static int kiumd_vfio_ctx_init(char __user *arg, struct file *fp)
 {
+	struct file *vfio_file __free(fput) = NULL;
 	struct kiumd_dev_mem_info kiusr;
-	int ret = 0;
-	struct vfio_device *vfio_dev;
-	struct kiumd_ctx *kiumd_ctx = NULL;
-	struct device_node *np;
+	struct kiumd_ctx *kiumd_ctx;
 	struct device_node *mem_np;
 	struct reserved_mem *rmem;
-
-	if (!fp) {
-		pr_err("%s:file ptr returns NULL\n", __func__);
-		return -EINVAL;
-	}
+	struct device_node *np;
+	struct device *dev;
 
 	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-	if (!kiumd_ctx) {
-		pr_err("%s:kiumd ctx is NULL\n", __func__);
-		return -EINVAL;
-	}
 
 	if (copy_from_user(&kiusr, arg, sizeof(kiusr))) {
 		pr_err("%s:%d invalid args from user\n", __func__, __LINE__);
@@ -4718,39 +4753,40 @@ static int kiumd_vfio_ctx_init(char __user *arg, struct file *fp)
 	}
 
 	trace_kiumd_vfio_ctx_init_start(kiusr.vfio_fd);
+	dev = kiumd_vfio_get_device(kiusr.vfio_fd, &vfio_file);
+	if (!dev)
+		return -EBADF;
 
-	vfio_dev = kiumd_get_vfio_device(kiusr.vfio_fd);
-	if (!vfio_dev) {
-		pr_err("%s:%d invalid vfio device fd\n", __func__, __LINE__);
-		return -EINVAL;
-	}
-
-	if (!vfio_dev->dev)
-		return -EINVAL;
-
-	np = dev_of_node(vfio_dev->dev);
+	np = dev_of_node(dev);
 	if (!np) {
-		pr_err("%s:No memory-region specified\n", __func__);
+		dev_err(dev, "%s:No memory-region specified\n", __func__);
 		return -EINVAL;
 	}
+
+	guard(mutex)(&kiumd_ctx->resmem_lock);
+	if (kiumd_ctx->num_reserved_regions)
+		return -ENOMEM;
 
 	kiumd_ctx->num_reserved_regions = of_property_count_elems_of_size(np,
 									  "memory-region",
 									  sizeof(phandle));
-	if (kiumd_ctx->num_reserved_regions <= 0) {
-		pr_err(":%s:no reserved mem areas\n", __func__);
+	if (kiumd_ctx->num_reserved_regions <= 0)
 		return -EINVAL;
+	kiusr.num_regions = kiumd_ctx->num_reserved_regions;
+
+	if (kiumd_ctx->res_mem_area)
+		pr_err("%s:res_mem_area repeatedly allocates memory\n", __func__);
+
+	kiumd_ctx->res_mem_area = kcalloc(kiumd_ctx->num_reserved_regions,
+					  sizeof(*kiumd_ctx->res_mem_area),
+					  GFP_KERNEL);
+	if (!kiumd_ctx->res_mem_area) {
+		pr_err("%s:%d fail to allocate kiumd_ctx->res_mem_area\n", __func__, __LINE__);
+		return -ENOMEM;
 	}
 
-	kiumd_ctx->res_mem_area = kcalloc((kiumd_ctx->num_reserved_regions + 1),
-					  sizeof(struct kiumd_reserved_mem_area),
-					  GFP_KERNEL);
-	if (!kiumd_ctx->res_mem_area)
-		return -ENOMEM;
-
-	kiusr.num_regions = kiumd_ctx->num_reserved_regions;
 	for (u64 i = 0; i < kiusr.num_regions; i++) {
-		mem_np = of_parse_phandle(vfio_dev->dev->of_node, "memory-region", i);
+		mem_np = of_parse_phandle(dev->of_node, "memory-region", i);
 		if (!mem_np) {
 			pr_debug("%s:cant find phandle\n", __func__);
 			continue;
@@ -4767,21 +4803,77 @@ static int kiumd_vfio_ctx_init(char __user *arg, struct file *fp)
 		of_node_put(mem_np);
 		kiumd_ctx->res_mem_area[i].size = rmem->size;
 		kiumd_ctx->res_mem_area[i].base = rmem->base;
-		kiusr.mem_info[i].size = rmem->size;
-		kiusr.mem_info[i].offset = i << KIUMD_INDEX_OFFSET;
-		pr_debug("%s:base:%lx size:%lx offset:%lx\n", __func__, kiumd_ctx->res_mem_area[i].base,
-				kiusr.mem_info[i].size, kiusr.mem_info[i].offset);
 	}
 
 	if (copy_to_user(arg, &kiusr, sizeof(kiusr))) {
-		kfree(kiumd_ctx->res_mem_area);
-                kiumd_ctx->res_mem_area = NULL;
-		pr_err("%s:error in copying vfio ctx data for reserved memory:%d\n", __func__, ret);
-		ret = -EFAULT;
+		pr_err("%s:error in copying vfio ctx data for reserved memory\n",
+		       __func__);
+		return -EFAULT;
 	}
+
 	trace_kiumd_vfio_ctx_init_end(kiusr.vfio_fd);
-	return ret;
+	return 0;
 }
+
+/**
+ * @Brief: This function facilitates to
+ * copy the reserved region information saved
+ * in struct kiumd_ctx to user space.
+ *
+ * Parameters:
+ * @arg: User space argument ptr
+ * @fp: file ptr for device context
+ *
+ * return value is errno in failure cases
+ * or 0 in case of success
+ */
+static int kiumd_vfio_ctx_get_data(char __user *arg, struct file *fp)
+{
+	struct kiumd_dev_mem_info kiusr;
+	struct kiumd_ctx *kiumd_ctx;
+	struct kiumd_mem_info *mem_info;
+
+	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
+
+	if (copy_from_user(&kiusr, arg, sizeof(kiusr))) {
+		pr_err("%s:%d invalid args from user\n", __func__, __LINE__);
+		return -EINVAL;
+	}
+
+	if (!kiusr.num_regions ||
+			kiusr.num_regions != kiumd_ctx->num_reserved_regions)
+		return -EINVAL;
+
+	if (!kiusr.mem_info) {
+		pr_err("%s: Invalid kiusr.mem_info pointer\n", __func__);
+		return -EINVAL;
+	}
+
+	mem_info = kcalloc(kiumd_ctx->num_reserved_regions,
+			sizeof(struct kiumd_mem_info), GFP_KERNEL);
+	if (!mem_info)
+		return -ENOMEM;
+
+	for (u64 i = 0; i < kiusr.num_regions; i++) {
+		mem_info[i].size = kiumd_ctx->res_mem_area[i].size;
+		mem_info[i].offset = i << KIUMD_INDEX_OFFSET;
+		pr_debug("%s:base:%llx size:%llx offset:%llx\n", __func__,
+			 kiumd_ctx->res_mem_area[i].base,
+			 mem_info[i].size, mem_info[i].offset);
+	}
+
+	if (copy_to_user(kiusr.mem_info, mem_info,
+				kiumd_ctx->num_reserved_regions * sizeof(struct kiumd_mem_info))) {
+		kfree(mem_info);
+		pr_err("%s:error in copying vfio ctx data for reserved memory\n",
+		       __func__);
+		return -EFAULT;
+	}
+	kfree(mem_info);
+	return 0;
+}
+
+
 
 /**
 * @Brief: This function facilitates to call
@@ -4854,6 +4946,9 @@ static long kiumd_ioctl(struct file *file, unsigned int cmd,
 	case KIUMD_VFIO_CTX_INIT:
 		err = kiumd_vfio_ctx_init(argp, file);
 		break;
+	case KIUMD_VFIO_CTX_GET_DATA:
+                err = kiumd_vfio_ctx_get_data(argp, file);
+                break;
 	case KIUMD_SMMU_MANAGED_IOVA_MAP:
 		err = kiumd_dmabuf_managed_iova_map(argp, file);
 		break;
