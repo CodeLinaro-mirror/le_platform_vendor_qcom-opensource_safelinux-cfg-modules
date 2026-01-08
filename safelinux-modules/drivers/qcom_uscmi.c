@@ -27,6 +27,9 @@ struct qcom_uscmi_dev {
 	struct dev_pm_domain_list *pd_list;
 	bool domains_attached;
 	bool pm_domains_on_demand;
+	int reset_count;           /* Number of reset domains */
+	const char **reset_names;  /* Array of reset domain names */
+	struct reset_control **resets; /* Array of reset control pointers */
 };
 
 #define miscdev_to_data(d) container_of(d, struct qcom_uscmi_dev, miscdev)
@@ -172,6 +175,11 @@ static int qcom_uscmi_attach_domains(struct qcom_uscmi_dev *uscmi)
 	ktime_t start_time, end_time;
 	s64 duration_us = 0;
 
+	/**
+	 * skip attach if domains are already attached or dynamic attach/detach
+	 * is not supported
+	 */
+
 	if (!uscmi->pm_domains_on_demand || uscmi->domains_attached)
 		return 0;
 
@@ -188,6 +196,7 @@ static int qcom_uscmi_attach_domains(struct qcom_uscmi_dev *uscmi)
 	}
 
 	dev_dbg(uscmi->dev, "multi domain attach success (num_pds=%d)\n", num_pds);
+
 	uscmi->domains_attached = true;
 	end_time = ktime_get();
 	duration_us = ktime_to_us(ktime_sub(end_time, start_time));
@@ -209,6 +218,10 @@ static void qcom_uscmi_detach_domains(struct qcom_uscmi_dev *uscmi,
 	ktime_t start_time, end_time;
 	s64 duration_us = 0;
 
+	/**
+	 * skip detach if domains are not attached or dynamic attach/detach
+	 * is not supported
+	 */
 	if (!uscmi->pm_domains_on_demand || !uscmi->domains_attached)
 		return;
 
@@ -220,6 +233,7 @@ static void qcom_uscmi_detach_domains(struct qcom_uscmi_dev *uscmi,
 			operation, force);
 		uscmi->domains_attached = false;
 		uscmi->pd_list = NULL;
+
 		end_time = ktime_get();
 		duration_us = ktime_to_us(ktime_sub(end_time, start_time));
 		trace_qcom_uscmi_pd_detach(dev_name(uscmi->dev), operation, force, duration_us);
@@ -401,32 +415,42 @@ static int do_reset_operation(scmi_oper_ioctl_t *req,
 			      struct qcom_uscmi_dev *uscmi)
 {
 	struct device *dev = uscmi->dev;
-	const char *id;
-	struct reset_control *rstc;
-	int ret = 0;
+	struct reset_control *rstc = NULL;
+	int ret = 0, i;
 	size_t len;
 	ktime_t start_time, end_time;
 	u64 duration_us;
 
 	start_time = ktime_get();
+	if (!uscmi->reset_count || !uscmi->reset_names || !uscmi->resets) {
+		ret = -ENODEV;
+		goto err;
+	}
 
 	if (req->proto != SCMI_PROTO_RESET) {
 		ret = -EINVAL;
-		goto out;
+		goto err;
 	}
 
 	len = strnlen(req->name, NAME_LEN);
 	if (!len || len == NAME_LEN) {
 		ret = -EINVAL;
-		goto out;
+		goto err;
 	}
 
 	req->name[len] = '\0';
-	id = req->name;
-	rstc = devm_reset_control_get_optional(dev, id);
-	if (IS_ERR_OR_NULL(rstc)) {
+	/* Find the reset control by name */
+	for (i = 0; i < uscmi->reset_count; i++) {
+		if (strcmp(uscmi->reset_names[i], req->name) == 0) {
+			rstc = uscmi->resets[i];
+			break;
+		}
+	}
+
+	if (!rstc) {
+		dev_err(uscmi->dev, "reset domain %s not found\n", req->name);
 		ret = -ENODEV;
-		goto out;
+		goto err;
 	}
 
 	switch(req->oper) {
@@ -444,8 +468,7 @@ static int do_reset_operation(scmi_oper_ioctl_t *req,
 		break;
 	}
 
-	reset_control_put(rstc);
-out:
+err:
 	if (ret)
 		dev_err(dev, "reset operation(%d) failed with err=%d\n", req->oper, ret);
 
@@ -507,6 +530,62 @@ static const struct file_operations qcom_uscmi_fops = {
 };
 
 /**
+ * uscmi_init_reset_controls - Initialize reset controls
+ * @uscmi: USCMI device structure
+ *
+ * Gets all reset controls from device tree and stores them for later use.
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+static int uscmi_init_reset_controls(struct qcom_uscmi_dev *uscmi)
+{
+	struct device *dev = uscmi->dev;
+	struct device_node *np = dev->of_node;
+	int i, num_resets, ret;
+
+	num_resets = of_property_count_strings(np, "reset-names");
+	if (num_resets <= 0)
+		return 0;
+
+	uscmi->reset_count = num_resets;
+
+	/* Allocate arrays for reset controls and names */
+	uscmi->reset_names = devm_kcalloc(dev, num_resets,
+					  sizeof(*uscmi->reset_names), GFP_KERNEL);
+	if (!uscmi->reset_names)
+		return -ENOMEM;
+
+	uscmi->resets = devm_kcalloc(dev, num_resets,
+				     sizeof(*uscmi->resets), GFP_KERNEL);
+	if (!uscmi->resets)
+		return -ENOMEM;
+
+	/* Get all reset controls */
+	for (i = 0; i < num_resets; i++) {
+		const char *name;
+
+		ret = of_property_read_string_index(np, "reset-names", i, &name);
+		if (ret) {
+			dev_err(dev, "Failed to read reset-names[%d]: %d\n", i, ret);
+			return ret;
+		}
+
+		uscmi->reset_names[i] = devm_kstrdup(dev, name, GFP_KERNEL);
+		if (!uscmi->reset_names[i])
+			return -ENOMEM;
+
+		uscmi->resets[i] = devm_reset_control_get(dev, name);
+		if (IS_ERR(uscmi->resets[i]))
+			return dev_err_probe(dev, PTR_ERR(uscmi->resets[i]),
+						"Failed to get reset control %s\n", name);
+
+		dev_dbg(dev, "Acquired reset control: %s\n", name);
+	}
+
+	return 0;
+}
+
+/**
  * qcom_uscmi_probe - Probe function for USCMI driver
  * @pdev: Platform device structure
  *
@@ -522,7 +601,7 @@ static int qcom_uscmi_probe(struct platform_device *pdev)
 
 	uscmi = devm_kzalloc(dev, sizeof(*uscmi), GFP_KERNEL);
 	if (!uscmi)
-		return -ENOMEM;
+		return dev_err_probe(dev, -ENOMEM, "failed to allocate uscmi dev\n");
 
 	uscmi->dev = dev;
 
@@ -536,12 +615,15 @@ static int qcom_uscmi_probe(struct platform_device *pdev)
 	else
 		uscmi->name = devm_kasprintf(dev, GFP_KERNEL, "%pOFn", np);
 
+	err = uscmi_init_reset_controls(uscmi);
+	if (err)
+		return dev_err_probe(dev, err, "reset control init failed\n");
+
 	if (!dev->pm_domain && !uscmi->pm_domains_on_demand) {
 		/* multiple domains used */
 		num_pds = dev_pm_domain_attach_list(dev, NULL, &uscmi->pd_list);
 		if (num_pds < 0) {
-			dev_err(dev, "multi domain attach failed(ret=%d)\n", num_pds);
-			return num_pds;
+			return dev_err_probe(dev, num_pds, "multi domain attach failed\n");
 		}
 		uscmi->domains_attached = true;
 	}
@@ -553,21 +635,24 @@ static int qcom_uscmi_probe(struct platform_device *pdev)
 
 	err = misc_register(&uscmi->miscdev);
 	if (err) {
-		dev_err(dev, "misc_register failed(ret=%d)\n", err);
 		mutex_destroy(&uscmi->uscmi_lock);
 		if (uscmi->pd_list) {
 			dev_pm_domain_detach_list(uscmi->pd_list);
 			uscmi->domains_attached = false;
 		}
-		return err;
+		return dev_err_probe(dev, err, "device registration failed\n");
 	}
 
 	/*
 	 * Enable runtime PM for devices with a single power domain
 	 */
 	if (dev->pm_domain) {
-		pm_runtime_set_active(dev);
-		pm_runtime_enable(dev);
+		err = devm_pm_runtime_set_active_enabled(dev);
+		if (err) {
+			mutex_destroy(&uscmi->uscmi_lock);
+			misc_deregister(&uscmi->miscdev);
+			return dev_err_probe(dev, err, "runtime pm failed\n");
+		}
 	}
 
 	pm_runtime_forbid(dev);
