@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2020, 2021 The Linux Foundation. All rights reserved.
- * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/init.h>
@@ -46,9 +46,11 @@ static int set_dump_mode(enum qcom_download_mode mode)
 
 	ret = qcom_scm_io_writel(dload_mode_addr, mode);
 	if (ret)
-		pr_err("failed to set dump mode as '0x%x', ret = %d\n", mode, ret);
+		pr_err("failed to set dump mode as '0x%x', ret = %d\n",
+								mode, ret);
 	else
 		dump_mode = mode;
+
 	return ret;
 }
 
@@ -84,6 +86,7 @@ static ssize_t attr_show(struct kobject *kobj, struct attribute *attr,
 
 	if (reset_attr->show)
 		ret = reset_attr->show(kobj, attr, buf);
+
 	return ret;
 }
 
@@ -95,6 +98,7 @@ static ssize_t attr_store(struct kobject *kobj, struct attribute *attr,
 
 	if (reset_attr->store)
 		ret = reset_attr->store(kobj, attr, buf, count);
+
 	return ret;
 }
 
@@ -126,6 +130,7 @@ static ssize_t dload_mode_show(struct kobject *kobj, struct attribute *this,
 		mode = "unknown";
 		break;
 	}
+
 	return scnprintf(buf, PAGE_SIZE, "DLOAD dump type: %s\n", mode);
 }
 
@@ -171,7 +176,6 @@ static ssize_t emmc_dload_store(struct kobject *kobj,
 		return -ENODEV;
 
 	ret = kstrtobool(buf, &enabled);
-
 	if (ret < 0)
 		return ret;
 
@@ -229,8 +233,10 @@ static void __iomem *map_prop_mem(const char *propname)
 	}
 
 	addr = of_iomap(np, 0);
+	of_node_put(np);
 	if (!addr)
 		pr_err("Unable to map memory for DT property: %s\n", propname);
+
 	return addr;
 }
 
@@ -238,6 +244,7 @@ static int qcom_dload_remove(struct platform_device *pdev)
 {
 	if (dload_dest_addr)
 		iounmap(dload_dest_addr);
+
 	return 0;
 }
 
@@ -253,9 +260,9 @@ static int qcom_dload_probe(struct platform_device *pdev)
 		dev_err(dev, "Unable to find 'qcom_scm' node!\n");
 		return -ENODEV;
 	}
-	of_node_put(scm_dev);
 
 	ret = qcom_scm_find_dload_mode_address(scm_dev, &dload_mode_addr);
+	of_node_put(scm_dev);
 	if (ret < 0) {
 		dev_err(dev, "Unable to find dload_mode_address!\n");
 		return ret;
@@ -275,10 +282,42 @@ static int qcom_dload_probe(struct platform_device *pdev)
 		kobject_del(&kobj);
 		return ret;
 	}
+
 	dump_mode = get_dump_mode(&temp) ? dump_mode : temp;
 	dload_dest_addr = map_prop_mem("qcom,msm-imem-dload-type");
+	if (!dload_dest_addr)
+		dev_err(dev, "Failed to map dload destination address!!\n");
+
 	return 0;
 }
+
+static int qcom_dload_resume(struct device *dev)
+{
+	enum qcom_download_mode mode = dump_mode;
+	int ret;
+
+	switch (mode) {
+	case QCOM_DOWNLOAD_FULLDUMP:
+	case QCOM_DOWNLOAD_MINIDUMP:
+	case QCOM_DOWNLOAD_BOTHDUMP:
+		ret = set_dump_mode(mode);
+		if (ret) {
+			dev_err(dev, "Resume restore failed, ret=%d\n", ret);
+			return ret;
+		}
+		break;
+	default:
+		dev_warn(dev, "Resume restore skipped, Invalid mode(0x%x)\n",
+									mode);
+		break;
+	}
+
+	return 0;
+}
+
+static const struct dev_pm_ops qcom_dload_pm_ops = {
+	.resume  = qcom_dload_resume,
+};
 
 static const struct of_device_id of_qcom_dload_match[] = {
 	{.compatible = "qcom,dload-mode", },
@@ -292,6 +331,7 @@ static struct platform_driver qcom_dload_driver = {
 	.driver = {
 		.name = "qcom-dload-mode",
 		.of_match_table = of_qcom_dload_match,
+		.pm = &qcom_dload_pm_ops,
 	},
 };
 
