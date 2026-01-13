@@ -11,6 +11,7 @@
 #include "safelinux_modules_trace.h"
 
 DECLARE_BITMAP(global_map, KGSL_PT_MEM_PAGES);
+static DEFINE_SPINLOCK(global_map_lock);
 
 #ifdef CONFIG_DMABUF_DEBUG
 /*
@@ -810,7 +811,9 @@ int clear_kgsl_map_iova(struct kiumd_ctx *kiumd_ctx, struct smmu_map_data *smap)
 
 	if (ptselect == KGSL_GLOBAL_PT) {
 		bit = (iova & ~KGSL_GLOBAL_PT_BASE_IOVA) >> PAGE_SHIFT;
+		spin_lock(&global_map_lock);
 		bitmap_clear(global_map, bit, size >> PAGE_SHIFT);
+		spin_unlock(&global_map_lock);
 	} else {
 		ret = free_allocated_iova(kiumd_ctx, iova, idx, true);
 		if (ret)
@@ -843,19 +846,22 @@ static u64 get_map_offset_global(u64 size)
 	}
 
 	size_in_pages = size >> PAGE_SHIFT;
+	spin_lock(&global_map_lock);
 	bit = bitmap_find_next_zero_area(map, KGSL_PT_MEM_PAGES,
 					 last_offset_global, size_in_pages, 0);
 	if (unlikely(bit >= KGSL_PT_MEM_PAGES)) {
 		//Reset from IOVA_ZERO
 		bit = bitmap_find_next_zero_area(map, KGSL_PT_MEM_PAGES,
 						 IOVA_ZERO, size_in_pages, 0);
-		if (unlikely(bit >= KGSL_PT_MEM_PAGES))
+		if (unlikely(bit >= KGSL_PT_MEM_PAGES)) {
+			spin_unlock(&global_map_lock);
 			return 0;
+		}
 	}
 
 	bitmap_set(map, bit, size_in_pages);
 	last_offset_global = (bit + size_in_pages) % KGSL_PT_MEM_PAGES;
-
+	spin_unlock(&global_map_lock);
 	iova = bit << PAGE_SHIFT;
 
 	/*
