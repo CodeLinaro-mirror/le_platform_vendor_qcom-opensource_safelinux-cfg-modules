@@ -473,8 +473,6 @@ static int kiumd_dmabuf_custom_iova_init(char __user *arg, struct file *fp)
 
 static void clean_map(struct kiumd_ctx *kiumd_ctx, struct smmu_map_data *smap)
 {
-	if (smap->is_kgsl_ctx)
-		(void)clear_kgsl_map_iova(kiumd_ctx, smap);
 
 	if (smap->is_iova_zero)
 		kiumd_dmabuf_zero_unmap(smap);
@@ -482,6 +480,10 @@ static void clean_map(struct kiumd_ctx *kiumd_ctx, struct smmu_map_data *smap)
 		kiumd_dmabuf_priv_unmap(smap);
 	else
 		kiumd_dmabuf_unmap(smap);
+
+	dma_buf_put(smap->dmabuf_ptr);
+	if (smap->is_kgsl_ctx)
+		(void)clear_kgsl_map_iova(kiumd_ctx, smap);
 }
 
 static int __kiumd_dmabuf_vfio_map(struct kiumd_ctx *kiumd_ctx,
@@ -608,18 +610,18 @@ static int __kiumd_dmabuf_vfio_unmap(struct kiumd_ctx *kiumd_ctx,
 			return -ENODEV;
 	}
 
-	if (smap->is_kgsl_ctx) {
-		ret = clear_kgsl_map_iova(kiumd_ctx, smap);
-		if (ret)
-			return -ENOENT;
-	}
-
 	if (smap->is_iova_zero)
 		kiumd_dmabuf_zero_unmap(smap);
 	else if (smap->is_priv_map)
 		kiumd_dmabuf_priv_unmap(smap);
 	else
 		kiumd_dmabuf_unmap(smap);
+
+	if (smap->is_kgsl_ctx) {
+		ret = clear_kgsl_map_iova(kiumd_ctx, smap);
+		if (ret)
+			return -ENOENT;
+	}
 
 	if (smap->is_kgsl_map || smap->is_fixed_map) {
 		iommu_dom = kiumd_iommu_get_dma_domain(smap->dev);
