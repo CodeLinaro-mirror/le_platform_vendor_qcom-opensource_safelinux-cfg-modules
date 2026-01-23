@@ -18,6 +18,7 @@
 #include "arm-smmu-qcom-fusa.h"
 
 #define FUSA_TCU_ERROR_INJECT_REGISTER	0x18
+#define FUSA_QTC_INTSTS_REGISTER	0x8
 
 #define FUSA_TCU500_NUM_ERR		0x4
 #define FUSA_TBU500_NUM_ERR		0x5
@@ -33,19 +34,28 @@
 #define FUSA_INTSTS_VA_ERR		0x8
 #define FUSA_INTSTS_PA_ERR		0x10
 
-#define FUSA_INTSTS_SPURIOUS		0x0
 #define FUSA_INTSTS_TBU_TCU_ERR_CLR	0x0
 
 #define FUSA_TBU500_OFFSET		0x4000
 
-#define FUSA_WARNING			0x0
-#define FUSA_ERROR			0x1
+#define FUSA_INTSTS_SPURIOUS		0x0
+#define FUSA_WARNING			0x1
+#define FUSA_ERROR			0x2
 
 #define BUFFER_SZ			64
 
+#define QSMMU_F_TBU500			BIT(1)
+#define QSMMU_F_QTB500			BIT(1) /* QTB500 uses same fault path as TBU500 */
+#define QSMMU_F_QTB600			BIT(2)
+
+struct qsmmu_fusa_match_data {
+	u32 offset;
+	u32 flags;
+};
+
 struct qcom_smmu_safety_fault {
 	char *fault_source;
-	u32 fault_code;
+	u64 fault_code;
 #ifdef CONFIG_DEBUG_FS
 	bool fault_src_ready;
 	bool fault_code_ready;
@@ -67,6 +77,7 @@ struct qsmmu_fusa {
 #ifdef CONFIG_DEBUG_FS
 	wait_queue_head_t wq;
 #endif
+	const struct qsmmu_fusa_match_data *md;
 };
 
 #ifdef CONFIG_DEBUG_FS
@@ -90,7 +101,7 @@ static ssize_t fault_code_read(struct file *filep, char __user *userbuf,
 	char buf[BUFFER_SZ];
 	u32 len;
 
-	len = scnprintf(buf, sizeof(buf), "0x%x\n", qsmmu_fusa->hw_fault.fault_code);
+	len = scnprintf(buf, sizeof(buf), "0x%llx\n", qsmmu_fusa->hw_fault.fault_code);
 
 	return simple_read_from_buffer(userbuf, count, ppos, buf, len);
 }
@@ -169,9 +180,9 @@ static void qcom_smmu_create_debug_dir(struct qsmmu_fusa *qsmmu_fusa)
 }
 #endif
 
-static int check_tcu_fault(u32 fisr, u32 num_clients, u8 *severity)
+static u64 check_tcu_fault(u64 fisr, u32 num_clients, u8 *severity)
 {
-	if ((fisr & GENMASK(num_clients + FUSA_TCU500_NUM_ERR, 0))) {
+	if ((fisr & GENMASK((num_clients + FUSA_TCU500_NUM_ERR) - 1, 0))) {
 		if (fisr == FUSA_INTSTS_TCU_SRAM_PARITY ||
 		    fisr == FUSA_INTSTS_TBU_SRAM_PARITY)
 			*severity = FUSA_WARNING;
@@ -185,9 +196,23 @@ static int check_tcu_fault(u32 fisr, u32 num_clients, u8 *severity)
 	return FUSA_INTSTS_SPURIOUS;
 }
 
-static int check_tbu_fault(u32 fisr, u8 *severity)
+static u64 check_qtc_fault(u64 fisr, u8 *severity)
 {
-	if ((fisr & GENMASK(FUSA_TBU500_NUM_ERR, 0))) {
+	if (fisr & GENMASK_ULL(34, 28)) {
+		*severity = FUSA_WARNING;
+		return fisr;
+	} else if (fisr & (GENMASK(27, 0) | BIT_ULL(35))) {
+		*severity = FUSA_ERROR;
+		return fisr;
+	}
+
+	*severity = FUSA_WARNING;
+	return FUSA_INTSTS_SPURIOUS;
+}
+
+static u32 check_tbu_fault(u32 fisr, u8 *severity)
+{
+	if ((fisr & GENMASK(FUSA_TBU500_NUM_ERR - 1, 0))) {
 		if (fisr == FUSA_INTSTS_WRBUF_WARN)
 			*severity = FUSA_WARNING;
 		else
@@ -206,27 +231,39 @@ static irqreturn_t qcom_smmu_tcu_fault(int irq, void *dev)
 	struct irq_desc *desc;
 	unsigned long flags;
 	u8 severity;
-	u32 fisr;
+	u64 fisr = 0;
 
-	fisr = readl(qsmmu_fusa->tcu_fusa_base);
-	writel(fisr, qsmmu_fusa->tcu_fusa_base);
+	if (qsmmu_fusa->md->flags == QSMMU_F_QTB600) {
+		fisr = readq(qsmmu_fusa->tcu_fusa_base + FUSA_QTC_INTSTS_REGISTER);
+		writeq(fisr, qsmmu_fusa->tcu_fusa_base + FUSA_QTC_INTSTS_REGISTER);
+	} else {
+		fisr = readl(qsmmu_fusa->tcu_fusa_base);
+		writel(fisr, qsmmu_fusa->tcu_fusa_base);
+	}
 
 	desc = irq_data_to_desc(irq_get_irq_data(irq));
 	if (unlikely(!desc))
 		return IRQ_NONE;
-
 	spin_lock_irqsave(&qsmmu_fusa->lock, flags);
 	scnprintf(qsmmu_fusa->hw_fault.fault_source, BUFFER_SZ, "%s",
 	          desc->action->name);
-	qsmmu_fusa->hw_fault.fault_code = check_tcu_fault(fisr, qsmmu_fusa->num_clients,
-	                                  &severity);
 #ifdef CONFIG_DEBUG_FS
 	qsmmu_fusa->hw_fault.fault_src_ready = true;
 	qsmmu_fusa->hw_fault.fault_code_ready = true;
 #endif
+
+	if (qsmmu_fusa->md->flags == QSMMU_F_QTB600)
+		qsmmu_fusa->hw_fault.fault_code = check_qtc_fault(fisr,
+								  &severity);
+	else
+		qsmmu_fusa->hw_fault.fault_code = check_tcu_fault(fisr,
+								  qsmmu_fusa->num_clients,
+								  &severity);
+
 	spin_unlock_irqrestore(&qsmmu_fusa->lock, flags);
 	trace_smmu_hwirq(dev_name(qsmmu_fusa->dev), qsmmu_fusa->hw_fault.fault_source,
-	                 qsmmu_fusa->hw_fault.fault_code, severity);
+			 qsmmu_fusa->hw_fault.fault_code, severity);
+
 #ifdef CONFIG_DEBUG_FS
 	wake_up_interruptible_all(&qsmmu_fusa->wq);
 #endif
@@ -249,6 +286,9 @@ static irqreturn_t qcom_smmu_client_fault(int irq, void *dev)
 		return IRQ_NONE;
 
 	client_name = strnstr(desc->action->name, "CLIENT", strlen(desc->action->name));
+	if (!client_name)
+		goto err;
+
 	ret = kstrtouint(client_name + strlen("CLIENT"), 0, &client_index);
 
 	if (ret)
@@ -293,7 +333,14 @@ static int qcom_smmu_hw_irq_setup(struct qsmmu_fusa *qsmmu_fusa)
 	int irq, i, ret;
 
 	num_irqs = platform_irq_count(pdev);
-	qsmmu_fusa->num_clients = num_irqs - 1;
+	// Note: Keeping this check until "qcom,num-clients"
+	//       DT property is mainlined for all Lemans/Monaco DTs
+	if (!qsmmu_fusa->num_clients)
+		qsmmu_fusa->num_clients = num_irqs - 1;
+	if (num_irqs < 1) {
+		dev_err(qsmmu_fusa->dev, "No H/W IRQs specified in DT. Exiting...\n");
+		return -EINVAL;
+	}
 
 	/* Register Fault Handler for TCU */
 	irq = platform_get_irq(pdev, 0);
@@ -367,6 +414,13 @@ static int qsmmu_fusa_probe(struct platform_device *pdev)
 	qsmmu_fusa->dev = dev;
 	qsmmu_fusa->smmu_name = dev_name(dev);
 
+	if (of_property_read_u32(np, "qcom,num_clients", &qsmmu_fusa->num_clients)) {
+		// Note: Not making mandatory until "qcom,num-clients"
+		//       DT property is mainlined for all Lemans/Monaco DTs
+		dev_notice(dev, "missing mandatory \"qcom,num_clients\" property\n");
+		//return -EINVAL;
+	}
+
 	tcu_res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!tcu_res)
 		return -ENODEV;
@@ -375,31 +429,39 @@ static int qsmmu_fusa_probe(struct platform_device *pdev)
 	qsmmu_fusa->tcu_fusa_base = devm_ioremap(dev, tcu_res->start, tcu_sz);
 	if (!qsmmu_fusa->tcu_fusa_base) {
 		dev_err(dev, "Can't map SMMU FUSA @%pa\n", &tcu_res->start);
-		return PTR_ERR(qsmmu_fusa->tcu_fusa_base);
+		return -ENOMEM;
 	}
 
-	if (!of_property_read_u32(np, "qcom,client_offset",
-	                          &qsmmu_fusa->client_offset)) {
-		ret = of_address_to_resource(np, 1, &client_res);
+	qsmmu_fusa->md = of_device_get_match_data(&pdev->dev);
+	if (!qsmmu_fusa->md)
+		return -ENODEV;
 
-		if (ret) {
-			dev_err(dev, "Failed to parse client fusa memory region\n");
-			return ret;
+	if (qsmmu_fusa->md->flags == QSMMU_F_TBU500) {
+		if (!of_property_read_u32(np, "qcom,client_offset",
+					  &qsmmu_fusa->client_offset)) {
+			ret = of_address_to_resource(np, 1, &client_res);
+
+			if (ret) {
+				dev_err(dev, "Failed to parse client fusa memory region\n");
+				return ret;
+			}
+
+			qsmmu_fusa->client_fusa_sz = resource_size(&client_res);
+			qsmmu_fusa->client_fusa_base = devm_ioremap(qsmmu_fusa->dev,
+								    client_res.start,
+								    qsmmu_fusa->client_fusa_sz);
+
+			if (!qsmmu_fusa->client_fusa_base)
+				return -ENOMEM;
 		}
-
-		qsmmu_fusa->client_fusa_sz = resource_size(&client_res);
-		qsmmu_fusa->client_fusa_base = devm_ioremap(qsmmu_fusa->dev,
-		                               client_res.start,
-		                               qsmmu_fusa->client_fusa_sz);
-
-		if (!qsmmu_fusa->client_fusa_base)
-			return -ENOMEM;
-
-		qsmmu_fusa->client_fusa_reg = (u32)(uintptr_t)of_device_get_match_data(dev);
 	}
+
+	qsmmu_fusa->client_fusa_reg = qsmmu_fusa->md->offset;
+
+	platform_set_drvdata(pdev, qsmmu_fusa);
 
 	qsmmu_fusa->hw_fault.fault_source = devm_kzalloc(qsmmu_fusa->dev,
-	                                    PAGE_SIZE, GFP_KERNEL);
+							 BUFFER_SZ, GFP_KERNEL);
 
 	if (!qsmmu_fusa->hw_fault.fault_source)
 		return -ENOMEM;
@@ -407,10 +469,9 @@ static int qsmmu_fusa_probe(struct platform_device *pdev)
 	spin_lock_init(&qsmmu_fusa->lock);
 	ret = qcom_smmu_hw_irq_setup(qsmmu_fusa);
 #ifdef CONFIG_DEBUG_FS
-	qcom_smmu_create_debug_dir(qsmmu_fusa);
 	init_waitqueue_head(&qsmmu_fusa->wq);
+	qcom_smmu_create_debug_dir(qsmmu_fusa);
 #endif
-	platform_set_drvdata(pdev, qsmmu_fusa);
 
 	return ret;
 }
@@ -419,15 +480,41 @@ static void qsmmu_fusa_remove(struct platform_device *pdev)
 {
 #ifdef CONFIG_DEBUG_FS
 	struct qsmmu_fusa *qsmmu_fusa = platform_get_drvdata(pdev);
+	char file_name[BUFFER_SZ];
 
-	debugfs_remove_recursive(qsmmu_fusa->qcom_smmu_dir);
+	if (IS_ERR_OR_NULL(qsmmu_fusa->qcom_smmu_dir))
+		return;
+
+	scnprintf(file_name, sizeof(file_name), "%s.qcom_smmu_fault_src",
+						qsmmu_fusa->smmu_name);
+	debugfs_lookup_and_remove(file_name, qsmmu_fusa->qcom_smmu_dir);
+	scnprintf(file_name, sizeof(file_name), "%s.qcom_smmu_fault_code",
+						qsmmu_fusa->smmu_name);
+	debugfs_lookup_and_remove(file_name, qsmmu_fusa->qcom_smmu_dir);
+
 	qsmmu_fusa->qcom_smmu_dir = NULL;
 #endif
 }
 
+static const struct qsmmu_fusa_match_data md_qsmmu_tbu500 = {
+	.offset = FUSA_TBU500_OFFSET,
+	.flags  = QSMMU_F_TBU500,
+};
+
+static const struct qsmmu_fusa_match_data md_qsmmu_qtb500 = {
+	.offset = 0,
+	.flags  = QSMMU_F_QTB500,
+};
+
+static const struct qsmmu_fusa_match_data md_qsmmu_qtb600 = {
+	.offset = 0,
+	.flags  = QSMMU_F_QTB600,
+};
+
 static const struct of_device_id qsmmu_fusa_of_match[] = {
-	{.compatible = "qcom,smmu500-tbu-fusa", .data = (void *) FUSA_TBU500_OFFSET},
-	{.compatible = "qcom,smmu500-qtb-fusa"},
+	{.compatible = "qcom,tbu500-fusa", .data = &md_qsmmu_tbu500},
+	{.compatible = "qcom,qtb500-fusa", .data = &md_qsmmu_qtb500},
+	{.compatible = "qcom,qtb600-fusa", .data = &md_qsmmu_qtb600},
 	{}
 };
 
