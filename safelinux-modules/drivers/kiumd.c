@@ -516,6 +516,8 @@ static int kiumd_dmabuf_managed_iova_map(char __user *arg, struct file *fp)
 		return ret;
 	}
 
+	/* Need to review/remove this lock after cookie change removed */
+	mutex_lock(&kiumd_ctx->map_lock);
 	if (kiumd_ctx->max_shift) {
 		ret = init_and_allocate_iova(dev, kiumd_ctx, hash_id,
 					     kiumd_dmabuf->size,
@@ -523,6 +525,7 @@ static int kiumd_dmabuf_managed_iova_map(char __user *arg, struct file *fp)
 		if (ret) {
 			pr_err("%s: failed to allocate iova for: %s, ret: %d\n",
 			       __func__, dev_name(dev), ret);
+			mutex_unlock(&kiumd_ctx->map_lock);
 			return ret;
 		}
 	}
@@ -532,11 +535,13 @@ static int kiumd_dmabuf_managed_iova_map(char __user *arg, struct file *fp)
 		pr_err("%s:dmabufattach failed with error: %ld, for device: %s\n",
 		       __func__, PTR_ERR(dmabufattach), dev_name(dev));
 		ret = PTR_ERR(dmabufattach);
+		mutex_unlock(&kiumd_ctx->map_lock);
 		goto fail_put;
 	}
 
 	if (IS_ERR_OR_NULL(dmabufattach->dmabuf)) {
 		pr_err("%s:dmabuf is NULL\n", __func__);
+		mutex_unlock(&kiumd_ctx->map_lock);
 		return -EINVAL;
 	}
 
@@ -544,6 +549,7 @@ static int kiumd_dmabuf_managed_iova_map(char __user *arg, struct file *fp)
 	    || (kiusr.dma_direction > DMA_NONE)) {
 		pr_err("%s:Invalid DMA direction: %d\n", __func__,
 			kiusr.dma_direction);
+		mutex_unlock(&kiumd_ctx->map_lock);
 		ret = -EINVAL;
 		goto fail_detach;
 	}
@@ -558,9 +564,10 @@ static int kiumd_dmabuf_managed_iova_map(char __user *arg, struct file *fp)
 		pr_err("%s: mapping failed with error: %ld, for device: %s\n",
 		       __func__, PTR_ERR(sgt), dev_name(dev));
 		ret = (sgt == NULL ? -EINVAL : PTR_ERR(sgt));
+		mutex_unlock(&kiumd_ctx->map_lock);
 		goto fail_detach;
 	}
-
+	mutex_unlock(&kiumd_ctx->map_lock);
 	smap = kzalloc(sizeof(*smap), GFP_KERNEL);
 	if (!smap) {
 		ret = -ENOMEM;
@@ -629,7 +636,7 @@ static int kiumd_dmabuf_managed_iova_unmap(char __user *arg, struct file *fp)
 	}
 
 	spin_unlock(&kiumd_ctx->smmu_lock);
-
+	guard(mutex)(&kiumd_ctx->map_lock);
 	kiumd_dmabuf = smap->dmabuf_ptr;
 	if (!kiumd_dmabuf) {
 		pr_err("%s:kiumd_dmabuf is NULL\n", __func__);
@@ -1728,6 +1735,7 @@ static int kiumd_open(struct inode *inode, struct file *filp)
 	spin_lock_init(&kictx->pt_lock);
 	mutex_init(&kictx->resmem_lock);
 	mutex_init(&kictx->hyp_lock);
+	mutex_init(&kictx->map_lock);
 	filp->private_data = kictx;
 
 	return 0;
