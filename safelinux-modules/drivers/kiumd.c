@@ -742,17 +742,22 @@ int kiumd_dmabuf_managed_iova_map(char __user *arg, struct file *fp)
 	if (!smap)
 		return -ENOMEM;
 
+	/* Need to review/remove this lock after cookie change removed */
+	mutex_lock(&kiumd_ctx->map_lock);
 	if (!kiusr.is_iova_zero) {
 		ret = init_and_allocate_iova(dev, kiumd_ctx, smap,
 					     kiumd_ctx->max_shift, fixed_iova, kiusr.is_fix_map);
 		if (ret) {
 			pr_err("%s: failed to allocate iova for: %s, ret: %d\n",
 			       __func__, dev_name(dev), ret);
+			mutex_unlock(&kiumd_ctx->map_lock);
+			kfree(smap);
 			return ret;
 		}
 	}
 
 	ret = __kiumd_dmabuf_vfio_map(kiumd_ctx, kiusr, smap);
+	mutex_unlock(&kiumd_ctx->map_lock);
 	if (ret)
 		goto smap_free;
 
@@ -837,6 +842,7 @@ int kiumd_dmabuf_managed_iova_unmap(char __user *arg, struct file *fp)
 	if (!found)
 		return -ENOENT;
 
+	guard(mutex)(&kiumd_ctx->map_lock);
 	ret = __kiumd_dmabuf_vfio_unmap(kiumd_ctx, smap);
 	if (ret)
 		return ret;
@@ -1676,6 +1682,7 @@ static int kiumd_open(struct inode *inode, struct file *filp)
 	mutex_init(&kictx->resmem_lock);
 	mutex_init(&kictx->hyp_lock);
 	mutex_init(&kictx->managed_rbtree_lock);
+	mutex_init(&kictx->map_lock);
 	filp->private_data = kictx;
 
 	return 0;

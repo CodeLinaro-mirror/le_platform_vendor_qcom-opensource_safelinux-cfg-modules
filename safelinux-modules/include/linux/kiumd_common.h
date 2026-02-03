@@ -259,6 +259,7 @@ struct kiumd_ctx {
 	struct mutex hyp_lock;
 	struct mutex resmem_lock;
 	struct mutex managed_rbtree_lock;
+	struct mutex map_lock;
 	unsigned long pt_start_iova;
 	unsigned long pt_end_iova;
 	DECLARE_HASHTABLE(page_table, SMMU_MAPTABLE_SIZE);
