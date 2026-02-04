@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/kernel.h>
@@ -179,8 +180,6 @@ struct erp_drvdata {
 };
 
 static struct erp_drvdata *panic_handler_drvdata;
-
-static DEFINE_SPINLOCK(local_handler_lock);
 
 static void l1_l2_irq_enable(void *info)
 {
@@ -394,10 +393,8 @@ static bool kryo_check_l1_l2_ecc(void *info)
 	u64 errxstatus = 0;
 	u64 errxmisc = 0;
 	int cpu = 0;
-	unsigned long flags;
 	bool ret = EDAC_SPURIOUS;
 
-	spin_lock_irqsave(&local_handler_lock, flags);
 	write_errselr_el1(0);
 	errxstatus = read_errxstatus_el1();
 	cpu = smp_processor_id();
@@ -412,7 +409,6 @@ static bool kryo_check_l1_l2_ecc(void *info)
 				cpu);
 		clear_errxstatus_valid(errxstatus);
 	}
-	spin_unlock_irqrestore(&local_handler_lock, flags);
 
 	return ret;
 }
@@ -431,10 +427,8 @@ static bool kryo_check_l3_scu_error(struct edac_device_ctl_info *edev_ctl)
 {
 	u64 errxstatus = 0;
 	u64 errxmisc = 0;
-	unsigned long flags;
 	bool ret = EDAC_SPURIOUS;
 
-	spin_lock_irqsave(&local_handler_lock, flags);
 	write_errselr_el1(1);
 	errxstatus = read_errxstatus_el1();
 	errxmisc = read_errxmisc_el1();
@@ -443,7 +437,6 @@ static bool kryo_check_l3_scu_error(struct edac_device_ctl_info *edev_ctl)
 		KRYO_ERRXMISC_LVL(errxmisc) == L3_BIT) {
 		if (l3_is_bus_error(errxstatus)) {
 			if (edev_ctl->panic_on_ue) {
-				spin_unlock_irqrestore(&local_handler_lock, flags);
 				panic("Causing panic due to Bus Error\n");
 			}
 			goto unlock;
@@ -461,7 +454,6 @@ static bool kryo_check_l3_scu_error(struct edac_device_ctl_info *edev_ctl)
 		clear_errxstatus_valid(errxstatus);
 	}
 unlock:
-	spin_unlock_irqrestore(&local_handler_lock, flags);
 	return ret;
 }
 
