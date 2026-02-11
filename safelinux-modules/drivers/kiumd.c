@@ -3058,7 +3058,7 @@ int kiumd_fd_dmabuf_handler(char __user *arg, struct file *fp)
 			if (!IS_ERR_OR_NULL(kiumd_dmabuf))
 				dma_buf_put(kiumd_dmabuf);
 			xa_erase(&kiumd_ctx->kiumd_xa, local_id);
-			if (!dmabuf_handle) {
+			if (dmabuf_handle) {
 				kfree(dmabuf_handle);
 				dmabuf_handle = NULL;
 			}
