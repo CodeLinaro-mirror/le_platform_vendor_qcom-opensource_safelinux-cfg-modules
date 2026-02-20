@@ -240,7 +240,7 @@ static irqreturn_t pinctrl_fusa_irq(int irq, void *data)
 	return ret;
 }
 
-#if IS_ENABLED(CONFIG_PINCTRL_SA8797P)
+#ifdef TLMM_FUSA_BOOT_INJECTION
 /* Boot-time TLMM FUSA Parity Error Validation */
 static void tlmm_fusa_validate_parity_errors(struct tlmm_fusa *pinctrl_fusa)
 {
@@ -343,7 +343,7 @@ static int tlmm_fusa_probe(struct platform_device *pdev)
 		return pinctrl_fusa->irq;
 	}
 
-#if IS_ENABLED(CONFIG_PINCTRL_SA8797P)
+#ifdef TLMM_FUSA_BOOT_INJECTION
 	tlmm_fusa_validate_parity_errors(pinctrl_fusa);
 #endif
 	ret = devm_request_irq(dev, pinctrl_fusa->irq, pinctrl_fusa_irq,
