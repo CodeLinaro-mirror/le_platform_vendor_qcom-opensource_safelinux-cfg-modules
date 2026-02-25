@@ -667,7 +667,7 @@ struct arm_smmu_domain *kiumd_get_smmu_domain(int vfio_fd)
 
 struct pgtable_map *kiumd_get_pgtable_entry(struct kiumd_ctx *kiumd_ctx, unsigned long idx, bool is_process)
 {
-	struct pgtable_map *pgtble_ctx;
+	struct pgtable_map *pgtble_ctx = NULL;
 	struct kiumd_kgsl_context *kgsl_context;
 	bool found = false;
 
@@ -2202,7 +2202,7 @@ int kiumd_dmabuf_managed_iova_map(char __user *arg, struct file *fp)
 	struct dma_buf *kiumd_dmabuf;
 	struct kiumd_ctx *kiumd_ctx;
 	struct smmu_map_data *smap;
-	unsigned long fixed_iova;
+	unsigned long fixed_iova = 0;
 	struct kiumd_user kiusr;
 	struct sg_table *sgt;
 	u64 size;
