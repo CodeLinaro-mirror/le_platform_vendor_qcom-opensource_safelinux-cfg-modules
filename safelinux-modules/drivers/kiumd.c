@@ -1772,6 +1772,9 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 					}
 				}
 
+				if (ki_ctx->pgtable_ctx && !smap->is_iova_zero && smap->iova_rb)
+					free_iova_range(ki_ctx->pgtable_ctx, smap->iova_rb);
+
 				dma_buf_detach(kiumd_dmabuf,
 						(struct dma_buf_attachment *)smap->dmabufattach);
 				dma_buf_put(kiumd_dmabuf);
@@ -1783,6 +1786,7 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 		}
 	}
 
+	kfree(ki_ctx->pgtable_ctx);
 	kfree(ki_ctx->res_mem_area);
 	kfree(ki_ctx);
 

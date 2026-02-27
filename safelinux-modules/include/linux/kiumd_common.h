@@ -414,6 +414,6 @@ int kiumd_set_dma_cookie(struct kiumd_iommu_dma_cookie *cookie,
 			 enum iommu_dma_cookie_type type,
 			 dma_addr_t iova);
 int set_allocated_iova(struct device *dev, unsigned long iova);
-
+int free_iova_range(struct pgtable_map *map, unsigned long iova);
 
 #endif /* __KIUMD_COMMON_H__ */

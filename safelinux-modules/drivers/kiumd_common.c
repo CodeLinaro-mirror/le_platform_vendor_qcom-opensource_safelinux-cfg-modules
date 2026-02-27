@@ -225,7 +225,7 @@ static void free_iommu_addr_entry(struct iommu_addr_entry *entry)
 	kmem_cache_free(iommu_addr_cache, entry);
 }
 
-static int free_iova_range(struct pgtable_map *map, unsigned long iova)
+int free_iova_range(struct pgtable_map *map, unsigned long iova)
 {
 	struct rb_node *node = map->rbtree.rb_node;
 	struct iommu_addr_entry *entry;
