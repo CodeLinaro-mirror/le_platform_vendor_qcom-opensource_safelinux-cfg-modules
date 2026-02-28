@@ -188,41 +188,26 @@ struct arm_smmu_domain *kiumd_get_smmu_domain(struct device *dev)
  * Return: Pointer to the found pagetable entry, or NULL if not found.
  */
 struct pgtable_map *kiumd_get_pgtable_entry(struct kiumd_ctx *kiumd_ctx,
-					    unsigned long idx, bool is_process)
+					    unsigned long idx)
 {
 	struct kiumd_kgsl_context *kgsl_context;
 	struct pgtable_map *pgtble_ctx;
 	bool found = false;
 
-	if (is_process) {
-		kgsl_context = kiumd_ctx->kgsl_context;
-		spin_lock(&kgsl_context->kgsl_hash_lock);
-		hash_for_each_possible(kiumd_ctx->kgsl_page_table, pgtble_ctx, node, idx) {
-			if (pgtble_ctx->idx == idx) {
-				found = true;
-				break;
-			}
+	kgsl_context = kiumd_ctx->kgsl_context;
+	spin_lock(&kgsl_context->kgsl_hash_lock);
+	hash_for_each_possible(kiumd_ctx->kgsl_page_table, pgtble_ctx, node, idx) {
+		if (pgtble_ctx->idx == idx) {
+			found = true;
+			break;
 		}
+	}
 
-		spin_unlock(&kgsl_context->kgsl_hash_lock);
-		if (!found) {
-			pr_err("%s:%d id not found in hash table\n", __func__, __LINE__);
-			return NULL;
-		}
-	} else {
-		spin_lock(&kiumd_ctx->pt_lock);
-		hash_for_each_possible(kiumd_ctx->page_table, pgtble_ctx, node, idx) {
-			if (pgtble_ctx->idx == idx) {
-				found = true;
-				break;
-			}
-		}
-
-		spin_unlock(&kiumd_ctx->pt_lock);
-		if (!found) {
-			pr_err("%s:%d id not found in hash table\n", __func__, __LINE__);
-			return NULL;
-		}
+	spin_unlock(&kgsl_context->kgsl_hash_lock);
+	if (!found) {
+		pr_err("%s:%d wrong id:%lu passed by client to get enrty in hash map\n",
+			__func__, __LINE__, idx);
+		return NULL;
 	}
 
 	return pgtble_ctx;
@@ -269,22 +254,22 @@ static int free_iova_range(struct pgtable_map *map, unsigned long iova)
  * Parameters:
  * @kiumd_ctx: Pointer to the kiumd context
  * @iova: IOVA address to free
- * @idx: Index of the pagetable entry
  * @is_process: Flag indicating if the context is process-specific
  *
  * Return: 0 on success, -EINVAL if the pagetable entry is not found.
  */
-int free_allocated_iova(struct kiumd_ctx *kiumd_ctx, unsigned long iova,
-			unsigned long idx, bool is_process)
+int free_allocated_iova(struct kiumd_ctx *kiumd_ctx, unsigned long iova)
 {
 	struct pgtable_map *pgtble_ctx;
 
-	pgtble_ctx = kiumd_get_pgtable_entry(kiumd_ctx, idx, is_process);
+	pgtble_ctx = kiumd_ctx->pgtable_ctx;
 	if (!pgtble_ctx) {
-		pr_err("%s:invalid id for hash table: id: %lu\n", __func__, idx);
+		pr_err("%s:invalid pgtable context for iova: %lx\n",
+				__func__, iova);
 		return -EINVAL;
 	}
 
+	guard(mutex)(&pgtble_ctx->pgctx_lock);
 	return free_iova_range(pgtble_ctx, iova);
 }
 
@@ -412,54 +397,79 @@ static unsigned long align_iova(struct device *dev, unsigned long start_iova,
 	return start_iova;
 }
 
-static unsigned long alloc_iova_range(struct device *dev,
-				      struct pgtable_map *ptable_ctx,
-				      unsigned long size,
-				      unsigned long max_shift)
+
+/**
+ * alloc_iova_range - Allocate an IOVA range from the page table context
+ * @dev: Device requesting the IOVA
+ * @ptable_ctx: Page table context
+ * @smap: Mapping metadata
+ * @max_shift: Alignment shift
+ * @fixed_iova: Fixed IOVA address (if applicable)
+ * @is_fix_map: Whether fixed mapping is requested
+ *
+ * Returns allocated IOVA address on success or negative error code.
+ */
+unsigned long alloc_iova_range(struct device *dev, struct pgtable_map *ptable_ctx,
+			       struct smmu_map_data *smap, unsigned long max_shift,
+			       unsigned long fixed_iova, bool is_fix_map)
 {
-	struct rb_node *node = rb_first(&ptable_ctx->rbtree);
-	unsigned long start_iova = ptable_ctx->start_iova;
 	struct iommu_addr_entry *new_entry;
 	struct iommu_addr_entry *entry;
+	unsigned long result = 0;
+	unsigned long start_iova;
+	size_t size = smap->size;
+	struct rb_node *node;
 
-	start_iova = align_iova(dev, start_iova, size, max_shift);
+	guard(mutex)(&ptable_ctx->pgctx_lock);
+	/* fix allocation path */
+	if (is_fix_map) {
+		start_iova = fixed_iova;
+		if (start_iova + size > ptable_ctx->end_iova)
+			return result;
+		node = rb_first(&ptable_ctx->rbtree);
+		while (node) {
+			entry = rb_entry(node, struct iommu_addr_entry, rbnode);
+			if ((start_iova < entry->base_addr + entry->size) &&
+							(start_iova + size > entry->base_addr)) {
+				return result;
+			}
+			node = rb_next(node);
+		}
+		goto dynamic_alloc;
+	}
+
+	/* Dynamic allocation path */
+	start_iova = align_iova(dev, ptable_ctx->start_iova, size, max_shift);
 	if (start_iova == ULONG_MAX)
-		return 0;
-
+		return result;
+	node = rb_first(&ptable_ctx->rbtree);
 	while (node) {
 		entry = rb_entry(node, struct iommu_addr_entry, rbnode);
-
-		if (start_iova + size < entry->base_addr) {
-			if (start_iova + size <= ptable_ctx->end_iova) {
-				new_entry = alloc_iommu_addr_entry(start_iova, size);
-
-				if (!new_entry)
-					return 0;
-
-				insert_iova(ptable_ctx, new_entry);
-				return start_iova;
-			}
-
-			return 0;
+		if (start_iova + size <= entry->base_addr &&
+						start_iova + size <= ptable_ctx->end_iova) {
+			goto dynamic_alloc;
 		}
 
 		start_iova = entry->base_addr + entry->size;
 		start_iova = align_iova(dev, start_iova, size, max_shift);
 		if (start_iova == ULONG_MAX)
-			return 0;
+			return result;
 		node = rb_next(node);
 	}
 
-	if (start_iova + size <= ptable_ctx->end_iova) {
-		new_entry = alloc_iommu_addr_entry(start_iova, size);
-		if (!new_entry)
-			return 0;
+	if (start_iova + size > ptable_ctx->end_iova)
+		return result;
 
-		insert_iova(ptable_ctx, new_entry);
-		return start_iova;
-	}
+dynamic_alloc:
+	new_entry = alloc_iommu_addr_entry(start_iova, size);
+	if (!new_entry)
+		return result;
 
-	return 0;
+	if (insert_iova(ptable_ctx, new_entry) != 0)
+		return result;
+
+	result = start_iova;
+	return result;
 }
 
 /**
@@ -800,8 +810,9 @@ int kiumd_set_dma_addr_ranges(struct kiumd_ctx *kiumd_ctx, struct device *dev)
  */
 int clear_kgsl_map_iova(struct kiumd_ctx *kiumd_ctx, struct smmu_map_data *smap)
 {
-	int ret, idx, ptselect;
 	u64 bit, size, iova;
+	int ret, ptselect, idx;
+	struct pgtable_map *pgtble_ctx;
 
 	size = smap->size;
 	iova = smap->kgsl_ctx.iova;
@@ -812,10 +823,18 @@ int clear_kgsl_map_iova(struct kiumd_ctx *kiumd_ctx, struct smmu_map_data *smap)
 		bit = (iova & ~KGSL_GLOBAL_PT_BASE_IOVA) >> PAGE_SHIFT;
 		bitmap_clear(global_map, bit, size >> PAGE_SHIFT);
 	} else {
-		ret = free_allocated_iova(kiumd_ctx, iova, idx, true);
-		if (ret)
-			pr_err("%s:%d unable to free iova\n",
-			       __func__, __LINE__);
+		pgtble_ctx = kiumd_get_pgtable_entry(kiumd_ctx, idx);
+		if (!pgtble_ctx) {
+			pr_err("%s:invalid id for hash table: id: %d\n", __func__, idx);
+			return -EINVAL;
+		}
+
+
+		ret = free_iova_range(pgtble_ctx, iova);
+		if (ret) {
+			pr_err("%s:%d unable to free iova\n", __func__, __LINE__);
+			return ret;
+		}
 	}
 
 	return 0;
@@ -977,7 +996,7 @@ static uint64_t get_pgtble_and_alloc_iova(struct device *dev,
 	struct pgtable_map *pgtble_ctx;
 	uint64_t addr;
 
-	pgtble_ctx = kiumd_get_pgtable_entry(kiumd_ctx, idx, true);
+	pgtble_ctx = kiumd_get_pgtable_entry(kiumd_ctx, idx);
 	if (!pgtble_ctx) {
 		pr_err("%s:%d Invalid id for hash table: id: %d\n", __func__,
 			__LINE__, idx);
@@ -1039,59 +1058,71 @@ int set_kgsl_map_iova(struct kiumd_ctx *kiumd_ctx, struct kiumd_user kiusr,
 	return 0;
 }
 
-int init_and_allocate_iova(struct device *dev, struct kiumd_ctx *kiumd_ctx,
-			   unsigned long idx, unsigned int size,
-			   unsigned long max_shift)
-{
-	struct pgtable_map *pgtable_ctx;
-	unsigned long iova;
-	int ret;
-
-	if (!kiumd_ctx->is_initialized) {
-
-		pgtable_ctx = kzalloc(sizeof(*pgtable_ctx), GFP_KERNEL);
-		if (!pgtable_ctx)
-			return -ENOMEM;
-
-		pgtable_ctx->rbtree = RB_ROOT;
-		pgtable_ctx->idx = idx;
-		pgtable_ctx->start_iova = kiumd_ctx->pt_start_iova;
-		pgtable_ctx->end_iova = kiumd_ctx->pt_end_iova;
-
-		spin_lock(&kiumd_ctx->pt_lock);
-		hash_add(kiumd_ctx->page_table, &pgtable_ctx->node, idx);
-		spin_unlock(&kiumd_ctx->pt_lock);
-
-		kiumd_ctx->is_initialized = true;
-	} else {
-		pgtable_ctx = kiumd_get_pgtable_entry(kiumd_ctx, idx, false);
-		if (!pgtable_ctx) {
-			pr_err("%s: Failed to find pgtable_map for device: %lu\n", __func__, idx);
-			return -EINVAL;
-		}
-	}
-
-	iova = alloc_iova_range(dev, pgtable_ctx, size, max_shift);
-	if (!iova) {
-		pr_err("%s: Failed to allocate iova.\n", __func__);
-		return -ENOMEM;
-	}
-
-	ret = kiumd_configure_dma_cookie(dev, IOMMU_DMA_MSI_COOKIE, iova);
-	if (ret < 0) {
-		pr_err("%s: Failed to set the iova.\n", __func__);
-		return -ENOMEM;
-	}
-
-	return 0;
-}
-
 void add_to_smmu_table(struct kiumd_ctx *ctx, struct smmu_map_data *map_data)
 {
 	spin_lock(&ctx->smmu_lock);
 	map_data->id = ctx->id++;
 	hash_add(ctx->smmu_table, &map_data->node, map_data->id);
 	spin_unlock(&ctx->smmu_lock);
+}
+
+int set_allocated_iova(struct device *dev, unsigned long iova)
+{
+	struct kiumd_iommu_dma_cookie *cookie;
+	int ret;
+
+	cookie = kiumd_get_dma_cookie(dev);
+	if (!cookie) {
+		pr_err("%s failed to get cookie\n", __func__);
+		return -EINVAL;
+	}
+
+	ret = kiumd_set_dma_cookie_unlocked(cookie, IOMMU_DMA_MSI_COOKIE, iova);
+	if (ret)
+		pr_err("%s failed to set cookie\n", __func__);
+
+	return ret;
+}
+
+
+int init_and_allocate_iova(struct device *dev, struct kiumd_ctx *kiumd_ctx,
+			   struct smmu_map_data *smap, unsigned long max_shift,
+			   unsigned long fixed_iova, bool is_fixed_map)
+
+{
+	unsigned long iova;
+	int ret;
+
+	if (!kiumd_ctx->pgtable_ctx) {
+		guard(mutex)(&kiumd_ctx->managed_rbtree_lock);
+		if (!kiumd_ctx->pgtable_ctx) {
+			kiumd_ctx->pgtable_ctx = kzalloc(sizeof(struct pgtable_map), GFP_KERNEL);
+			if (!kiumd_ctx->pgtable_ctx)
+				return -ENOMEM;
+
+			kiumd_ctx->pgtable_ctx->rbtree = RB_ROOT;
+			kiumd_ctx->pgtable_ctx->start_iova = kiumd_ctx->pt_start_iova;
+			kiumd_ctx->pgtable_ctx->end_iova = kiumd_ctx->pt_end_iova;
+			mutex_init(&kiumd_ctx->pgtable_ctx->pgctx_lock);
+		}
+	}
+
+	iova = alloc_iova_range(dev, kiumd_ctx->pgtable_ctx, smap,
+				max_shift, fixed_iova, is_fixed_map);
+	if (!iova) {
+		pr_err("%s: Failed to allocate iova.\n", __func__);
+		return -ENOMEM;
+	}
+
+	smap->iova_rb  = iova;
+	ret = kiumd_configure_dma_cookie(dev, IOMMU_DMA_MSI_COOKIE, iova);
+	if (ret < 0) {
+		pr_err("%s: Failed to set the iova.\n", __func__);
+		free_allocated_iova(kiumd_ctx, iova);
+		return -ENOMEM;
+	}
+
+	return 0;
 }
 
 u64 kiumd_get_dmabuf_size(int dmabuf_fd)
@@ -1172,6 +1203,7 @@ static int kiumd_iommu_zero_map(struct smmu_map_data *smap)
 	kiumd_mangle_sg_table(smap->sgt_ptr);
 	mapped_size = iommu_map_sg(iommu_dom, IOVA_ZERO, smap->sgt_ptr->sgl,
 				   smap->sgt_ptr->orig_nents, prot, GFP_ATOMIC);
+
 	if (smap->size != mapped_size) {
 		dev_err(smap->dev, "%s:iommu_map_sg failed\n", __func__);
 		return -EFAULT;
@@ -1186,14 +1218,14 @@ int kiumd_dmabuf_zero_map(struct smmu_map_data *smap)
 	struct sg_table *sgt;
 	int ret;
 
-	dmabufattach = dma_buf_attach(smap->dmabuf_ptr, smap->dev);
+	dmabufattach = dma_buf_attach(smap->dmabuf_ptr, smap->staging_dev);
 	if (IS_ERR(dmabufattach)) {
 		dev_err(smap->dev, "%s:attach failed error:%ld\n",
 			__func__, PTR_ERR(dmabufattach));
 		return PTR_ERR(dmabufattach);
 	}
-	smap->dmabufattach = dmabufattach;
 
+	smap->dmabufattach = dmabufattach;
 	sgt = dma_buf_map_attachment_unlocked(dmabufattach, smap->dma_dir);
 	if (IS_ERR(sgt)) {
 		dev_err(smap->dev, "%s:map failed error:%ld\n",
@@ -1201,8 +1233,8 @@ int kiumd_dmabuf_zero_map(struct smmu_map_data *smap)
 		ret = PTR_ERR(sgt);
 		goto fail_attach;
 	}
-	smap->sgt_ptr = sgt;
 
+	smap->sgt_ptr = sgt;
 	/*
 	 * For mapping at 0x0 we create a mapping using
 	 * dma_buf_map_attachment_unlocked and then take the sg list
@@ -1295,19 +1327,15 @@ void kiumd_dmabuf_zero_unmap(struct smmu_map_data *smap)
 	struct iommu_domain *iommu_dom;
 	u64 unmapped_size;
 
-	dma_buf_unmap_attachment_unlocked(smap->dmabufattach, smap->sgt_ptr,
-					  smap->dma_dir);
-
 	iommu_dom = kiumd_iommu_get_dma_domain(smap->dev);
 	if (!iommu_dom)
 		return;
-
 	unmapped_size = iommu_unmap(iommu_dom, IOVA_ZERO, smap->size);
 	if (unmapped_size != smap->size) {
 		dev_err(smap->dev, "%s:iommu_unmap unmapped %llu\n",
 			__func__, unmapped_size);
 	}
-
+	//pr_err("%s, device: %s, zero unmap done\n", __func__, smap->dev->kobj.name);
 	dma_buf_detach(smap->dmabuf_ptr, smap->dmabufattach);
 	dma_buf_put(smap->dmabuf_ptr);
 }
@@ -1491,6 +1519,7 @@ int kiumd_hyp_unassign_sg(struct sg_table *sgt, int *source_vm_list,
 		sg = sg_next(sg);
 	} while (sg);
 
+	sg = sgt->sgl;
 	if (clear_page_private)
 		for_each_sg(sgt->sgl, sg, sgt->nents, i) {
 			if (sg)

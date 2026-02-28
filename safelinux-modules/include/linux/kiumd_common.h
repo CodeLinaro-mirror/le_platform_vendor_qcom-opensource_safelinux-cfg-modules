@@ -218,6 +218,7 @@ struct pgtable_map {
 	unsigned long end_iova;
 	struct rb_root rbtree;
 	struct hlist_node node;
+	struct mutex pgctx_lock;
 //Used only by GPU
 	unsigned long ttbr0_addr;
 	unsigned long pgtbl_ops_ptr;
@@ -242,6 +243,7 @@ struct pgtable_map {
 
 struct kiumd_ctx {
 	int id;
+	struct device *staging_dev;
 	u32 pt_id;
 	bool is_initialized;
 	struct hlist_node smmu_map_data;
@@ -256,6 +258,8 @@ struct kiumd_ctx {
 	int num_reserved_regions;
 	struct mutex hyp_lock;
 	struct mutex resmem_lock;
+	struct mutex managed_rbtree_lock;
+	struct mutex map_lock;
 	unsigned long pt_start_iova;
 	unsigned long pt_end_iova;
 	DECLARE_HASHTABLE(page_table, SMMU_MAPTABLE_SIZE);
@@ -263,6 +267,7 @@ struct kiumd_ctx {
 	struct kiumd_kgsl_context *kgsl_context;
 	unsigned long max_shift;
 	struct io_pgtable *pgtable;
+	struct pgtable_map *pgtable_ctx;
 };
 
 struct iommu_addr_entry {
@@ -291,7 +296,9 @@ struct smmu_map_data {
 	bool is_priv_map;
 	bool is_fixed_map;
 	struct device *dev;
+	struct device *staging_dev;
 	u64 size;
+	unsigned long iova_rb;
 	bool is_kgsl_map;
 	bool is_kgsl_ctx;
 	struct kiumd_smmu_kgsl_ctx kgsl_ctx;
@@ -325,7 +332,7 @@ int kiumd_set_pgtble_ttbr0_context(struct iommu_domain *iommu_dom,
 int kiumd_set_pgtble_ttbr1_context(struct iommu_domain *iommu_dom);
 
 struct pgtable_map *kiumd_get_pgtable_entry(struct kiumd_ctx *kiumd_ctx,
-					    unsigned long idx, bool is_process);
+					    unsigned long idx);
 
 bool check_pgtable_context(struct device *dev, struct pgtable_map *pgtable_ctx);
 
@@ -343,8 +350,12 @@ int set_kgsl_map_iova(struct kiumd_ctx *kiumd_ctx, struct kiumd_user kiusr,
 unsigned long get_hash_key(struct device *dev);
 
 int init_and_allocate_iova(struct device *dev, struct kiumd_ctx *kiumd_ctx,
-			   unsigned long idx, unsigned int size,
-			   unsigned long max_shift);
+			   struct smmu_map_data *smap, unsigned long max_shift,
+			   unsigned long fixed_iova, bool is_fixed_map);
+
+unsigned long alloc_iova_range(struct device *dev, struct pgtable_map *ptable_ctx,
+			       struct smmu_map_data *smap, unsigned long max_shift,
+			       unsigned long fixed_iova, bool is_fix_map);
 
 void add_to_smmu_table(struct kiumd_ctx *ctx, struct smmu_map_data *map_data);
 
@@ -367,15 +378,13 @@ void kiumd_dmabuf_priv_unmap(struct smmu_map_data *smap);
 
 void kiumd_dmabuf_unmap(struct smmu_map_data *smap);
 
-int free_allocated_iova(struct kiumd_ctx *kiumd_ctx, unsigned long iova,
-			unsigned long idx, bool is_process);
+int free_allocated_iova(struct kiumd_ctx *kiumd_ctx, unsigned long iova);
 
 int kiumd_configure_dma_cookie(struct device *dev,
 			       enum iommu_dma_cookie_type cookie_type,
 			       dma_addr_t dma_addr);
 
 bool check_ptselect(struct kiumd_user *kiusr);
-
 struct kiumd_iommu_dma_cookie *kiumd_get_dma_cookie(struct device *dev);
 
 int kiumd_set_dma_cookie_unlocked(struct kiumd_iommu_dma_cookie *cookie,
@@ -404,5 +413,7 @@ int kiumd_io_pgtable_hyp_unassign_page(u32 *vmid, u64 page, u32 nr_acl_entries);
 int kiumd_set_dma_cookie(struct kiumd_iommu_dma_cookie *cookie,
 			 enum iommu_dma_cookie_type type,
 			 dma_addr_t iova);
+int set_allocated_iova(struct device *dev, unsigned long iova);
+
 
 #endif /* __KIUMD_COMMON_H__ */
