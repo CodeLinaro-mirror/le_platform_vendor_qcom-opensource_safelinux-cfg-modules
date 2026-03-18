@@ -1,0 +1,30 @@
+#!/usr/bin/make -f
+%:
+	dh $@
+
+export KDIR := /usr/src/kernel
+export KERNEL_SRC := /usr/src/kernel
+export M := $(CURDIR)/safelinux-modules
+
+override_dh_auto_build:
+	make -C safelinux-modules modules
+
+override_dh_auto_install:
+	dh_auto_install --destdir=$(CURDIR)/debian/tmp
+	make -C safelinux-modules KDIR=${KDIR} INSTALL_MOD_PATH=$(CURDIR)/debian/tmp modules_install
+	mkdir -p "$(CURDIR)/debian/tmp/usr/include/linux/"
+	mkdir -p "$(CURDIR)/debian/tmp/usr/include/uapi/misc/"
+	mkdir -p "$(CURDIR)/debian/tmp/usr/lib/modules-load.d/"
+	cp safelinux-modules/include/linux/*.h $(CURDIR)/debian/tmp/usr/include/linux/
+	cp safelinux-modules/include/uapi/misc/qcom_vdev.h $(CURDIR)/debian/tmp/usr/include/linux/
+	cp safelinux-modules/include/uapi/misc/iommu_iova_map_user.h $(CURDIR)/debian/tmp/usr/include/uapi/misc/
+	cp safelinux-modules/include/uapi/misc/kiumd.h $(CURDIR)/debian/tmp/usr/include/uapi/misc/
+	cp safelinux-modules/include/uapi/misc/dmabuf_share.h $(CURDIR)/debian/tmp/usr/include/uapi/misc/
+	cp safelinux-modules/include/uapi/misc/scm_user_intf.h $(CURDIR)/debian/tmp/usr/include/uapi/misc/
+	cp safelinux-modules/include/uapi/misc/qcom_uscmi.h $(CURDIR)/debian/tmp/usr/include/uapi/misc/
+	cp safelinux-modules/include/uapi/misc/vendor_uscmi.h $(CURDIR)/debian/tmp/usr/include/uapi/misc/
+	cp safelinux-modules/include/uapi/misc/qcom_l3_cache_config.h $(CURDIR)/debian/tmp/usr/include/uapi/misc/
+	cp umd_load_sa8797.conf $(CURDIR)/debian/tmp/usr/lib/modules-load.d/umd_load.conf
+
+.PHONY: clean
+clean:

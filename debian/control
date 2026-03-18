@@ -1,0 +1,20 @@
+Source: safelinux-cfg-modules
+Section: devel
+Priority: optional
+Maintainer: leiwang <leiwan@qti.qualcomm.com>
+Build-Depends: debhelper-compat (= 13), linux-qcom-source
+Standards-Version: 4.6.0
+Homepage: 
+
+Package: safelinux-cfg-modules
+Architecture: arm64
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: QCOM OOT UMD related kernel modules
+
+Package: safelinux-cfg-modules-dev
+Section: libdevel
+Architecture: any
+Depends:
+ safelinux-cfg-modules (= ${binary:Version}),
+ ${misc:Depends}
+Description: safelinux-cfg-modules - development files

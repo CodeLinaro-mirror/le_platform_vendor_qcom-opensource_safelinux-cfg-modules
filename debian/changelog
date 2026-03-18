@@ -1,0 +1,5 @@
+safelinux-cfg-modules (1.0.0) noble; urgency=medium
+
+  * Converted from RPM spec file.
+
+ -- leiwang <leiwan@qti.qualcomm.com>  Wed, 18 Mar 2026 07:55:31 +0000
