@@ -36,6 +36,16 @@ struct irq_context {
 	char *irq_name;
 };
 
+struct kgsl_fault_info {
+	u32 fsr;
+	spinlock_t lock;
+	unsigned long fault_count;
+	unsigned long pgtable_id;
+	unsigned long iova;
+	struct device_attribute attr_info;
+	struct kernfs_node *fs_node;
+};
+
 struct umd_kgsl_data {
 	struct resource *resources;
 	int num_regs;
@@ -45,6 +55,7 @@ struct umd_kgsl_data {
 	struct kiumd_ctx *kiumdctx;
 	struct irq_context *irq_ctx;
 	int num_irqs;
+	struct kgsl_fault_info *fault_info;
 };
 
 static struct kmem_cache *kgsl_addr_cache;
@@ -1106,6 +1117,129 @@ static int umd_kgsl_mmap(struct file *filp, struct vm_area_struct *vma)
 	return 0;
 }
 
+static ssize_t fault_info_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct kgsl_fault_info *fault_info;
+	unsigned long irq_flags;
+	unsigned long fault_count;
+	unsigned long pgtable_id;
+	unsigned long iova;
+	u32 fsr;
+
+	fault_info = container_of(attr, struct kgsl_fault_info, attr_info);
+	spin_lock_irqsave(&fault_info->lock, irq_flags);
+	fsr = fault_info->fsr;
+	iova = fault_info->iova;
+	pgtable_id = fault_info->pgtable_id;
+	fault_count = fault_info->fault_count;
+	spin_unlock_irqrestore(&fault_info->lock, irq_flags);
+
+	return sysfs_emit(buf, "fsr=0x%x iova=0x%lx pgtable_id=%lu fault_count=%lu\n",
+			  fsr, iova, pgtable_id, fault_count);
+}
+
+unsigned long kgsl_get_pgtable_identifier(struct kiumd_ctx *kiumd_ctx, u64 ttbr0)
+{
+	struct kiumd_kgsl_context *kgsl_context;
+	unsigned long bkt, ret = -EINVAL;
+	struct pgtable_map *pgtbl_ctx;
+
+	kgsl_context = kiumd_ctx->kgsl_context;
+	if (!kgsl_context)
+		return ret;
+
+	spin_lock(&kgsl_context->kgsl_hash_lock);
+	hash_for_each(kiumd_ctx->kgsl_page_table, bkt, pgtbl_ctx, node) {
+		if (pgtbl_ctx->ttbr0_addr == ttbr0) {
+			ret = pgtbl_ctx->idx;
+			break;
+		}
+	}
+
+	spin_unlock(&kgsl_context->kgsl_hash_lock);
+
+	return ret;
+}
+
+static int umd_kgsl_iommu_fault_handler(struct iommu_domain *domain, struct device *dev,
+							unsigned long iova, int flags, void *token)
+{
+	struct umd_kgsl_data *kgsl_data = token;
+	unsigned long irq_flags, ttbr0, pt_id;
+	struct arm_smmu_domain *smmu_domain;
+	struct kgsl_fault_info *fault_info;
+	struct kernfs_node *fs_node;
+	struct arm_smmu_cfg *cfg;
+	u32 fsr;
+
+	if (!kgsl_data || !kgsl_data->fault_info)
+		return -EINVAL;
+
+	smmu_domain = container_of(domain, struct arm_smmu_domain, domain);
+	cfg = &smmu_domain->cfg;
+	ttbr0 = arm_smmu_cb_readq(smmu_domain->smmu, cfg->cbndx, ARM_SMMU_CB_TTBR0);
+
+	pt_id = kgsl_get_pgtable_identifier(kgsl_data->kiumdctx, ttbr0);
+	fsr = arm_smmu_cb_read(smmu_domain->smmu, cfg->cbndx, ARM_SMMU_CB_FSR);
+	fault_info = kgsl_data->fault_info;
+	spin_lock_irqsave(&fault_info->lock, irq_flags);
+	fault_info->iova = iova;
+	fault_info->fsr = fsr;
+	fault_info->pgtable_id = pt_id;
+	fault_info->fault_count++;
+	fs_node = fault_info->fs_node;
+	spin_unlock_irqrestore(&fault_info->lock, irq_flags);
+
+	if (fault_info->fs_node)
+		sysfs_notify_dirent(fs_node);
+	else
+		dev_err(dev, "IOMMU fault: sysfs notify failed\n");
+
+	dev_warn(dev, "IOMMU fault: iova=0x%lx flags=0x%x fsr=0x%x pgtableid: %ld\n",
+				iova, flags, fsr, pt_id);
+
+	return 0;
+}
+
+static int umd_kgsl_init_fault_handler(struct umd_kgsl_data *kgsl_data)
+{
+	struct kgsl_fault_info *fault_info = kgsl_data->fault_info;
+	struct iommu_domain *domain;
+	int ret;
+
+	domain = kiumd_iommu_get_dma_domain(kgsl_data->dev);
+	if (!domain) {
+		dev_err(kgsl_data->dev, "No IOMMU domain attached\n");
+		return -ENODEV;
+	}
+
+	iommu_set_fault_handler(domain, umd_kgsl_iommu_fault_handler, kgsl_data);
+
+	spin_lock_init(&fault_info->lock);
+	fault_info->attr_info.attr.name = "fault_info";
+	fault_info->attr_info.attr.mode = 0444;
+	fault_info->attr_info.show = fault_info_show;
+	fault_info->attr_info.store = NULL;
+	fault_info->fsr = 0;
+	fault_info->iova = 0;
+	fault_info->pgtable_id = 0;
+	fault_info->fault_count = 0;
+
+	ret = device_create_file(kgsl_data->dev, &fault_info->attr_info);
+	if (ret) {
+		dev_err(kgsl_data->dev, "failed to create sysfs file in /sys/kernel/\n");
+		return ret;
+	}
+
+	fault_info->fs_node = sysfs_get_dirent(kgsl_data->dev->kobj.sd, "fault_info");
+	if (!fault_info->fs_node) {
+		device_remove_file(kgsl_data->dev, &fault_info->attr_info);
+		return -ENOENT;
+	}
+
+	return 0;
+}
+
 static int umd_kgsl_open(struct inode *inode, struct file *file)
 {
 	struct umd_kgsl_data *kgsl_data = GET_KGSL_DATA(file);
@@ -1217,6 +1351,10 @@ static int allocate_kgsl_data_memory(struct umd_kgsl_data *kgsl_data,
 			return -ENOMEM;
 	}
 
+	kgsl_data->fault_info = devm_kzalloc(dev, sizeof(struct kgsl_fault_info), GFP_KERNEL);
+	if (!kgsl_data->fault_info)
+		return -ENOMEM;
+
 	kgsl_data->kiumdctx = devm_kzalloc(dev, sizeof(struct kiumd_ctx), GFP_KERNEL);
 	if (!kgsl_data->kiumdctx)
 		return -ENOMEM;
@@ -1323,6 +1461,11 @@ static int umd_kgsl_init(struct device *parent_dev, struct device_node *child_np
 	if (ret)
 		return dev_err_probe(&child_pdev->dev, ret,
 					"Failed to configure DMA for child device\n");
+
+	ret = umd_kgsl_init_fault_handler(kgsl_data);
+	if (ret)
+		return dev_err_probe(&child_pdev->dev, ret,
+						"Failed to init fault handler\n");
 
 	dev_info(&child_pdev->dev, "Child device initialized with resources and interrupts\n");
 	return 0;
