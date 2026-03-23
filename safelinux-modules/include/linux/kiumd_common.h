@@ -48,9 +48,6 @@
 #define KIUMD_32BIT_START_IOVA		(0x1000)
 #define KIUMD_32BIT_END_IOVA		(0xFFFFFFFF)
 
-extern struct kmem_cache *iommu_addr_cache;
-extern struct smmu_device_obj *head;
-
 struct smmu_device_obj {
 	struct kobject *kobj;
 	int smmu_fsr;

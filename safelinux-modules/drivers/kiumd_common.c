@@ -893,9 +893,12 @@ void clean_map(struct kmem_cache *addr_cache, struct kiumd_ctx *kiumd_ctx,
 	else
 		kiumd_dmabuf_unmap(smap);
 
-	dma_buf_put(smap->dmabuf_ptr);
 	if (smap->is_kgsl_ctx)
 		(void)clear_kgsl_map_iova(addr_cache, kiumd_ctx, smap);
+
+	spin_lock(&kiumd_ctx->smmu_lock);
+	hash_del(&smap->node);
+	spin_unlock(&kiumd_ctx->smmu_lock);
 }
 
 
@@ -1456,7 +1459,7 @@ void kiumd_dmabuf_zero_unmap(struct smmu_map_data *smap)
 		dev_err(smap->dev, "%s:iommu_unmap unmapped %llu\n",
 			__func__, unmapped_size);
 	}
-	//pr_err("%s, device: %s, zero unmap done\n", __func__, smap->dev->kobj.name);
+
 	dma_buf_detach(smap->dmabuf_ptr, smap->dmabufattach);
 	dma_buf_put(smap->dmabuf_ptr);
 }

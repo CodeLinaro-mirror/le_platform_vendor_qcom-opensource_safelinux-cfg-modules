@@ -27,7 +27,7 @@
 
 #define IOVA_ZERO	((dma_addr_t)0)
 
-struct kmem_cache *iommu_addr_cache;
+static struct kmem_cache *iommu_addr_cache;
 
 /**
  * Added in kernel tag v6.12-rc1
@@ -1698,6 +1698,7 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 		hash_for_each_safe(ki_ctx->smmu_table, iter, tmp, smap, node) {
 			if (smap->context) {
 				struct kiumd_smmu_mmio_ctx *mmio_ctx = smap->context;
+
 				pr_debug("Free mmio ctx%p iova:%llx size:%lx\n",
 					 mmio_ctx, mmio_ctx->iova, mmio_ctx->size);
 				dma_unmap_resource(mmio_ctx->dev, mmio_ctx->iova, mmio_ctx->size, 0, 0);
