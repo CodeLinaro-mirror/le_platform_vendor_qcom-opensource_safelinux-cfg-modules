@@ -46,6 +46,7 @@
 #define L2_GOLD_BIT 0x8
 #define L2_GOLD_TLB_BIT 0x2
 
+#define LINVAL	(~0x0)
 #define L1 0x0
 #define L2 0x1
 #define L3 0x2
@@ -63,6 +64,8 @@
 #define CPU_0_CLUSTER_0			(0U)
 #define CPU_0_CLUSTER_1			(4U)
 
+#define EDAC_OK				((bool)1)
+#define EDAC_SPURIOUS			((bool)0)
 
 #define edac_cpu_printk(level, prefix, fmt, arg...) \
 	printk(level "EDAC " prefix ": " fmt, ##arg)
@@ -255,7 +258,7 @@ out:
 	return -EINVAL;
 }
 
-static void dump_err_reg(int errorcode, int level, u64 errxstatus, u64 errxmisc,
+static bool dump_err_reg(int errorcode, int level, u64 errxstatus, u64 errxmisc,
 	struct edac_device_ctl_info *edev_ctl)
 {
 	edac_cpu_printk(KERN_CRIT, EDAC_CPU, "ERRXSTATUS_EL1: %llx\n", errxstatus);
@@ -286,6 +289,9 @@ static void dump_err_reg(int errorcode, int level, u64 errxstatus, u64 errxmisc,
 	case BUS_ERROR:
 		edac_cpu_printk(KERN_CRIT, EDAC_CPU, "Bus Error\n");
 		break;
+	default:
+		edac_cpu_printk(KERN_CRIT, EDAC_CPU, "Unrecognizable error\n");
+		goto ret_spurious;
 	}
 
 	if (level == L3)
@@ -296,12 +302,16 @@ static void dump_err_reg(int errorcode, int level, u64 errxstatus, u64 errxmisc,
 			"Way: %d\n", (int) KRYO_ERRXMISC_WAY(errxmisc) >> 2);
 	errors[errorcode].func(edev_ctl, smp_processor_id(),
 				level, errors[errorcode].msg);
+	return EDAC_OK;
+
+ret_spurious:
+	return EDAC_SPURIOUS;
 }
 
-static void kryo_parse_l1_l2_cache_error(u64 errxstatus, u64 errxmisc,
+static bool kryo_parse_l1_l2_cache_error(u64 errxstatus, u64 errxmisc,
 	struct edac_device_ctl_info *edev_ctl, int cpu)
 {
-	int level = 0;
+	int level = LINVAL;
 	u32 part_num;
 
 	part_num = read_cpuid_part_number();
@@ -320,6 +330,7 @@ static void kryo_parse_l1_l2_cache_error(u64 errxstatus, u64 errxmisc,
 			edac_cpu_printk(KERN_CRIT, EDAC_CPU,
 				"silver cpu:%d unknown error location:%llu\n",
 				cpu, KRYO_ERRXMISC_LVL(errxmisc));
+			goto ret_spurious;
 		}
 		break;
 	case QCOM_CPU_PART_KRYO4XX_GOLD:
@@ -339,13 +350,14 @@ static void kryo_parse_l1_l2_cache_error(u64 errxstatus, u64 errxmisc,
 			edac_cpu_printk(KERN_CRIT, EDAC_CPU,
 				"gold cpu:%d unknown error location:%llu\n",
 				cpu, KRYO_ERRXMISC_LVL_GOLD(errxmisc));
+			goto ret_spurious;
 		}
 		break;
 	default:
 		edac_cpu_printk(KERN_CRIT, EDAC_CPU,
 			"Error in matching cpu%d with part num:%u\n",
 			cpu, part_num);
-		return;
+		goto ret_spurious;
 	}
 
 	switch (level) {
@@ -367,16 +379,23 @@ static void kryo_parse_l1_l2_cache_error(u64 errxstatus, u64 errxmisc,
 		break;
 	default:
 		edac_cpu_printk(KERN_CRIT, EDAC_CPU, "Unknown KRYO_ERRXMISC_LVL value\n");
+		goto ret_spurious;
 	}
+
+	return EDAC_OK;
+
+ret_spurious:
+	return EDAC_SPURIOUS;
 }
 
-static void kryo_check_l1_l2_ecc(void *info)
+static bool kryo_check_l1_l2_ecc(void *info)
 {
 	struct edac_device_ctl_info *edev_ctl = info;
 	u64 errxstatus = 0;
 	u64 errxmisc = 0;
 	int cpu = 0;
 	unsigned long flags;
+	bool ret = EDAC_SPURIOUS;
 
 	spin_lock_irqsave(&local_handler_lock, flags);
 	write_errselr_el1(0);
@@ -389,11 +408,13 @@ static void kryo_check_l1_l2_ecc(void *info)
 		"Kryo CPU%d detected a L1/L2 cache error, errxstatus = %llx, errxmisc = %llx\n",
 		cpu, errxstatus, errxmisc);
 
-		kryo_parse_l1_l2_cache_error(errxstatus, errxmisc, edev_ctl,
+		ret = kryo_parse_l1_l2_cache_error(errxstatus, errxmisc, edev_ctl,
 				cpu);
 		clear_errxstatus_valid(errxstatus);
 	}
 	spin_unlock_irqrestore(&local_handler_lock, flags);
+
+	return ret;
 }
 
 static bool l3_is_bus_error(u64 errxstatus)
@@ -406,11 +427,12 @@ static bool l3_is_bus_error(u64 errxstatus)
 	return false;
 }
 
-static void kryo_check_l3_scu_error(struct edac_device_ctl_info *edev_ctl)
+static bool kryo_check_l3_scu_error(struct edac_device_ctl_info *edev_ctl)
 {
 	u64 errxstatus = 0;
 	u64 errxmisc = 0;
 	unsigned long flags;
+	bool ret = EDAC_SPURIOUS;
 
 	spin_lock_irqsave(&local_handler_lock, flags);
 	write_errselr_el1(1);
@@ -428,11 +450,11 @@ static void kryo_check_l3_scu_error(struct edac_device_ctl_info *edev_ctl)
 		}
 		if (KRYO_ERRXSTATUS_UE(errxstatus)) {
 			edac_cpu_printk(KERN_CRIT, EDAC_CPU, "Detected L3 uncorrectable error\n");
-			dump_err_reg(KRYO_L3_UE, L3, errxstatus, errxmisc,
+			ret = dump_err_reg(KRYO_L3_UE, L3, errxstatus, errxmisc,
 				edev_ctl);
 		} else {
 			edac_cpu_printk(KERN_CRIT, EDAC_CPU, "Detected L3 correctable error\n");
-			dump_err_reg(KRYO_L3_CE, L3, errxstatus, errxmisc,
+			ret = dump_err_reg(KRYO_L3_CE, L3, errxstatus, errxmisc,
 				edev_ctl);
 		}
 
@@ -440,6 +462,7 @@ static void kryo_check_l3_scu_error(struct edac_device_ctl_info *edev_ctl)
 	}
 unlock:
 	spin_unlock_irqrestore(&local_handler_lock, flags);
+	return ret;
 }
 
 static int kryo_cpu_panic_notify(struct notifier_block *this,
@@ -450,25 +473,41 @@ static int kryo_cpu_panic_notify(struct notifier_block *this,
 
 	edev_ctl->panic_on_ue = 0;
 
-	kryo_check_l3_scu_error(edev_ctl);
-	kryo_check_l1_l2_ecc(edev_ctl);
+	(void)kryo_check_l3_scu_error(edev_ctl);
+	(void)kryo_check_l1_l2_ecc(edev_ctl);
 
 	return NOTIFY_OK;
 }
 
 static irqreturn_t kryo_l1_l2_handler(int irq, void *drvdata)
 {
-	kryo_check_l1_l2_ecc(panic_handler_drvdata->edev_ctl);
-	return IRQ_HANDLED;
+	irqreturn_t irq_status = IRQ_HANDLED;
+	bool edac_l1_l2_status = kryo_check_l1_l2_ecc(panic_handler_drvdata->edev_ctl);
+
+	if (unlikely(edac_l1_l2_status == EDAC_SPURIOUS))
+	{
+		edac_cpu_printk(KERN_CRIT, EDAC_CPU, "EDAC spurious L1/L2 interrupt detected!!!\n");
+		sysfs_notify_dirent(per_cpu(cpu_kn.ue[L1], smp_processor_id()));
+		irq_status = IRQ_NONE;
+	}
+	return irq_status;
 }
 
 static irqreturn_t kryo_l3_scu_handler(int irq, void *drvdata)
 {
+	irqreturn_t irq_status = IRQ_HANDLED;
 	struct erp_drvdata *drv = drvdata;
 	struct edac_device_ctl_info *edev_ctl = drv->edev_ctl;
+	bool edac_l3_status = kryo_check_l3_scu_error(edev_ctl);
 
-	kryo_check_l3_scu_error(edev_ctl);
-	return IRQ_HANDLED;
+	if (unlikely(edac_l3_status == EDAC_SPURIOUS))
+	{
+		edac_cpu_printk(KERN_CRIT, EDAC_CPU, "EDAC spurious L3 interrupt detected!!!\n");
+		sysfs_notify_dirent(per_cpu(cpu_kn.ue[L3], smp_processor_id()));
+		irq_status = IRQ_NONE;
+	}
+
+	return irq_status;
 }
 
 static void initialize_registers(void *info)
