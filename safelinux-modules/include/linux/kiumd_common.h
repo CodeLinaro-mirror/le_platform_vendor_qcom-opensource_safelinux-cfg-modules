@@ -348,9 +348,6 @@ int set_kgsl_map_iova(struct kmem_cache *addr_cache, struct kiumd_ctx *kiumd_ctx
 
 unsigned long get_hash_key(struct device *dev);
 
-int init_and_allocate_iova(struct kmem_cache *addr_cache, struct device *dev,
-		struct kiumd_ctx *kiumd_ctx, struct smmu_map_data *smap,
-		unsigned long max_shift, unsigned long fixed_iova, bool is_fixed_map);
 
 unsigned long alloc_iova_range(struct kmem_cache *addr_cache, struct device *dev,
 				struct pgtable_map *ptable_ctx, struct smmu_map_data *smap,
@@ -379,6 +376,11 @@ void kiumd_dmabuf_unmap(struct smmu_map_data *smap);
 
 int free_allocated_iova(struct kmem_cache *addr_cache, struct kiumd_ctx *kiumd_ctx,
 									unsigned long iova);
+
+int init_and_allocate_iova(struct kmem_cache *addr_cache, struct device *dev,
+			   struct kiumd_ctx *kiumd_ctx,
+			   struct smmu_map_data *smap, unsigned long max_shift,
+			   unsigned long fixed_iova, bool is_fixed_map);
 
 int kiumd_configure_dma_cookie(struct device *dev,
 			       enum iommu_dma_cookie_type cookie_type,

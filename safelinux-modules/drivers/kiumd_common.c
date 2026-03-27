@@ -885,7 +885,7 @@ int clear_kgsl_map_iova(struct kmem_cache *addr_cache,
 void clean_map(struct kmem_cache *addr_cache, struct kiumd_ctx *kiumd_ctx,
 		struct smmu_map_data *smap)
 {
-
+	guard(mutex)(&kiumd_ctx->map_lock);
 	if (smap->is_iova_zero)
 		kiumd_dmabuf_zero_unmap(smap);
 	else if (smap->is_priv_map)
@@ -895,6 +895,9 @@ void clean_map(struct kmem_cache *addr_cache, struct kiumd_ctx *kiumd_ctx,
 
 	if (smap->is_kgsl_ctx)
 		(void)clear_kgsl_map_iova(addr_cache, kiumd_ctx, smap);
+
+	if (smap->iova_rb)
+		(void)free_allocated_iova(addr_cache, kiumd_ctx, smap->iova_rb);
 
 	spin_lock(&kiumd_ctx->smmu_lock);
 	hash_del(&smap->node);
@@ -1154,8 +1157,9 @@ int set_allocated_iova(struct device *dev, unsigned long iova)
 }
 
 int init_and_allocate_iova(struct kmem_cache *addr_cache, struct device *dev,
-			   struct kiumd_ctx *kiumd_ctx, struct smmu_map_data *smap,
-			   unsigned long max_shift, unsigned long fixed_iova, bool is_fixed_map)
+			   struct kiumd_ctx *kiumd_ctx,
+			   struct smmu_map_data *smap, unsigned long max_shift,
+			   unsigned long fixed_iova, bool is_fixed_map)
 {
 	unsigned long iova;
 	int ret;
