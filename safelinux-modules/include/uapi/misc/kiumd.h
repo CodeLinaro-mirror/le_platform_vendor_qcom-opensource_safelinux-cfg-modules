@@ -16,8 +16,6 @@
 #define KIUMD_PER_PROCESS_FREE          _IOWR('R', 18, struct kiumd_smmu_user)
 #define KIUMD_CUSTOM_IOVA_INIT          _IOWR('R', 20, struct kiumd_user)
 #define KIUMD_GLOBAL_PT_SET             _IOWR('R', 21, struct kiumd_smmu_user)
-#define KIUMD_SMMU_SECURE_MAP           _IOWR('R', 22, struct kiumd_user)
-#define KIUMD_SMMU_SECURE_UNMAP         _IOWR('R', 23, struct kiumd_user)
 #define KIUMD_SMMU_MMIO_MAP		_IOWR('R', 24, struct kiumd_smmu_mmio_map)
 #define KIUMD_SMMU_MMIO_UNMAP		_IOWR('R', 25, struct kiumd_smmu_mmio_map)
 #define KIUMD_SMMU_FAULT_HANDLE_REGISTER _IOWR('R', 26, struct kiumd_user)
