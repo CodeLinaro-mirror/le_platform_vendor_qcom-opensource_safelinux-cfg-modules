@@ -3277,12 +3277,13 @@ static int kiumd_hyp_unassign_sg(struct sg_table *sgt, int *source_vm_list,
 		sg = sg_next(sg);
 	} while (sg);
 
-	sg = sgt->sgl;
 	if (clear_page_private)
-		for_each_sg(sgt->sgl, sg, sgt->nents, i) {
-			if (sg)
+		for(i = 0, sg = sgt->sgl; i < sgt->nents && sg; i++, sg = sg_next(sg) ) {
 				ClearPagePrivate(sg_page(sg));
 		}
+	if (i != sgt->nents)
+		pr_warn("%s: sg list shorter than nents (%d < %d)\n",
+		       __func__ ,i, sgt->nents);
 
 	trace_kiumd_hyp_unassign_sg_end(sgt);
 out:
