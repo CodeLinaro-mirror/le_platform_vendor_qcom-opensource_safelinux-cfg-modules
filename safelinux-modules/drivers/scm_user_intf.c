@@ -295,9 +295,9 @@ static long scm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	struct scm_hand_shake scm_data;
 #if (LINUX_VERSION_CODE == KERNEL_VERSION(5, 14, 0))
 	struct qcom_scm_desc desc;
-	struct qcom_scm_res res;
+	struct qcom_scm_res res = {0};
 #else
-	struct scm_user_res res;
+	struct scm_user_res res = {0};
 	u64 res1 = 0;
 #endif
 
