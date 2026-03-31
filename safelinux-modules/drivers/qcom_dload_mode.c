@@ -13,7 +13,35 @@
 #include <linux/types.h>
 #include <linux/firmware/qcom/qcom_scm.h>
 
+/*
+ * TZ dump capability query (SMC 0x02000310):
+ *
+ * Response 1 (dumps_allowed):
+ *   0 = No dumps allowed
+ *   1 = SEC_DMP_ALLOWED  - secure full dump (superset, also permits minidump)
+ *   2 = NSEC_DMP_ALLOWED - non-secure full dump (does NOT permit minidump)
+ *
+ * Response 3 (md_flags) for newer SoC family (bit31=1):
+ *   bit1  = MD_APPS_NSEC_SUBSYS_ENABLED - minidump gate
+ *   bit31 = TARGET_FAMILY - set for newer SoC family
+ *
+ * Response 3 (md_flags) for previous SoC family (bit31=0):
+ *   bit5 = SEC_DBG_ENABLE_APPS_ENCRYPTED_MINI_DUMPS
+ */
+
+/* md_flags bits for newer SoC family (bit31=1) */
+#define MD_TARGET_FAMILY_BIT		BIT(31)
+#define MD_APPS_NSEC_SUBSYS_ENABLED_BIT	BIT(1)
+
+/* md_flags bits for previous SoC family (bit31=0) */
+#define APDP_APPS_MINI_DUMPS_BIT        BIT(5)
+
+/* dumps_allowed values */
+#define SEC_DMP_ALLOWED     1
+#define NSEC_DMP_ALLOWED    2
+
 enum qcom_download_mode {
+	QCOM_DOWNLOAD_NODUMP    = 0x00,
 	QCOM_DOWNLOAD_FULLDUMP  = 0x10,
 	QCOM_DOWNLOAD_MINIDUMP  = 0x20,
 	QCOM_DOWNLOAD_BOTHDUMP  = (QCOM_DOWNLOAD_FULLDUMP | QCOM_DOWNLOAD_MINIDUMP),
@@ -35,23 +63,99 @@ static int get_dump_mode(int *mode)
 
 	ret = qcom_scm_io_readl(dload_mode_addr, mode);
 	if (ret)
-		pr_err("failed to get dump mode, ret = %d\n", ret);
+		pr_err("dload: failed to read TCSR: addr=0x%llx ret=%d\n",
+		       dload_mode_addr, ret);
 
 	return ret;
 }
 
 static int set_dump_mode(enum qcom_download_mode mode)
 {
-	int ret;
+	int ret, readback;
 
 	ret = qcom_scm_io_writel(dload_mode_addr, mode);
-	if (ret)
-		pr_err("failed to set dump mode as '0x%x', ret = %d\n",
-								mode, ret);
-	else
-		dump_mode = mode;
+	if (ret) {
+		pr_err("dload: write failed: mode=0x%x ret=%d\n",
+		       mode, ret);
+		return ret;
+	}
 
-	return ret;
+	/*
+	 * qcom_scm_io_writel() returns 0 if the SCM call transport succeeded,
+	 * but TZ/APDP policy may silently accept the call while not honoring
+	 * the write (or writing a different value). A readback is required to
+	 * confirm the value was actually accepted.
+	 */
+	ret = get_dump_mode(&readback);
+	if (ret)
+		return ret;
+
+	if ((enum qcom_download_mode)readback != mode) {
+		pr_err("dload: TZ/APDP rejected mode 0x%x, read back 0x%x\n",
+		       mode, readback);
+		return -EIO;
+	}
+
+	dump_mode = mode;
+	return 0;
+}
+
+struct qcom_dload_caps {
+	u32 dumps_allowed;
+	u32 md_flags;
+};
+
+static int qcom_dload_query_caps(struct qcom_dload_caps *caps)
+{
+	u32 dload_cookie;
+
+	return qcom_scm_get_dump_mode_caps(&caps->dumps_allowed,
+					   &dload_cookie,
+					   &caps->md_flags);
+}
+
+/*
+ * Select and apply the best dump mode based on TZ policy.
+ *
+ * For newer SoC family (bit31=1):
+ *   full dump: dumps_allowed == SEC_DMP_ALLOWED or NSEC_DMP_ALLOWED
+ *   mini dump: dumps_allowed == SEC_DMP_ALLOWED (superset)
+ *              OR md_flags & MD_APPS_NSEC_SUBSYS_ENABLED (bit1)
+ *
+ * For previous SoC family (bit31=0):
+ *   full dump: dumps_allowed == SEC_DMP_ALLOWED or NSEC_DMP_ALLOWED
+ *   mini dump: dumps_allowed == SEC_DMP_ALLOWED (superset)
+ *              OR md_flags & APDP_APPS_MINI_DUMPS_BIT (bit5)
+ *
+ * No dump: write NODUMP (0x00) to TCSR
+ *
+ * Preference: FULLDUMP > MINIDUMP > NODUMP
+ * BOTHDUMP (0x30) is not selected here; callers can set it via sysfs
+ * if the platform supports simultaneous full and mini dump collection.
+ *
+ * Returns the result of set_dump_mode() so the caller can handle failures.
+ */
+static int qcom_dload_apply_best_mode(const struct qcom_dload_caps *caps)
+{
+	bool new_family = !!(caps->md_flags & MD_TARGET_FAMILY_BIT);
+	bool full_ok, mini_ok;
+
+	full_ok = (caps->dumps_allowed == SEC_DMP_ALLOWED ||
+		   caps->dumps_allowed == NSEC_DMP_ALLOWED);
+
+	if (new_family)
+		mini_ok = (caps->dumps_allowed == SEC_DMP_ALLOWED) ||
+			  !!(caps->md_flags & MD_APPS_NSEC_SUBSYS_ENABLED_BIT);
+	else
+		mini_ok = (caps->dumps_allowed == SEC_DMP_ALLOWED) ||
+			  !!(caps->md_flags & APDP_APPS_MINI_DUMPS_BIT);
+
+	if (full_ok)
+		return set_dump_mode(QCOM_DOWNLOAD_FULLDUMP);
+	else if (mini_ok)
+		return set_dump_mode(QCOM_DOWNLOAD_MINIDUMP);
+	else
+		return set_dump_mode(QCOM_DOWNLOAD_NODUMP);
 }
 
 static void set_download_dest(enum qcom_download_dest dest)
@@ -115,8 +219,15 @@ static ssize_t dload_mode_show(struct kobject *kobj, struct attribute *this,
 			       char *buf)
 {
 	const char *mode;
+	int val;
 
-	switch ((unsigned int)dump_mode) {
+	if (get_dump_mode(&val))
+		return scnprintf(buf, PAGE_SIZE, "DLOAD dump type: unknown\n");
+
+	switch ((unsigned int)val) {
+	case QCOM_DOWNLOAD_NODUMP:
+		mode = "off";
+		break;
 	case QCOM_DOWNLOAD_FULLDUMP:
 		mode = "full";
 		break;
@@ -124,7 +235,7 @@ static ssize_t dload_mode_show(struct kobject *kobj, struct attribute *this,
 		mode = "mini";
 		break;
 	case QCOM_DOWNLOAD_BOTHDUMP:
-		mode = "both";
+		mode = "full,mini";
 		break;
 	default:
 		mode = "unknown";
@@ -139,15 +250,17 @@ static ssize_t dload_mode_store(struct kobject *kobj, struct attribute *this,
 {
 	enum qcom_download_mode mode;
 
-	if (sysfs_streq(buf, "full")) {
+	if (sysfs_streq(buf, "off")) {
+		mode = QCOM_DOWNLOAD_NODUMP;
+	} else if (sysfs_streq(buf, "full")) {
 		mode = QCOM_DOWNLOAD_FULLDUMP;
 	} else if (sysfs_streq(buf, "mini")) {
 		mode = QCOM_DOWNLOAD_MINIDUMP;
-	} else if (sysfs_streq(buf, "both")) {
+	} else if (sysfs_streq(buf, "full,mini")) {
 		mode = QCOM_DOWNLOAD_BOTHDUMP;
 	} else {
-		pr_err("Invalid dump mode request...\n");
-		pr_err("Supported modes are : 'full', 'mini', or 'both'\n");
+		pr_err("dload: invalid mode '%.*s'. Supported: off, full, mini, full,mini\n",
+		       (int)count, buf);
 		return -EINVAL;
 	}
 
@@ -165,6 +278,7 @@ static ssize_t emmc_dload_show(struct kobject *kobj,
 	return scnprintf(buf, PAGE_SIZE, "%u\n",
 			get_download_dest() == QCOM_DOWNLOAD_DEST_EMMC);
 }
+
 static ssize_t emmc_dload_store(struct kobject *kobj,
 				struct attribute *this,
 				const char *buf, size_t count)
@@ -253,7 +367,8 @@ static int qcom_dload_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	static struct kobject kobj;
 	struct device_node *scm_dev;
-	int ret, temp;
+	struct qcom_dload_caps caps = {0};
+	int ret;
 
 	scm_dev = of_find_node_by_name(NULL, "qcom_scm");
 	if (!scm_dev) {
@@ -280,15 +395,43 @@ static int qcom_dload_probe(struct platform_device *pdev)
 	if (ret) {
 		dev_err(dev, "Error in creation sysfs_create_group!\n");
 		kobject_del(&kobj);
+		kobject_put(&kobj);
 		return ret;
 	}
 
-	dump_mode = get_dump_mode(&temp) ? dump_mode : temp;
 	dload_dest_addr = map_prop_mem("qcom,msm-imem-dload-type");
 	if (!dload_dest_addr)
 		dev_err(dev, "Failed to map dload destination address!!\n");
 
+	ret = qcom_dload_query_caps(&caps);
+	if (ret) {
+		dev_warn(dev, "dload: caps query failed (ret=%d), using default FULLDUMP\n",
+			 ret);
+		ret = set_dump_mode(dump_mode);
+		if (ret) {
+			dev_err(dev, "dload: default dump mode rejected by TZ\n");
+			goto err_cleanup;
+		}
+	} else {
+		ret = qcom_dload_apply_best_mode(&caps);
+		if (ret) {
+			dev_err(dev, "dload: failed to apply best mode: ret=%d\n",
+				ret);
+			goto err_cleanup;
+		}
+	}
+
 	return 0;
+
+err_cleanup:
+	if (dload_dest_addr) {
+		iounmap(dload_dest_addr);
+		dload_dest_addr = NULL;
+	}
+	sysfs_remove_group(&kobj, &qcom_dload_attr_group);
+	kobject_del(&kobj);
+	kobject_put(&kobj);
+	return ret;
 }
 
 static int qcom_dload_resume(struct device *dev)
@@ -297,18 +440,20 @@ static int qcom_dload_resume(struct device *dev)
 	int ret;
 
 	switch (mode) {
+	case QCOM_DOWNLOAD_NODUMP:
 	case QCOM_DOWNLOAD_FULLDUMP:
 	case QCOM_DOWNLOAD_MINIDUMP:
 	case QCOM_DOWNLOAD_BOTHDUMP:
 		ret = set_dump_mode(mode);
 		if (ret) {
-			dev_err(dev, "Resume restore failed, ret=%d\n", ret);
+			dev_err(dev, "dload: resume: restore failed, ret=%d\n",
+				ret);
 			return ret;
 		}
 		break;
 	default:
-		dev_warn(dev, "Resume restore skipped, Invalid mode(0x%x)\n",
-									mode);
+		dev_warn(dev, "dload: resume: skipped, invalid mode=0x%x\n",
+			 mode);
 		break;
 	}
 
