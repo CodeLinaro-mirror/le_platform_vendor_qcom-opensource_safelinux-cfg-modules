@@ -52,6 +52,9 @@ iommu_faults-objs := drivers/iommu_faults.o
 obj-m += profiler.o
 profiler-objs := drivers/profiler.o
 
+obj-m += qcom_l3_cache_config.o
+qcom_l3_cache_config-objs := drivers/qcom_l3_cache_config.o
+
 obj-m += qcom_ethqos_filter.o
 qcom_ethqos_filter-objs := drivers/qcom_ethqos_filter.o
 
