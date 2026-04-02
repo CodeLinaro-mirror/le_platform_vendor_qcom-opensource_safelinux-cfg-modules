@@ -478,7 +478,6 @@ static int __kiumd_dmabuf_vfio_map(struct kiumd_ctx *kiumd_ctx,
 {
 	int ret = 0;
 
-
 	if (cmd == KIUMD_SMMU_MAP_BUF)
 		ret = set_kgsl_map_iova(iommu_addr_cache, kiumd_ctx, kiusr,
 					smap);
@@ -618,19 +617,11 @@ static int __kiumd_dmabuf_vfio_unmap(struct kiumd_ctx *kiumd_ctx,
 	else
 		kiumd_dmabuf_unmap(smap);
 
-	if (smap->is_kgsl_ctx) {
-		ret = clear_kgsl_map_iova(iommu_addr_cache, kiumd_ctx, smap);
-		if (ret)
-			return -ENOENT;
-	}
+	if (smap->is_kgsl_ctx)
+		clear_kgsl_map_iova(iommu_addr_cache, kiumd_ctx, smap);
 
-	if (smap->iova_rb) {
-		ret = free_allocated_iova(iommu_addr_cache, kiumd_ctx, smap->iova_rb);
-		if (ret) {
-			pr_err("%s:unable to free iova\n", __func__);
-			return ret;
-		}
-	}
+	if (smap->iova_rb)
+		free_allocated_iova(iommu_addr_cache, kiumd_ctx, smap->iova_rb);
 
 	if (smap->is_kgsl_map || smap->is_fixed_map) {
 		iommu_dom = kiumd_iommu_get_dma_domain(smap->dev);
@@ -641,7 +632,6 @@ static int __kiumd_dmabuf_vfio_unmap(struct kiumd_ctx *kiumd_ctx,
 		}
 		iommu_flush_iotlb_all(iommu_dom);
 	}
-
 
 	return 0;
 }
@@ -697,6 +687,171 @@ static int kiumd_dmabuf_unmap_common(char __user *arg, struct file *fp)
 
 	trace_kiumd_dmabuf_vfio_unmap_end(kiusr.vfio_fd);
 
+	return 0;
+}
+
+static int __kiumd_mmio_vfio_map(struct kiumd_ctx *kiumd_ctx,
+				 struct kiumd_smmu_mmio_map kiusr,
+				 struct smmu_map_data *smap)
+{
+	int ret = 0;
+
+	if (smap->is_fixed_map)
+		ret = init_and_allocate_iova(iommu_addr_cache, smap->dev,
+					     kiumd_ctx, smap, PAGE_SHIFT,
+					     kiusr.iova, kiusr.fixed_iova);
+	if (ret)
+		return -EINVAL;
+
+	ret = kiumd_mmio_map(smap);
+	if (ret) {
+		if (smap->is_fixed_map)
+			free_allocated_iova(iommu_addr_cache, kiumd_ctx,
+					    smap->iova_rb);
+		return ret;
+	}
+
+	add_to_smmu_table(kiumd_ctx, smap);
+	return 0;
+}
+
+static void __kiumd_vfio_mmio_unmap(struct kiumd_ctx *kiumd_ctx,
+				   struct smmu_map_data *smap);
+/**
+ * kiumd_mmio_smmu_map - Facilitate to map mmio region into smmu at fixed
+ * IOVA
+ * Parameters:
+ * @arg: User space argument ptr
+ * @fp: file ptr for device context
+ *
+ * Return: value is errno in failure cases
+ * or 0 in case of successful mapping
+ */
+static int kiumd_mmio_smmu_map(char __user *arg, struct file *fp)
+{
+	struct file *vfio_file __free(fput) = NULL;
+	char *reg_name __free(kfree) = NULL;
+	struct kiumd_smmu_mmio_map kiusr;
+	struct kiumd_ctx *kiumd_ctx;
+	struct smmu_map_data *smap;
+	struct resource *res;
+	struct device *dev;
+	int ret;
+
+	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
+	if (copy_from_user(&kiusr, arg, sizeof(kiusr)))
+		return -EFAULT;
+
+	dev = kiumd_vfio_get_device(kiusr.vfio_fd, &vfio_file);
+	if (!dev)
+		return -EBADF;
+
+
+	reg_name = strndup_user(kiusr.reg_name, KIUMD_MAX_REG_NAME_LEN);
+	if (IS_ERR(reg_name))
+		return PTR_ERR(reg_name);
+
+	if (!dev_is_platform(dev))
+		return -EINVAL;
+
+	res = platform_get_resource_byname(to_platform_device(dev),
+					   IORESOURCE_MEM, reg_name);
+	if (!res)
+		return -EINVAL;
+
+	smap = allocate_init_smap_mmio(kiusr, res, dev);
+	if (!smap)
+		return -ENOMEM;
+
+	trace_kiumd_mmio_smmu_map_start(kiusr.vfio_fd, kiusr.fixed_iova, kiusr.iova);
+
+	mutex_lock(&kiumd_ctx->map_lock);
+	ret = __kiumd_mmio_vfio_map(kiumd_ctx, kiusr, smap);
+	mutex_unlock(&kiumd_ctx->map_lock);
+	if (ret) {
+		kfree(smap->context);
+		goto smap_free;
+	}
+
+	kiusr.id = smap->id;
+	kiusr.iova = smap->context->iova;
+	kiusr.reg_len = smap->context->size;
+	trace_kiumd_mmio_smmu_map_end(reg_name, kiusr.vfio_fd,  kiusr.id, kiusr.iova,
+				      kiusr.reg_len);
+	if (copy_to_user(arg, &kiusr, sizeof(kiusr))) {
+		ret = -EFAULT;
+		goto clean_map_res;
+	}
+
+	return 0;
+
+clean_map_res:
+	mutex_lock(&kiumd_ctx->map_lock);
+	__kiumd_vfio_mmio_unmap(kiumd_ctx, smap);
+	mutex_unlock(&kiumd_ctx->map_lock);
+	spin_lock(&kiumd_ctx->smmu_lock);
+	hash_del(&smap->node);
+	spin_unlock(&kiumd_ctx->smmu_lock);
+smap_free:
+	kfree(smap);
+	return ret;
+}
+
+static void __kiumd_vfio_mmio_unmap(struct kiumd_ctx *kiumd_ctx,
+				   struct smmu_map_data *smap)
+{
+	if (smap->is_fixed_map)
+		free_allocated_iova(iommu_addr_cache, kiumd_ctx,
+				    smap->context->iova);
+
+	kiumd_mmio_unmap(smap);
+}
+
+/**
+ * @Brief: This function facilitates to
+ * unmap mmio region into smmu at fixed
+ * IOVA.The function is called via IOCTL
+ * interface and input is provided via
+ * struct kiumd_user from the user space.
+ *
+ * Parameters:
+ * @arg: User space argument ptr
+ * @fp: file ptr for device context
+ *
+ * return value is errno in failure cases
+ * or 0 in case of successful mapping
+ */
+static int kiumd_mmio_smmu_unmap(char __user *arg, struct file *fp)
+{
+	struct smmu_map_data *smap __free(kfree) = NULL;
+	struct kiumd_smmu_mmio_map kiusr;
+	struct kiumd_ctx *kiumd_ctx;
+	bool found = false;
+
+	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
+	if (copy_from_user(&kiusr, arg, sizeof(kiusr)))
+		return -EFAULT;
+
+	trace_kiumd_mmio_smmu_unmap_start(kiusr.vfio_fd, kiusr.iova, kiusr.id);
+	spin_lock(&kiumd_ctx->smmu_lock);
+	hash_for_each_possible(kiumd_ctx->smmu_table, smap, node, kiusr.id) {
+		if (smap->id == kiusr.id && smap->context) {
+			found = true;
+			break;
+		}
+	}
+	if (found)
+		hash_del(&smap->node);
+
+	spin_unlock(&kiumd_ctx->smmu_lock);
+	if (!found) {
+		smap = NULL;
+		return -ENOENT;
+	}
+
+	guard(mutex)(&kiumd_ctx->map_lock);
+	__kiumd_vfio_mmio_unmap(kiumd_ctx, smap);
+	trace_kiumd_mmio_smmu_unmap_end(kiusr.id);
 	return 0;
 }
 
@@ -973,245 +1128,6 @@ err:
 }
 
 /**
- * kiumd_mmio_smmu_map - Facilitate to map mmio region into smmu at fixed
- * IOVA
- * Parameters:
- * @arg: User space argument ptr
- * @fp: file ptr for device context
- *
- * Return: value is errno in failure cases
- * or 0 in case of successful mapping
- */
-static int kiumd_mmio_smmu_map(char __user *arg, struct file *fp)
-{
-	struct file *vfio_file __free(fput) = NULL;
-	struct kiumd_smmu_mmio_ctx *mmio_ctx;
-	struct kiumd_smmu_mmio_map kiusr;
-	struct kiumd_ctx *kiumd_ctx;
-	struct smmu_map_data *smap;
-	struct resource *res;
-	dma_addr_t dma_addr;
-	struct device *dev;
-	int iter, ret = 0;
-	char *reg_name;
-	u64 addr, size;
-
-	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-
-	if (copy_from_user(&kiusr, arg, sizeof(kiusr))) {
-		pr_err("%s:%d invalid args from user\n", __func__, __LINE__);
-		return -EFAULT;
-	}
-
-	trace_kiumd_mmio_smmu_map_start(kiusr.vfio_fd, kiusr.fixed_iova, kiusr.iova);
-	dev = kiumd_vfio_get_device(kiusr.vfio_fd, &vfio_file);
-	if (!dev)
-		return -EBADF;
-
-	spin_lock(&kiumd_ctx->smmu_lock);
-	if (!hash_empty(kiumd_ctx->smmu_table)) {
-		hash_for_each(kiumd_ctx->smmu_table, iter, smap, node) {
-			if (!smap->context)
-				continue;
-			pr_debug("mmio ctx%p iova:%llx size:%lx\n", smap->context,
-				 smap->context->iova,
-				 smap->context->size);
-			if (kiusr.fixed_iova &&
-			    smap->context->iova == kiusr.iova) {
-				spin_unlock(&kiumd_ctx->smmu_lock);
-				pr_err("%s:error IOVA:%llx exists..\n", __func__, kiusr.iova);
-				return -EINVAL;
-			}
-		}
-	}
-	spin_unlock(&kiumd_ctx->smmu_lock);
-
-	smap = kzalloc(sizeof(*smap), GFP_KERNEL);
-	if (!smap)
-		return -ENOMEM;
-
-	mmio_ctx = kzalloc(sizeof(*mmio_ctx), GFP_KERNEL);
-	if (!mmio_ctx) {
-		kfree(smap);
-		return -ENOMEM;
-	}
-
-	reg_name = strndup_user(kiusr.reg_name, KIUMD_MAX_REG_NAME_LEN);
-	if (IS_ERR(reg_name)) {
-		pr_err("%s:%d invalid str\n", __func__, __LINE__);
-		ret = -EINVAL;
-		goto smap_free;
-	}
-
-	if (!dev_is_platform(dev)) {
-		pr_err("%s:%d not platform device\n", __func__, __LINE__);
-		ret = -EINVAL;
-		goto reg_free;
-	}
-
-	res = platform_get_resource_byname(to_platform_device(dev),
-					   IORESOURCE_MEM, reg_name);
-	if (!res) {
-		ret = -EINVAL;
-		pr_err("%s:%d resource error\n", __func__, __LINE__);
-		goto reg_free;
-	}
-
-	addr = res->start;
-	size = resource_size(res);
-	smap->size = size;
-	ret = init_and_allocate_iova(iommu_addr_cache, dev, kiumd_ctx, smap,
-				     PAGE_SHIFT, kiusr.iova, kiusr.fixed_iova);
-	if (ret) {
-		pr_err("%s: failed to allocate iova for: %s, ret: %d\n",
-		       __func__, dev_name(dev), ret);
-		ret = -EINVAL;
-		goto reg_free;
-	}
-
-	dma_addr = dma_map_resource(dev, addr, size, 0, 0);
-	ret = dma_mapping_error(dev, dma_addr);
-
-	if (ret) {
-		pr_err("%s:Failed to map with error: %d\n", __func__, ret);
-		ret = free_allocated_iova(iommu_addr_cache, kiumd_ctx, smap->iova_rb);
-		if (ret) {
-			pr_err("%s:unable to free iova\n", __func__);
-			ret = -ENOMEM;
-		} else {
-			ret = -EINVAL;
-		}
-
-		goto reg_free;
-	}
-
-	kiusr.iova = dma_addr;
-	kiusr.reg_len = size;
-
-	spin_lock(&kiumd_ctx->smmu_lock);
-	smap->id = kiumd_ctx->id++;
-	kiusr.id = smap->id;
-	hash_add(kiumd_ctx->smmu_table, &smap->node, smap->id);
-	mmio_ctx->iova = dma_addr;
-	mmio_ctx->size = size;
-	mmio_ctx->dev = dev;
-	smap->context = mmio_ctx;
-	spin_unlock(&kiumd_ctx->smmu_lock);
-
-	pr_debug("%s:%s mapped pa:%llx size:%llx user iova:%llx dma_addr:%llx id:%d\n",
-		 __func__, reg_name, addr, size, kiusr.iova, dma_addr, kiusr.id);
-	if (copy_to_user(arg, &kiusr, sizeof(kiusr))) {
-		pr_err("kiumd:error in copying data:%d\n", ret);
-		ret = -EFAULT;
-		goto smap_del;
-	}
-
-	trace_kiumd_mmio_smmu_map_end(reg_name, kiusr.vfio_fd,  kiusr.id, kiusr.iova,
-				      kiusr.reg_len);
-	kfree(reg_name);
-	return 0;
-smap_del:
-	dma_unmap_resource(dev, dma_addr, size, 0, 0);
-	spin_lock(&kiumd_ctx->smmu_lock);
-	hash_del(&smap->node);
-	spin_unlock(&kiumd_ctx->smmu_lock);
-reg_free:
-	kfree(reg_name);
-smap_free:
-	kfree(smap->context);
-	kfree(smap);
-
-	return ret;
-}
-
-/**
- * @Brief: This function facilitates to
- * unmap mmio region into smmu at fixed
- * IOVA.The function is called via IOCTL
- * interface and input is provided via
- * struct kiumd_user from the user space.
- *
- * Parameters:
- * @arg: User space argument ptr
- * @fp: file ptr for device context
- *
- * return value is errno in failure cases
- * or 0 in case of successful mapping
- */
-static int kiumd_mmio_smmu_unmap(char __user *arg, struct file *fp)
-{
-	struct file *vfio_file __free(fput) = NULL;
-	struct kiumd_smmu_mmio_ctx *mmio_ctx;
-	struct kiumd_smmu_mmio_map kiusr;
-	struct kiumd_ctx *kiumd_ctx;
-	struct smmu_map_data *smap;
-	bool found = false;
-	struct device *dev;
-	int ret;
-
-	kiumd_ctx = (struct kiumd_ctx *)fp->private_data;
-
-	if (copy_from_user(&kiusr, arg, sizeof(kiusr))) {
-		pr_err("%s:%d invalid args from user\n", __func__, __LINE__);
-		return -EFAULT;
-	}
-
-	trace_kiumd_mmio_smmu_unmap_start(kiusr.vfio_fd, kiusr.iova, kiusr.id);
-
-	if (kiusr.id < 0) {
-		pr_err("%s:id passed from user should be positive value\n",
-		       __func__);
-		return -EFAULT;
-	}
-
-	dev = kiumd_vfio_get_device(kiusr.vfio_fd, &vfio_file);
-	if (!dev)
-		return -EBADF;
-
-	spin_lock(&kiumd_ctx->smmu_lock);
-	hash_for_each_possible(kiumd_ctx->smmu_table, smap, node, kiusr.id) {
-		if (smap->id == kiusr.id && smap->context) {
-			found = true;
-			break;
-		}
-	}
-	spin_unlock(&kiumd_ctx->smmu_lock);
-
-	if (!found) {
-		pr_err("%s:smmu id not found: %d\n", __func__, kiusr.id);
-		return -ENOENT;
-	}
-
-	mmio_ctx = smap->context;
-	if (!mmio_ctx) {
-		pr_err("%s:invalid context:%d\n", __func__, __LINE__);
-		return -EINVAL;
-	}
-
-	pr_debug("%s:mapping found:%d mmio_ctx:%p iova:%llx size:%lx\n",
-		 __func__, kiusr.id, mmio_ctx, mmio_ctx->iova, mmio_ctx->size);
-
-	ret = free_allocated_iova(iommu_addr_cache, kiumd_ctx, mmio_ctx->iova);
-	if (ret) {
-		pr_err("%s:unable to free iova\n", __func__);
-		return ret;
-	}
-
-	dma_unmap_resource(mmio_ctx->dev, mmio_ctx->iova, mmio_ctx->size,
-			   0, 0);
-
-	spin_lock(&kiumd_ctx->smmu_lock);
-	hash_del(&smap->node);
-	kfree(smap->context);
-	kfree(smap);
-	spin_unlock(&kiumd_ctx->smmu_lock);
-
-	trace_kiumd_mmio_smmu_unmap_end(kiusr.id);
-
-	return 0;
-}
-
-/**
  * kiumd_open - Facilitates to initialize the locks, hash tables and
  * allocate the memory for device ctx
  *
@@ -1285,7 +1201,8 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 
 				pr_debug("Free mmio ctx%p iova:%llx size:%lx\n",
 					 mmio_ctx, mmio_ctx->iova, mmio_ctx->size);
-				dma_unmap_resource(mmio_ctx->dev, mmio_ctx->iova, mmio_ctx->size, 0, 0);
+				dma_unmap_resource(smap->dev, mmio_ctx->iova,
+						   mmio_ctx->size, 0, 0);
 				kfree(smap->context);
 			}
 
@@ -1539,6 +1456,12 @@ static long kiumd_ioctl(struct file *file, unsigned int cmd,
 	case KIUMD_SMMU_MANAGED_IOVA_UNMAP:
 		err = kiumd_dmabuf_unmap_common(argp, file);
 		break;
+	case KIUMD_SMMU_MMIO_MAP:
+		err = kiumd_mmio_smmu_map(argp, file);
+		break;
+	case KIUMD_SMMU_MMIO_UNMAP:
+		err = kiumd_mmio_smmu_unmap(argp, file);
+		break;
 	case KIUMD_IOVA_MAP_CTRL:
 		err = kiumd_iova_ctrl(argp);
 		break;
@@ -1559,12 +1482,6 @@ static long kiumd_ioctl(struct file *file, unsigned int cmd,
 		break;
 	case KIUMD_GLOBAL_PT_SET:
 		err = kiumd_global_pgtble_set(argp, file);
-		break;
-	case KIUMD_SMMU_MMIO_MAP:
-		err = kiumd_mmio_smmu_map(argp, file);
-		break;
-	case KIUMD_SMMU_MMIO_UNMAP:
-		err = kiumd_mmio_smmu_unmap(argp, file);
 		break;
 /* Will remove below 2 ioctls, once tech teams update the code */
 	case KIUMD_SMMU_FAULT_HANDLE_REGISTER:

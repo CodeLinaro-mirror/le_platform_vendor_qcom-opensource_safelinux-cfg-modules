@@ -258,12 +258,13 @@ static void free_iommu_addr_entry(struct kmem_cache *addr_cache, struct iommu_ad
 	kmem_cache_free(addr_cache, entry);
 }
 
-int free_iova_range(struct kmem_cache *addr_cache,
-			   struct pgtable_map *map, unsigned long iova)
+void free_iova_range(struct kmem_cache *addr_cache,
+		     struct pgtable_map *map, unsigned long iova)
 {
 	struct rb_node *node = map->rbtree.rb_node;
 	struct iommu_addr_entry *entry;
 
+	guard(mutex)(&map->pgctx_lock);
 	while (node) {
 		entry = rb_entry(node, struct iommu_addr_entry, rbnode);
 
@@ -274,11 +275,10 @@ int free_iova_range(struct kmem_cache *addr_cache,
 		else {
 			rb_erase(&entry->rbnode, &map->rbtree);
 			free_iommu_addr_entry(addr_cache, entry);
-			return 0;
+			return;
 		}
 	}
 
-	return -EINVAL; // IOVA not found
 }
 
 /**
@@ -290,22 +290,15 @@ int free_iova_range(struct kmem_cache *addr_cache,
  * @iova: IOVA address to free
  * @is_process: Flag indicating if the context is process-specific
  *
- * Return: 0 on success, -EINVAL if the pagetable entry is not found.
+ * Return: void
  */
-int free_allocated_iova(struct kmem_cache *addr_cache,
+void free_allocated_iova(struct kmem_cache *addr_cache,
 			struct kiumd_ctx *kiumd_ctx, unsigned long iova)
 {
 	struct pgtable_map *pgtble_ctx;
 
 	pgtble_ctx = kiumd_ctx->pgtable_ctx;
-	if (!pgtble_ctx) {
-		pr_err("%s:invalid pgtable context for iova: %lx\n",
-				__func__, iova);
-		return -EINVAL;
-	}
-
-	guard(mutex)(&pgtble_ctx->pgctx_lock);
-	return free_iova_range(addr_cache, pgtble_ctx, iova);
+	free_iova_range(addr_cache, pgtble_ctx, iova);
 }
 
 struct iommu_addr_entry *alloc_iommu_addr_entry(struct kmem_cache *addr_cache,
@@ -397,7 +390,7 @@ unsigned long get_shift_from_dt(struct device *dev)
 	if (!of_property_read_u32(node, "qcom,iova-align-shift-max", &shift))
 		return shift;
 
-	return 0;
+	return DEFAULT_IOVA_ALIGN_SHIFT_MAX;
 }
 
 
@@ -847,12 +840,12 @@ int kiumd_set_dma_addr_ranges(struct kiumd_ctx *kiumd_ctx, struct device *dev)
  *
  * Return: nothing
  */
-int clear_kgsl_map_iova(struct kmem_cache *addr_cache,
+void clear_kgsl_map_iova(struct kmem_cache *addr_cache,
 			struct kiumd_ctx *kiumd_ctx, struct smmu_map_data *smap)
 {
-	u64 bit, size, iova;
-	int ret, ptselect, idx;
 	struct pgtable_map *pgtble_ctx;
+	u64 bit, size, iova;
+	int ptselect, idx;
 
 	size = smap->size;
 	iova = smap->kgsl_ctx.iova;
@@ -866,20 +859,9 @@ int clear_kgsl_map_iova(struct kmem_cache *addr_cache,
 		spin_unlock(&global_map_lock);
 	} else {
 		pgtble_ctx = kiumd_get_pgtable_entry(kiumd_ctx, idx);
-		if (!pgtble_ctx) {
-			pr_err("%s:invalid id for hash table: id: %d\n", __func__, idx);
-			return -EINVAL;
-		}
-
-
-		ret = free_iova_range(addr_cache, pgtble_ctx, iova);
-		if (ret) {
-			pr_err("%s:%d unable to free iova\n", __func__, __LINE__);
-			return ret;
-		}
+		free_iova_range(addr_cache, pgtble_ctx, iova);
 	}
 
-	return 0;
 }
 
 void clean_map(struct kmem_cache *addr_cache, struct kiumd_ctx *kiumd_ctx,
@@ -1114,6 +1096,7 @@ int set_kgsl_map_iova(struct kmem_cache *addr_cache, struct kiumd_ctx *kiumd_ctx
 		return -ENOSPC;
 	}
 
+	smap->is_fixed_map = true;
 	smap->is_kgsl_map = true;
 	smap->is_kgsl_ctx = true;
 	smap->kgsl_ctx.ptselect = kiusr.ptselect;
@@ -1185,6 +1168,7 @@ int init_and_allocate_iova(struct kmem_cache *addr_cache, struct device *dev,
 		return -ENOMEM;
 	}
 
+	smap->is_fixed_map = true;
 	smap->iova_rb  = iova;
 	ret = kiumd_configure_dma_cookie(dev, IOMMU_DMA_MSI_COOKIE, iova);
 	if (ret < 0) {
@@ -1240,7 +1224,7 @@ struct smmu_map_data *allocate_init_smap(struct kiumd_user kiusr,
 {
 	struct smmu_map_data *smap;
 
-	smap = kzalloc(sizeof(struct smmu_map_data), GFP_KERNEL);
+	smap = kzalloc(sizeof(*smap), GFP_KERNEL);
 	if (!smap)
 		return NULL;
 
@@ -1253,6 +1237,31 @@ struct smmu_map_data *allocate_init_smap(struct kiumd_user kiusr,
 	smap->is_iova_zero = KIUSR_IS_IOVA_ZERO(kiusr);
 	smap->is_fixed_map = is_fixed_mapping(smap->dev);
 
+	return smap;
+}
+
+struct smmu_map_data *allocate_init_smap_mmio(struct  kiumd_smmu_mmio_map kiusr,
+					      struct resource *res,
+					      struct device *dev)
+{
+	struct kiumd_smmu_mmio_ctx *mmio_ctx;
+	struct smmu_map_data *smap;
+
+	smap = kzalloc(sizeof(*smap), GFP_KERNEL);
+	if (!smap)
+		return NULL;
+
+	mmio_ctx = kzalloc(sizeof(*mmio_ctx), GFP_KERNEL);
+	if (!mmio_ctx) {
+		kfree(smap);
+		return NULL;
+	}
+
+	mmio_ctx->size = resource_size(res);
+	mmio_ctx->addr = res->start;
+	smap->context = mmio_ctx;
+	smap->dev = dev;
+	smap->is_fixed_map = kiusr.iova && kiusr.fixed_iova;
 	return smap;
 }
 
@@ -1393,6 +1402,14 @@ fail_attach:
 	return ret;
 }
 
+int kiumd_mmio_map(struct smmu_map_data *smap)
+{
+	smap->context->iova = dma_map_resource(smap->dev,
+			      smap->context->addr, smap->context->size, 0, 0);
+	return dma_mapping_error(smap->dev, smap->context->iova);
+
+}
+
 void release_map_data(struct kiumd_ctx *kiumd_ctx, struct smmu_map_data *smap)
 {
 	spin_lock(&kiumd_ctx->smmu_lock);
@@ -1401,54 +1418,6 @@ void release_map_data(struct kiumd_ctx *kiumd_ctx, struct smmu_map_data *smap)
 	spin_unlock(&kiumd_ctx->smmu_lock);
 }
 
-/*TODO: Remove the function after kiumd refactor phase 3*/
-int kiumd_mmio_iommu_map(struct kiumd_smmu_mmio_map *kiusr, struct device *dev,
-				struct kiumd_smmu_mmio_ctx *mmio_ctx, struct resource *res)
-{
-	struct kiumd_iommu_dma_cookie *cookie;
-	int ret, retval = 0;
-	dma_addr_t dma_addr;
-	u64 addr, size;
-
-	addr = res->start;
-	size = resource_size(res);
-
-	cookie = kiumd_get_dma_cookie(dev);
-	if (!cookie) {
-		pr_err("%s:cookie not found\n", __func__);
-		return -EINVAL;
-	}
-
-	if (kiusr->fixed_iova) {
-		mutex_lock(&cookie->mutex);
-		ret = kiumd_set_dma_cookie(cookie, IOMMU_DMA_MSI_COOKIE, kiusr->iova);
-		if (ret) {
-			mutex_unlock(&cookie->mutex);
-			return -EINVAL;
-		}
-	}
-
-	dma_addr = dma_map_resource(dev, addr, size, 0, 0);
-	ret = dma_mapping_error(dev, dma_addr);
-	if (kiusr->fixed_iova) {
-		retval = kiumd_set_dma_cookie(cookie, IOMMU_DMA_IOVA_COOKIE, 0);
-		mutex_unlock(&cookie->mutex);
-	}
-
-	if (ret || retval) {
-		pr_err("%s:Failed to map with error: %d\n", __func__, ret);
-		return -EINVAL;
-	}
-
-	kiusr->iova = dma_addr;
-	kiusr->reg_len = size;
-
-	mmio_ctx->iova = dma_addr;
-	mmio_ctx->size = size;
-	mmio_ctx->dev = dev;
-
-	return ret;
-}
 
 void kiumd_dmabuf_zero_unmap(struct smmu_map_data *smap)
 {
@@ -1483,6 +1452,13 @@ void kiumd_dmabuf_unmap(struct smmu_map_data *smap)
 					  smap->dma_dir);
 	dma_buf_detach(smap->dmabuf_ptr, smap->dmabufattach);
 	dma_buf_put(smap->dmabuf_ptr);
+}
+
+void kiumd_mmio_unmap(struct smmu_map_data *smap)
+{
+	dma_unmap_resource(smap->dev, smap->context->iova,
+			   smap->context->size, 0, 0);
+	kfree(smap->context);
 }
 
 unsigned long get_hash_key(struct device *dev)

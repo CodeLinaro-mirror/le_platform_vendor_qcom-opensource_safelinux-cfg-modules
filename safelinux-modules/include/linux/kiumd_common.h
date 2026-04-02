@@ -47,6 +47,7 @@
 
 #define KIUMD_32BIT_START_IOVA		(0x1000)
 #define KIUMD_32BIT_END_IOVA		(0xFFFFFFFF)
+#define DEFAULT_IOVA_ALIGN_SHIFT_MAX	(12)
 
 struct smmu_device_obj {
 	struct kobject *kobj;
@@ -57,9 +58,10 @@ struct smmu_device_obj {
 };
 
 struct kiumd_smmu_mmio_ctx {
-	struct device *dev;
+	resource_size_t addr;
 	dma_addr_t iova;
 	size_t size;
+	struct device *dev;
 };
 
 struct kiumd_smmu_kgsl_ctx {
@@ -340,7 +342,7 @@ unsigned long get_shift_from_dt(struct device *dev);
 
 int kiumd_set_dma_addr_ranges(struct kiumd_ctx *kiumd_ctx, struct device *dev);
 
-int clear_kgsl_map_iova(struct kmem_cache *addr_cache,
+void clear_kgsl_map_iova(struct kmem_cache *addr_cache,
 			struct kiumd_ctx *kiumd_ctx, struct smmu_map_data *smap);
 
 int set_kgsl_map_iova(struct kmem_cache *addr_cache, struct kiumd_ctx *kiumd_ctx,
@@ -362,11 +364,17 @@ bool is_fixed_mapping(struct device *dev);
 struct smmu_map_data *allocate_init_smap(struct kiumd_user kiusr,
 					 struct device *dev, u64 size);
 
+struct smmu_map_data *allocate_init_smap_mmio(struct  kiumd_smmu_mmio_map kiusr,
+					      struct resource *res,
+					      struct device *dev);
+
 int kiumd_dmabuf_zero_map(struct smmu_map_data *smap);
 
 int kiumd_dmabuf_priv_map(struct smmu_map_data *smap);
 
 int kiumd_dmabuf_map(struct smmu_map_data *smap);
+
+int kiumd_mmio_map(struct smmu_map_data *smap);
 
 void kiumd_dmabuf_zero_unmap(struct smmu_map_data *smap);
 
@@ -374,8 +382,10 @@ void kiumd_dmabuf_priv_unmap(struct smmu_map_data *smap);
 
 void kiumd_dmabuf_unmap(struct smmu_map_data *smap);
 
-int free_allocated_iova(struct kmem_cache *addr_cache, struct kiumd_ctx *kiumd_ctx,
-									unsigned long iova);
+void kiumd_mmio_unmap(struct smmu_map_data *smap);
+
+void free_allocated_iova(struct kmem_cache *addr_cache, struct kiumd_ctx *kiumd_ctx,
+			 unsigned long iova);
 
 int init_and_allocate_iova(struct kmem_cache *addr_cache, struct device *dev,
 			   struct kiumd_ctx *kiumd_ctx,
@@ -417,8 +427,8 @@ int kiumd_set_dma_cookie(struct kiumd_iommu_dma_cookie *cookie,
 			 dma_addr_t iova);
 int set_allocated_iova(struct device *dev, unsigned long iova);
 
-int free_iova_range(struct kmem_cache *addr_cache,
-				struct pgtable_map *map, unsigned long iova);
+void free_iova_range(struct kmem_cache *addr_cache,
+		     struct pgtable_map *map, unsigned long iova);
 
 void clean_map(struct kmem_cache *addr_cache, struct kiumd_ctx *kiumd_ctx,
 						struct smmu_map_data *smap);
@@ -430,8 +440,4 @@ int kiumd_iommu_custom_iova_init(struct device *dev);
 struct iommu_addr_entry *alloc_iommu_addr_entry(struct kmem_cache *addr_cache,
 						unsigned long base_addr,
 						unsigned long size);
-int kiumd_mmio_iommu_map(struct kiumd_smmu_mmio_map *kiusr, struct device *dev,
-							struct kiumd_smmu_mmio_ctx *mmio_ctx,
-							struct resource *res);
-
 #endif /* __KIUMD_COMMON_H__ */
