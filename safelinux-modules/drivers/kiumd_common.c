@@ -1491,6 +1491,7 @@ int kiumd_hyp_unassign_sg(struct sg_table *sgt, int *source_vm_list,
 		sg = sg_next(sg);
 	} while (sg);
 
+	sg = sgt->sgl;
 	if (clear_page_private)
 		for_each_sg(sgt->sgl, sg, sgt->nents, i) {
 			if (sg)
