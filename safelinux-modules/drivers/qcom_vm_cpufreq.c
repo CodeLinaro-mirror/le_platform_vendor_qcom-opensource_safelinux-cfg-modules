@@ -14,6 +14,7 @@
 #include <linux/scmi_protocol.h>
 #include <linux/slab.h>
 #include <linux/srcu.h>
+#include <linux/thermal.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
 #include <uapi/misc/qcom_vm_cpufreq.h>
@@ -96,6 +97,7 @@ struct vm_policy_node {
 
 /* Global cpufreq kobject for policy hierarchy - No lock needed */
 static struct kobject *cpufreq_global_kobj;
+
 
 /* Cleanup helpers */
 static inline void vm_cpufreq_client_ctx_cleanup(struct vm_cpufreq_client_ctx *ctx_ptr)
@@ -319,31 +321,20 @@ static int vm_cpufreq_recompute_and_update(struct vm_cpufreq_cluster *cluster)
 {
 	struct vm_cpufreq_client_ctx *ctx;
 	u32 new_target = 0;
-	bool has_clients = false;
 
 	lockdep_assert_held(&cluster->lock);
 
 	list_for_each_entry(ctx, &cluster->client_list, node) {
-		has_clients = true;
 		if (ctx->client.level > new_target)
 			new_target = ctx->client.level;
 	}
 
-	if (!has_clients) {
-		/*
-		 * No clients remain.  Reset the cached level to 0 so the next
-		 * client that arrives will always issue a fresh SCMI call
-		 * (new_target != agg_applied_level).  We intentionally do NOT
-		 * push a level=0 to the hardware here; the hardware stays at
-		 * the last programmed frequency until a new client requests a
-		 * change.  If explicit hardware reset is required, add a
-		 * vm_cpufreq_set_level(cluster, lowest_level) call here.
-		 */
-		cluster->agg_applied_level = 0;
-		return 0;
-	}
-
+	new_target = new_target ?: U32_MAX;
 	new_target = min_t(u32, new_target, cluster->thermal_cap_khz);
+
+	/* Keep agg_applied_level at U32_MAX while no clients are active */
+	cluster->agg_applied_level = (new_target == U32_MAX) ?
+				     U32_MAX : cluster->agg_applied_level;
 	if (new_target == cluster->agg_applied_level)
 		return 0;
 
@@ -393,6 +384,149 @@ static int vm_cpufreq_init_freq_table(struct vm_cpufreq_cluster *cluster)
 	/* Loop runs exactly 'count' times; num_levels == count on success */
 	cluster->num_levels = i;
 	return 0;
+}
+
+/* =========================================================================
+ * CPU Cooling Device Implementation
+ * =========================================================================
+ */
+
+struct vm_cpufreq_cdev_device {
+	struct list_head node;
+	struct thermal_cooling_device *cdev;
+	struct vm_cpufreq_cluster *cluster;
+	int cpu;
+	unsigned long cur_state;
+	unsigned long max_state;
+	char cdev_name[THERMAL_NAME_LENGTH];
+};
+
+/* Global list of cooling devices */
+static LIST_HEAD(vm_cdev_list);
+static DEFINE_MUTEX(vm_cdev_list_lock);
+
+static int vm_cpufreq_cdev_set_state(struct thermal_cooling_device *cdev,
+					unsigned long state)
+{
+	struct vm_cpufreq_cdev_device *cdev_data = cdev->devdata;
+	struct vm_cpufreq_cluster *cluster = cdev_data->cluster;
+
+	if (state > cdev_data->max_state)
+		return -EINVAL;
+	if (state == cdev_data->cur_state)
+		return 0;
+
+	cdev_data->cur_state = state;
+
+	dev_dbg(cluster->dev, "Thermal cdev:%s state:%lu (max_state:%lu)\n",
+		cdev->type, state, cdev_data->max_state);
+	/*@TODO: check if thermal cap is set correctly*/
+	guard(mutex)(&cluster->lock);
+	cluster->thermal_cap_khz = cluster->freq_table[cdev_data->max_state - state];
+
+	/*
+	 * Immediately re-apply the aggregation so that any active clients
+	 * are throttled without waiting for their next ioctl.
+	 */
+	return vm_cpufreq_recompute_and_update(cluster);
+}
+
+static int vm_cpufreq_cdev_get_state(struct thermal_cooling_device *cdev,
+					unsigned long *state)
+{
+	struct vm_cpufreq_cdev_device *cdev_data = cdev->devdata;
+
+	*state = cdev_data->cur_state;
+	return 0;
+}
+
+static int vm_cpufreq_cdev_get_max_state(struct thermal_cooling_device *cdev,
+					unsigned long *state)
+{
+	struct vm_cpufreq_cdev_device *cdev_data = cdev->devdata;
+
+	*state = cdev_data->max_state;
+	return 0;
+}
+
+static struct thermal_cooling_device_ops vm_cpufreq_cdev_ops = {
+	.set_cur_state = vm_cpufreq_cdev_set_state,
+	.get_cur_state = vm_cpufreq_cdev_get_state,
+	.get_max_state = vm_cpufreq_cdev_get_max_state,
+};
+
+/* Create cooling device for a cluster */
+static int vm_cpufreq_create_cooling_device(struct vm_cpufreq_cluster *cluster)
+{
+	struct vm_cpufreq_cdev_device *cdev_data;
+	struct device_node *np;
+	int cpu, ret = 0;
+
+	if (!cluster->freq_table || cluster->num_levels == 0)
+		return -EINVAL;
+
+	cpu = cpumask_first(&cluster->cpus);
+	if (cpu >= nr_cpu_ids)
+		return -EINVAL;
+
+	cdev_data = kzalloc(sizeof(*cdev_data), GFP_KERNEL);
+	if (!cdev_data)
+		return -ENOMEM;
+
+	cdev_data->cluster = cluster;
+	cdev_data->cpu = cpu;
+	cdev_data->max_state = cluster->num_levels - 1;
+	cdev_data->cur_state = 0;
+
+	snprintf(cdev_data->cdev_name, sizeof(cdev_data->cdev_name),
+		 "vm-thermal-cpufreq%d", cluster->domain);
+
+	/*
+	 * Register cooling device with device tree support.
+	 * This links the cooling device to the CPU's device tree node,
+	 * allowing thermal zones to reference it as <&cpu4 0 15>.
+	 */
+	np = of_cpu_device_node_get(cpu);
+	cdev_data->cdev = thermal_of_cooling_device_register(np,
+							     cdev_data->cdev_name,
+							     cdev_data,
+							     &vm_cpufreq_cdev_ops);
+	of_node_put(np);
+
+	if (IS_ERR(cdev_data->cdev)) {
+		ret = PTR_ERR(cdev_data->cdev);
+		dev_err(cluster->dev, "Failed to register cooling device %s: %d\n",
+			cdev_data->cdev_name, ret);
+		kfree(cdev_data);
+		return ret;
+	}
+
+	/* Add to global list */
+	mutex_lock(&vm_cdev_list_lock);
+	list_add(&cdev_data->node, &vm_cdev_list);
+	mutex_unlock(&vm_cdev_list_lock);
+
+	dev_info(cluster->dev, "Registered cooling device %s for domain %d (CPU %d)\n",
+		 cdev_data->cdev_name, cluster->domain, cpu);
+
+	return 0;
+}
+
+/* Remove cooling device for a cluster */
+static void vm_cpufreq_remove_cooling_device(struct vm_cpufreq_cluster *cluster)
+{
+	struct vm_cpufreq_cdev_device *cdev_data, *tmp;
+
+	mutex_lock(&vm_cdev_list_lock);
+	list_for_each_entry_safe(cdev_data, tmp, &vm_cdev_list, node) {
+		if (cdev_data->cluster == cluster) {
+			list_del(&cdev_data->node);
+			thermal_cooling_device_unregister(cdev_data->cdev);
+			kfree(cdev_data);
+			break;
+		}
+	}
+	mutex_unlock(&vm_cdev_list_lock);
 }
 
 /* File operations */
@@ -812,6 +946,9 @@ static void vm_cpufreq_release_all(void *data)
 		WRITE_ONCE(cluster->ph, NULL);
 		synchronize_srcu(&cluster->hw_srcu);
 
+		/* Remove cooling device */
+		vm_cpufreq_remove_cooling_device(cluster);
+
 		vm_cpufreq_remove_policy_structure(cluster);
 
 		if (cluster->miscdev.this_device)
@@ -846,6 +983,7 @@ static int vm_cpufreq_process_domain(struct scmi_device *sdev,
 	cluster->perf_ops = perf_ops;
 	cluster->dev = &sdev->dev;
 	cluster->thermal_cap_khz = U32_MAX;
+	cluster->agg_applied_level = U32_MAX;
 	mutex_init(&cluster->lock);
 	INIT_LIST_HEAD(&cluster->client_list);
 	INIT_LIST_HEAD(&cluster->list);
@@ -909,6 +1047,16 @@ static int vm_cpufreq_process_domain(struct scmi_device *sdev,
 	if (ret)
 		dev_warn(&sdev->dev,
 			 "Domain %d: sysfs policy structure unavailable: %d\n",
+			 domain_id, ret);
+
+	/*
+	 * Create cooling device for thermal management.
+	 * A failure here should not prevent the main functionality.
+	 */
+	ret = vm_cpufreq_create_cooling_device(cluster);
+	if (ret)
+		dev_warn(&sdev->dev,
+			 "Domain %d: cooling device creation failed: %d\n",
 			 domain_id, ret);
 
 	/*
