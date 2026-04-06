@@ -79,7 +79,8 @@ close_file:
  * kiumd_set_pgtbl_context - Set the page table context for an SMMU device.
  *
  * Parameters:
- * @arg: User-provided pointer to a struct kiumd_user containing context information
+ * @arg: User-provided pointer to a struct kiumd_user containing context
+ * information
  *
  * Return: 0 on success, negative error code on failure.
  */
@@ -603,6 +604,9 @@ static int __kiumd_dmabuf_vfio_unmap(struct kiumd_ctx *kiumd_ctx,
 
 	dma_addr = smap->is_iova_zero ?
 		   IOVA_ZERO : sg_dma_address(smap->sgt_ptr->sgl);
+
+	trace_kiumd_dmabuf_vfio_unmap_start(dev_name(smap->dev), smap->id, dma_addr);
+
 	if (smap->is_fixed_map) {
 		ret = kiumd_configure_dma_cookie(smap->dev, IOMMU_DMA_MSI_COOKIE,
 						 dma_addr);
@@ -633,6 +637,8 @@ static int __kiumd_dmabuf_vfio_unmap(struct kiumd_ctx *kiumd_ctx,
 		iommu_flush_iotlb_all(iommu_dom);
 	}
 
+	trace_kiumd_dmabuf_vfio_unmap_end(dev_name(smap->dev), smap->id, dma_addr);
+
 	return 0;
 }
 
@@ -649,8 +655,8 @@ static int __kiumd_dmabuf_vfio_unmap(struct kiumd_ctx *kiumd_ctx,
 static int kiumd_dmabuf_unmap_common(char __user *arg, struct file *fp)
 {
 	struct smmu_map_data *smap __free(kfree) = NULL;
+	struct kiumd_user_unmap kiusr;
 	struct kiumd_ctx *kiumd_ctx;
-	struct kiumd_user kiusr;
 	bool found = false;
 	int ret;
 
@@ -674,18 +680,10 @@ static int kiumd_dmabuf_unmap_common(char __user *arg, struct file *fp)
 		return -ENOENT;
 	}
 
-	trace_kiumd_dmabuf_vfio_unmap_start(dev_name(smap->dev), kiusr.vfio_fd,
-					    kiusr.dma_buf_fd, kiusr.dma_addr,
-					    kiusr.dma_attr, kiusr.dma_direction,
-					    kiusr.ptselect, kiusr.is_iova_zero,
-					    smap->size, kiumd_ctx);
-
 	guard(mutex)(&kiumd_ctx->map_lock);
 	ret = __kiumd_dmabuf_vfio_unmap(kiumd_ctx, smap);
 	if (ret)
 		return ret;
-
-	trace_kiumd_dmabuf_vfio_unmap_end(kiusr.vfio_fd);
 
 	return 0;
 }
@@ -800,11 +798,10 @@ smap_free:
 static void __kiumd_vfio_mmio_unmap(struct kiumd_ctx *kiumd_ctx,
 				   struct smmu_map_data *smap)
 {
+	kiumd_mmio_unmap(smap);
 	if (smap->is_fixed_map)
 		free_allocated_iova(iommu_addr_cache, kiumd_ctx,
-				    smap->context->iova);
-
-	kiumd_mmio_unmap(smap);
+				    smap->iova_rb);
 }
 
 /**
@@ -824,7 +821,7 @@ static void __kiumd_vfio_mmio_unmap(struct kiumd_ctx *kiumd_ctx,
 static int kiumd_mmio_smmu_unmap(char __user *arg, struct file *fp)
 {
 	struct smmu_map_data *smap __free(kfree) = NULL;
-	struct kiumd_smmu_mmio_map kiusr;
+	struct kiumd_user_unmap kiusr;
 	struct kiumd_ctx *kiumd_ctx;
 	bool found = false;
 
@@ -832,7 +829,7 @@ static int kiumd_mmio_smmu_unmap(char __user *arg, struct file *fp)
 	if (copy_from_user(&kiusr, arg, sizeof(kiusr)))
 		return -EFAULT;
 
-	trace_kiumd_mmio_smmu_unmap_start(kiusr.vfio_fd, kiusr.iova, kiusr.id);
+	trace_kiumd_mmio_smmu_unmap_start(kiusr.id);
 	spin_lock(&kiumd_ctx->smmu_lock);
 	hash_for_each_possible(kiumd_ctx->smmu_table, smap, node, kiusr.id) {
 		if (smap->id == kiusr.id && smap->context) {
@@ -1345,7 +1342,7 @@ static int kiumd_vfio_ctx_init(char __user *arg, struct file *fp)
 	for (u64 i = 0; i < kiusr.num_regions; i++) {
 		mem_np = of_parse_phandle(dev->of_node, "memory-region", i);
 		if (!mem_np) {
-			pr_debug("%s:cant find phandle\n", __func__);
+			pr_debug("%s:can't find phandle\n", __func__);
 			continue;
 		}
 

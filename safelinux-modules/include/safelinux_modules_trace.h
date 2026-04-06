@@ -469,60 +469,46 @@ TRACE_EVENT(kiumd_dmabuf_vfio_map_end,
 
 TRACE_EVENT(kiumd_dmabuf_vfio_unmap_start,
 
-	TP_PROTO(const char *device_name, int vfio_fd, int dma_buf_fd,
-		 unsigned long dma_addr, int dma_attr, int dma_direction, int ptselect,
-		 int is_iova_zero, size_t size, void *kiumd_ctx),
+	TP_PROTO(const char *device_name, int id, unsigned long dma_addr),
 
-	TP_ARGS(device_name, vfio_fd, dma_buf_fd, dma_addr, dma_attr, dma_direction,
-		ptselect, is_iova_zero, size, kiumd_ctx),
+	TP_ARGS(device_name, id, dma_addr),
 
 	TP_STRUCT__entry(
 		__string(str, device_name)
-		__field(int, vfio_fd)
-		__field(int, dma_buf_fd)
+		__field(int, id)
 		__field(unsigned long, dma_addr)
-		__field(int, dma_attr)
-		__field(int, dma_direction)
-		__field(int, ptselect)
-		__field(int, is_iova_zero)
-		__field(size_t, size)
-		__field(void *, kiumd_ctx)
 	),
 
 	TP_fast_assign(
 		__assign_str(str, device_name);
-		__entry->vfio_fd = vfio_fd;
-		__entry->dma_buf_fd = dma_buf_fd;
+		__entry->id = id;
 		__entry->dma_addr = dma_addr;
-		__entry->dma_attr = dma_attr;
-		__entry->dma_direction = dma_direction;
-		__entry->ptselect = ptselect;
-		__entry->is_iova_zero = is_iova_zero;
-		__entry->size = size;
-		__entry->kiumd_ctx = kiumd_ctx;
 	),
 
-	TP_printk("device_name=%s, vfio_fd=%d, dma_buf_fd=%d, dma_addr=0x%lx, dma_attr=%d, dma_direction=%d, ptselect=%d, is_iova_zero=%d size=%zu kiumd_ctx=%p",
-		   __get_str(str), __entry->vfio_fd, __entry->dma_buf_fd, __entry->dma_addr,
-		   __entry->dma_attr, __entry->dma_direction, __entry->ptselect,
-		   __entry->is_iova_zero, __entry->size, __entry->kiumd_ctx)
+	TP_printk("device_name=%s, map_id=%d, dma_addr=0x%lx",
+		   __get_str(str), __entry->id, __entry->dma_addr)
 );
 
 TRACE_EVENT(kiumd_dmabuf_vfio_unmap_end,
 
-	TP_PROTO(int vfio_fd),
+	TP_PROTO(const char *device_name, int id, unsigned long dma_addr),
 
-	TP_ARGS(vfio_fd),
+	TP_ARGS(device_name, id, dma_addr),
 
 	TP_STRUCT__entry(
-		__field(int, vfio_fd)
+		__string(str, device_name)
+		__field(int, id)
+		__field(unsigned long, dma_addr)
 	),
 
 	TP_fast_assign(
-		__entry->vfio_fd = vfio_fd;
+		__assign_str(str, device_name);
+		__entry->id = id;
+		__entry->dma_addr = dma_addr;
 	),
 
-	TP_printk("vfio_fd=%d", __entry->vfio_fd)
+	TP_printk("device_name=%s, map_id=%d, dma_addr=0x%lx",
+		   __get_str(str), __entry->id, __entry->dma_addr)
 );
 
 TRACE_EVENT(kiumd_iova_ctrl_start,
@@ -791,24 +777,19 @@ TRACE_EVENT(kiumd_mmio_smmu_map_end,
 
 TRACE_EVENT(kiumd_mmio_smmu_unmap_start,
 
-	TP_PROTO(int vfio_fd, __u64 iova, int id),
+	TP_PROTO(int id),
 
-	TP_ARGS(vfio_fd, iova, id),
+	TP_ARGS(id),
 
 	TP_STRUCT__entry(
-		__field(int, vfio_fd)
-		__field(__u64, iova)
 		__field(int, id)
 	),
 
 	TP_fast_assign(
-		__entry->vfio_fd =  vfio_fd;
-		__entry->iova = iova;
 		__entry->id = id;
 	),
 
-	TP_printk("vfio_fd=%d, iova=%llx, id=%d", __entry->vfio_fd, __entry->iova,
-		  __entry->id)
+	TP_printk("map_id = %d", __entry->id)
 );
 
 TRACE_EVENT(kiumd_mmio_smmu_unmap_end,
@@ -825,7 +806,7 @@ TRACE_EVENT(kiumd_mmio_smmu_unmap_end,
 		__entry->id = id;
 	),
 
-	TP_printk("id=%d", __entry->id)
+	TP_printk("map_id = %d", __entry->id)
 );
 
 TRACE_EVENT(kiumd_vfio_ctx_init_start,
