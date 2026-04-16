@@ -24,6 +24,9 @@
 #include <linux/xarray.h>
 #include <linux/pm_runtime.h>
 
+#define CREATE_TRACE_POINTS
+#include "safelinux_modules_trace.h"
+
 #define IS_PGTABLE_SET(kiusr) \
 	((kiusr.ptselect == KGSL_GLOBAL_PT) || (kiusr.ptselect == KGSL_PER_PROCESS_PT))
 
@@ -270,6 +273,8 @@ static int umd_kgsl_process_pt_alloc(char __user *arg, struct umd_kgsl_data *kgs
 		ret = -EINVAL;
 		goto free_pt_context;
 	}
+
+	trace_umd_kgsl_process_pt_alloc(dev_name(kgsl_data->dev), kiusr.pt_id);
 
 	return 0;
 
@@ -631,6 +636,8 @@ static int umd_kgsl_perprocess_pgtble_set(char __user *arg, struct umd_kgsl_data
 
 	smmu_dom->pgtbl_ops = pgtable_ops;
 
+	trace_umd_kgsl_perprocess_pgtble_set(dev_name(kgsl_data->dev), kiusr.pt_id);
+
 	return 0;
 }
 
@@ -910,7 +917,8 @@ static int umd_kgsl_dmabuf_map(char __user *arg, struct umd_kgsl_data *kgsl_data
 	struct smmu_map_data *smap;
 	struct kiumd_user kiusr;
 	struct device *dev;
-	int size, ret = 0;
+	u64 size;
+	int ret = 0;
 
 	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user)))
 		return -EFAULT;
@@ -948,6 +956,9 @@ static int umd_kgsl_dmabuf_map(char __user *arg, struct umd_kgsl_data *kgsl_data
 		ret = kiumd_dmabuf_priv_map(smap);
 	else
 		ret = kiumd_dmabuf_map(smap);
+
+	trace_umd_kgsl_dmabuf_map(dev_name(dev), smap->kgsl_ctx.iova, size,
+							kiusr.ptselect, kiusr.pt_id);
 
 	if (ret)
 		goto dmabuf_put;
@@ -1023,6 +1034,11 @@ static int umd_kgsl_dmabuf_unmap(char __user *arg, struct umd_kgsl_data *kgsl_da
 
 	if (smap->is_kgsl_ctx)
 		clear_kgsl_map_iova(kgsl_data->addr_cache, kiumd_ctx, smap);
+
+
+	trace_umd_kgsl_dmabuf_unmap(dev_name(dev), dma_addr,
+				smap->size, smap->kgsl_ctx.ptselect, smap->kgsl_ctx.pt_id);
+
 
 	if (smap->is_iova_zero)
 		kiumd_dmabuf_zero_unmap(smap);
