@@ -3235,7 +3235,8 @@ static int kiumd_hyp_unassign_sg(struct sg_table *sgt, int *source_vm_list,
 	struct qcom_scm_vmperm dst_vmids[] = { {QCOM_SCM_VMID_HLOS,
 						QCOM_SCM_PERM_RWX } };
 	struct scatterlist *sg;
-	int ret, i;
+	int ret = 0;
+	int i = 0;
 
 	if (source_nelems <= 0)
 		return -EINVAL;
