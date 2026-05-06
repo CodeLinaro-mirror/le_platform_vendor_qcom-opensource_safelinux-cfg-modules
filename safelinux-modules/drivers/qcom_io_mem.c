@@ -1590,6 +1590,16 @@ static int umd_kgsl_init(struct device *parent_dev, struct device_node *child_np
 		return dev_err_probe(&child_pdev->dev, ret,
 				     "Failed to init fault handler\n");
 
+	ret = devm_pm_runtime_set_active_enabled(&child_pdev->dev);
+	if (ret)
+		return dev_err_probe(&child_pdev->dev, ret,
+				     "Failed to enable runtime PM\n");
+
+	ret = pm_runtime_resume_and_get(&child_pdev->dev);
+	if (ret < 0)
+		return dev_err_probe(&child_pdev->dev, ret,
+				     "Failed to resume runtime PM\n");
+
 	dev_info(&child_pdev->dev, "Child device initialized with resources and interrupts\n");
 	return 0;
 }
@@ -1597,6 +1607,8 @@ static int umd_kgsl_init(struct device *parent_dev, struct device_node *child_np
 
 static int umd_kgsl_destroy_child(struct device *dev, void *data)
 {
+	if (pm_runtime_enabled(dev))
+		pm_runtime_put_noidle(dev);
 	of_platform_device_destroy(dev, NULL);
 	return 0;
 }
