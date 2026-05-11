@@ -81,3 +81,6 @@ endif
 
 obj-m  += qcom_remote_virq.o
 qcom_remote_virq-objs := drivers/qcom_remote_virq.o
+
+obj-m += qcom_vm_cpufreq.o
+qcom_vm_cpufreq-objs := drivers/qcom_vm_cpufreq.o
