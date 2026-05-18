@@ -6,6 +6,7 @@
 #include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/irq.h>
+#include <linux/irqdomain.h>
 #include <linux/kernel.h>
 #include <linux/miscdevice.h>
 #include <linux/mm.h>
@@ -21,7 +22,12 @@
 #define VDEV_OFFSET_MASK (((u64)(1) << VDEV_INDEX_OFFSET_SHIFT) - 1)
 #define VDEV_INDEX_TO_OFFSET(index) ((u64)(index) << VDEV_INDEX_OFFSET_SHIFT)
 
+
+#define CREATE_TRACE_POINTS
+#include "qcom_vdev_trace.h"
+
 struct vdev_irq {
+	const char *name;
 	int hwirq;
 	u32 count;
 	u32 flags;
@@ -91,6 +97,9 @@ static int vdev_register_eventfd(struct vdev_data *vdev_data, int eventfd, u32 i
 
 	enable_irq(hwirq);
 
+	trace_qcom_vdev_register_eventfd(dev_name(vdev_data->dev),
+		hwirq, eventfd, irq_index);
+
 	return 0;
 }
 
@@ -119,6 +128,9 @@ static int vdev_mask_interrupt(struct vdev_data *vdev_data, u32 irq_index)
 		disable_irq_nosync(irq_ctx->hwirq);
 		irq_ctx->masked = true;
 	}
+
+	trace_qcom_vdev_mask_interrupt(dev_name(vdev_data->dev),
+		irq_index, irq_ctx->hwirq, irq_ctx->flags, irq_ctx->masked);
 
 	return 0;
 }
@@ -149,6 +161,9 @@ static int vdev_unmask_interrupt(struct vdev_data *vdev_data, u32 irq_index)
 		enable_irq(irq_ctx->hwirq);
 	}
 
+	trace_qcom_vdev_unmask_interrupt(dev_name(vdev_data->dev),
+		irq_index, irq_ctx->hwirq, irq_ctx->flags, irq_ctx->masked);
+
 	return 0;
 }
 
@@ -177,6 +192,7 @@ static void vdev_send_eventfd(struct vdev_irq *irq_ctx)
 static irqreturn_t vdev_automasked_irq_handler(int irq, void *dev_id)
 {
 	struct vdev_irq  *irq_ctx = (struct vdev_irq  *)dev_id;
+	struct irq_data *d = irq_get_irq_data(irq);
 	int ret = IRQ_NONE;
 
 	if (!irq_ctx->masked) {
@@ -188,6 +204,8 @@ static irqreturn_t vdev_automasked_irq_handler(int irq, void *dev_id)
 
 	if (ret == IRQ_HANDLED)
 		vdev_send_eventfd(irq_ctx);
+
+	trace_qcom_vdev_automasked_irq_handler(irq_ctx->name, d->hwirq, irq_ctx->hwirq, ret);
 
 	return ret;
 }
@@ -204,8 +222,11 @@ static irqreturn_t vdev_automasked_irq_handler(int irq, void *dev_id)
 static irqreturn_t vdev_irq_handler(int irq, void *dev_id)
 {
 	struct vdev_irq  *irq_ctx = (struct vdev_irq  *)dev_id;
+	struct irq_data *d = irq_get_irq_data(irq);
 
 	vdev_send_eventfd(irq_ctx);
+
+	trace_qcom_vdev_irq_handler(irq_ctx->name, d->hwirq, irq_ctx->hwirq);
 
 	return IRQ_HANDLED;
 }
@@ -428,8 +449,8 @@ static int vdev_mem_regions_init(struct platform_device *pdev,
 		vdev_data->regions[rindex].flags = 0;
 		vdev_data->regions[rindex].type = VDEV_REGION_TYPE_MEM;
 
-		dev_info(dev, "memory regions: index=%d base:0x%llx size:0x%llx\n",
-		rindex, vdev_data->regions[rindex].addr, vdev_data->regions[rindex].size);
+		trace_qcom_vdev_mem_regions_init(dev_name(vdev_data->dev),
+			rindex, vdev_data->regions[rindex].addr, vdev_data->regions[rindex].size);
 	}
 
 	return 0;
@@ -476,7 +497,7 @@ static int vdev_regions_init(struct platform_device *pdev,
 		vdev_data->regions[rindex].flags = 0;
 		vdev_data->regions[rindex].type = VDEV_REGION_TYPE_MMIO;
 
-		dev_info(dev, "Resource %d: start = 0x%llx, size = 0x%llx\n", rindex,
+		trace_qcom_vdev_regions_init(dev_name(vdev_data->dev), rindex,
 			(unsigned long long)res->start, (unsigned long long)resource_size(res));
 	}
 
@@ -522,6 +543,7 @@ static int vdev_irq_init(struct platform_device *pdev,
 		vdev_data->irqs[i].count = 1;
 		vdev_data->irqs[i].hwirq = hwirq;
 		vdev_data->irqs[i].masked = false;
+		vdev_data->irqs[i].name = devm_kstrdup(&pdev->dev, vdev_data->name, GFP_KERNEL);
 
 		ret = devm_request_irq(&pdev->dev, vdev_data->irqs[i].hwirq, handler,
 				IRQF_NO_AUTOEN, vdev_data->name, &vdev_data->irqs[i]);
