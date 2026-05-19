@@ -24,6 +24,8 @@ INSTALL_HDR=$(shell mkdir -p $(HDR_INSTAL_PATH)/linux; \
 			 $(KDIR)/scripts/headers_install.sh \
 			 $(PWD)/include/uapi/misc/scm_user_intf.h $(HDR_INSTAL_PATH)/uapi/misc/scm_user_intf.h; \
 			 $(KDIR)/scripts/headers_install.sh \
+			 $(PWD)/include/uapi/misc/named_dmabuf.h $(HDR_INSTAL_PATH)/uapi/misc/named_dmabuf.h; \
+			 $(KDIR)/scripts/headers_install.sh \
 			 $(PWD)/include/uapi/misc/vendor_uscmi.h $(HDR_INSTAL_PATH)/uapi/misc/vendor_uscmi.h; \
 			 [ -f $(HDR_INSTAL_PATH)/uapi/misc/kiumd.h ] && [ -f $(HDR_INSTAL_PATH)/uapi/misc/scm_user_intf.h ] && echo "passed" || echo "failed")
 
