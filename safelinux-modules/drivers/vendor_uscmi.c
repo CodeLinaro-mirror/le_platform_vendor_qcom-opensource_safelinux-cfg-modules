@@ -160,28 +160,25 @@ static int uscmi_vendor_probe(struct platform_device *pdev)
 
 	scmi_dev = bus_find_device_by_of_node(&scmi_bus_type, scmi_node);
 	if (unlikely(!scmi_dev)) {
-		dev_err(dev, "scmi dev not found %s\n", __func__);
-		return -ENODEV;
+		return dev_err_probe(dev, -EPROBE_DEFER,
+				"scmi dev not ready %s\n", __func__);
 	}
 
 	dev_dbg(dev, "device found: %s\n", dev_name(scmi_dev));
 
 	uscmi->sdev = dev_get_drvdata(scmi_dev);
-	if (unlikely(!uscmi->sdev)) {
-		pr_info("drv data not set %s\n", __func__);
-		return -EINVAL;
+	if (unlikely(!uscmi->sdev || !uscmi->sdev->handle)) {
+		return dev_err_probe(dev, -EPROBE_DEFER,
+				"SCMI drv sdev/handle not ready %s\n", __func__);
 	}
-
-	if (unlikely(!uscmi->sdev->handle))
-		return -EINVAL;
 
 	uscmi->ops = uscmi->sdev->handle->devm_protocol_get(uscmi->sdev,
 			QCOM_SCMI_VENDOR_PROTOCOL, &uscmi->ph);
 	if (unlikely(IS_ERR(uscmi->ops))) {
 		ret = PTR_ERR(uscmi->ops);
 		uscmi->ops = NULL;
-		dev_err(dev, "Error getting vendor protocol ops: %d\n", ret);
-		return ret;
+		return dev_err_probe(dev, ret,
+				"Error getting vendor protocol ops: %d\n", ret);
 	}
 
 	uscmi->miscdev.minor = MISC_DYNAMIC_MINOR;
