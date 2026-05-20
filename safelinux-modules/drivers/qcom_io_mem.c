@@ -753,6 +753,56 @@ static int umd_platform_fixed_iova_control(char __user *arg, struct umd_kgsl_dat
 	return ret;
 }
 
+static int kiumd_mmio_iommu_map(struct kiumd_smmu_mmio_map *kiusr,
+				struct device *dev,
+				struct kiumd_smmu_mmio_ctx *mmio_ctx,
+				struct resource *res)
+{
+	struct kiumd_iommu_dma_cookie *cookie;
+	int ret, retval = 0;
+	dma_addr_t dma_addr;
+	u64 addr, size;
+
+	addr = res->start;
+	size = resource_size(res);
+
+	cookie = kiumd_get_dma_cookie(dev);
+	if (!cookie) {
+		pr_err("%s:cookie not found\n", __func__);
+		return -EINVAL;
+	}
+
+	if (kiusr->fixed_iova) {
+		mutex_lock(&cookie->mutex);
+		ret = kiumd_set_dma_cookie(cookie, IOMMU_DMA_MSI_COOKIE, kiusr->iova);
+		if (ret) {
+			mutex_unlock(&cookie->mutex);
+			return -EINVAL;
+		}
+	}
+
+	dma_addr = dma_map_resource(dev, addr, size, 0, 0);
+	ret = dma_mapping_error(dev, dma_addr);
+	if (kiusr->fixed_iova) {
+		retval = kiumd_set_dma_cookie(cookie, IOMMU_DMA_IOVA_COOKIE, 0);
+		mutex_unlock(&cookie->mutex);
+	}
+
+	if (ret || retval) {
+		pr_err("%s:Failed to map with error: %d\n", __func__, ret);
+		return -EINVAL;
+	}
+
+	kiusr->iova = dma_addr;
+	kiusr->reg_len = size;
+
+	mmio_ctx->iova = dma_addr;
+	mmio_ctx->size = size;
+	mmio_ctx->dev = dev;
+
+	return ret;
+}
+
 static int umd_kgsl_mmio_smmu_map(char __user *arg, struct umd_kgsl_data *kgsl_data)
 {
 	struct kiumd_smmu_mmio_ctx *mmio_ctx;
@@ -946,11 +996,8 @@ static int umd_kgsl_dmabuf_unmap(char __user *arg, struct umd_kgsl_data *kgsl_da
 			return -ENODEV;
 	}
 
-	if (smap->is_kgsl_ctx) {
-		ret = clear_kgsl_map_iova(kgsl_addr_cache, kiumd_ctx, smap);
-		if (ret)
-			return -ENOENT;
-	}
+	if (smap->is_kgsl_ctx)
+		clear_kgsl_map_iova(kgsl_addr_cache, kiumd_ctx, smap);
 
 	if (smap->is_iova_zero)
 		kiumd_dmabuf_zero_unmap(smap);

@@ -13,6 +13,13 @@
 #include <linux/slab.h>
 #include <linux/version.h>
 
+/* Ratelimit: 100 dev_err() calls per 1 second window using __ratelimit().
+ * Kernel default is 10 messages per 5 seconds (DEFAULT_RATELIMIT_BURST/INTERVAL),
+ * which could be too less for iommu fault handler.
+ */
+
+static DEFINE_RATELIMIT_STATE(iommufault_rs, 1 * HZ, 100);
+
 /*
  * struct device_fault_info - This structure holds information about faults information
  * detected by the System Memory Management Unit (SMMU).
@@ -103,8 +110,6 @@ static ssize_t fsr_iova_show(struct kobject *kobj, struct kobj_attribute *attr,
 	fault_info->iova = 0;
 	fault_info->flag = 0;
 
-	pr_err("%s on dev 0x%x:0x%llx attr %p\n", __func__, fsr, iova, attr);
-
 	return scnprintf(buf, PAGE_SIZE, "0x%x:0x%llx\n", fsr, iova);
 }
 
@@ -145,8 +150,10 @@ static int iommu_fault_custom_handler(struct iommu_domain *domain,
 	fault_info->flag = 1;
 	sysfs_notify(fault_info->kobj, NULL, "fsr_iova");
 
-	pr_err("IOMMU fault on device %s at IOVA 0x%lx FSR %x\n",
-			fault_info->kobj->name, iova, fault_info->fsr);
+	if (__ratelimit(&iommufault_rs))
+		pr_err("IOMMU fault on device %s at IOVA 0x%lx FSR %x\n",
+				fault_info->kobj->name, iova, fault_info->fsr);
+
 	return 0;
 }
 
