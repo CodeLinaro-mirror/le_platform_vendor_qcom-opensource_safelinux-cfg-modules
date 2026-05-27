@@ -10,6 +10,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/overflow.h>
 #include <linux/pm_opp.h>
 #include <linux/scmi_protocol.h>
 #include <linux/slab.h>
@@ -29,9 +30,18 @@ struct vm_cpufreq_client_ctx;
 #define DEFAULT_TRANSITION_LATENCY_US 10000
 
 /*
+ * Per-cluster cap on concurrent open() handles. Each open allocates a
+ * vm_cpufreq_client_ctx and adds an entry to client_list; aggregation is O(N)
+ * over that list. Without a cap, a misbehaving guest can drive arbitrary
+ * memory growth and CPU work per ioctl. 256 is well above any plausible
+ * legitimate use (one or a handful of governors per VM).
+ */
+#define VM_CPUFREQ_MAX_CLIENTS 256
+
+/*
  * rate_limit - enable transition-latency rate limiting (default: off).
  *
- * When true, vm_cpufreq_set_level() rejects SCMI level_set calls that arrive
+ * When true, vm_cpufreq_apply_freq_khz() rejects SCMI freq_set calls that arrive
  * sooner than transition_latency_us after the previous successful call,
  * returning -EAGAIN to the caller.
  *
@@ -42,11 +52,16 @@ struct vm_cpufreq_client_ctx;
 static bool rate_limit;
 module_param(rate_limit, bool, 0444);
 MODULE_PARM_DESC(rate_limit,
-		 "Reject level_set calls within transition_latency_us of the previous call (default: 0)");
+		 "Reject freq_set calls within transition_latency_us of the previous call (default: 0)");
 
-/* Client data structure - simplified to single performance level request */
+/*
+ * Per-client request, in kHz. Named freq_khz (not "level") to avoid
+ * confusion with the SCMI perf-protocol "level" concept and with the
+ * UAPI's level-index field; this driver always operates in the kHz
+ * domain via perf_ops->freq_set / freq_get.
+ */
 struct vm_cpufreq_client {
-	u32 level;
+	u32 freq_khz;
 };
 
 /* Cluster device structure */
@@ -63,17 +78,34 @@ struct vm_cpufreq_cluster {
 	struct mutex lock;
 
 	struct list_head client_list;
-	u32 agg_applied_level;
+	/* Number of entries in client_list (capped at VM_CPUFREQ_MAX_CLIENTS) */
+	u32 client_count;
+	/*
+	 * Last freq we asked SCMI to apply, in kHz. Initialized to U32_MAX
+	 * as a "nothing applied yet" sentinel: with that value, the first
+	 * recompute_and_update with no active client requests falls back to
+	 * U32_MAX, then min_t clamps to thermal_cap_khz, so a thermal cap
+	 * fired before any client SETs is enforced by pushing the cap
+	 * itself. Real kHz values replace the sentinel after the first apply.
+	 */
+	u32 agg_applied_freq_khz;
 
-	/* Rate limiting for level changes */
+	/* Rate limiting for frequency changes */
 	ktime_t last_freq_change;
 	u32 transition_latency_us;
 
 	u32 *freq_table;
 	u32 num_levels;
 	u32 thermal_cap_khz;
+	struct device *opp_dev;
 	/* Policy kobject for cpufreq hierarchy */
 	struct kobject *policy_kobj;
+	/*
+	 * CPUs whose /sys/devices/system/cpu/cpuN/cpufreq symlink we
+	 * created. Only these are torn down on remove, so we never delete a
+	 * symlink owned by another cpufreq driver.
+	 */
+	struct cpumask policy_link_cpus;
 	struct srcu_struct hw_srcu;
 };
 
@@ -195,8 +227,8 @@ static int vm_cpufreq_freq_to_index(struct vm_cpufreq_cluster *cluster,
 	return -EINVAL;
 }
 
-/* Get current frequency in kHz via SCMI */
-static int vm_cpufreq_get_level(struct vm_cpufreq_cluster *cluster, u32 *freq_khz)
+/* Query current frequency from SCMI, in kHz. */
+static int vm_cpufreq_query_freq_khz(struct vm_cpufreq_cluster *cluster, u32 *freq_khz)
 {
 	ktime_t start_time, end_time;
 	unsigned long freq_hz;
@@ -228,6 +260,7 @@ static int vm_cpufreq_get_level(struct vm_cpufreq_cluster *cluster, u32 *freq_kh
 	if (!ret)
 		*freq_khz = (u32)(freq_hz / 1000);
 
+	/* trace field "level" carries kHz; tracepoint name kept for ABI stability */
 	trace_vm_cpufreq_level_get(cluster->domain, ret ? 0 : *freq_khz, ret,
 				   duration_us);
 out:
@@ -235,11 +268,12 @@ out:
 	return ret;
 }
 
-/* Set performance level via SCMI - caller must hold cluster->lock */
-static int vm_cpufreq_set_level(struct vm_cpufreq_cluster *cluster, u32 level,
-				bool urgent)
+/* Apply requested frequency (kHz) via SCMI - caller must hold cluster->lock. */
+static int vm_cpufreq_apply_freq_khz(struct vm_cpufreq_cluster *cluster, u32 freq_khz,
+				     bool urgent)
 {
 	ktime_t start_time, end_time;
+	unsigned long rate_hz;
 	int ret, srcu_idx;
 	s64 duration_us;
 
@@ -267,24 +301,39 @@ static int vm_cpufreq_set_level(struct vm_cpufreq_cluster *cluster, u32 level,
 
 		if (elapsed_us < cluster->transition_latency_us) {
 			dev_dbg(cluster->dev,
-				"Rate limit: rejecting level change (%lld us since last, need %u us)\n",
+				"Rate limit: rejecting freq change (%lld us since last, need %u us)\n",
 				elapsed_us, cluster->transition_latency_us);
 			ret = -EAGAIN;
-			trace_vm_cpufreq_level_set(cluster->domain, level, ret, 0);
+			trace_vm_cpufreq_level_set(cluster->domain, freq_khz, ret, 0);
 			goto out;
 		}
 	}
 
+	/*
+	 * Convert kHz to Hz before handing to SCMI. The multiplication is
+	 * done in unsigned long width to match freq_set's parameter type.
+	 * On 32-bit kernels this can overflow for freq_khz > ULONG_MAX/1000
+	 * (~4.29 GHz); detect that explicitly and surface -ERANGE rather
+	 * than passing a wrapped rate to firmware.
+	 */
+	if (check_mul_overflow((unsigned long)freq_khz, 1000UL, &rate_hz)) {
+		dev_err(cluster->dev,
+			"freq %u kHz would overflow unsigned long Hz\n", freq_khz);
+		ret = -ERANGE;
+		trace_vm_cpufreq_level_set(cluster->domain, freq_khz, ret, 0);
+		goto out;
+	}
+
 	start_time = ktime_get();
 	ret = cluster->perf_ops->freq_set(cluster->ph, cluster->domain,
-					  (u64)level * 1000, false);
+					  rate_hz, false);
 	end_time = ktime_get();
 	duration_us = ktime_us_delta(end_time, start_time);
 
-	trace_vm_cpufreq_level_set(cluster->domain, level, ret, duration_us);
+	trace_vm_cpufreq_level_set(cluster->domain, freq_khz, ret, duration_us);
 
 	if (!ret) {
-		cluster->agg_applied_level = level;
+		cluster->agg_applied_freq_khz = freq_khz;
 		cluster->last_freq_change = end_time;
 	}
 
@@ -298,37 +347,58 @@ static int vm_cpufreq_recompute_and_update(struct vm_cpufreq_cluster *cluster,
 					   bool urgent)
 {
 	struct vm_cpufreq_client_ctx *ctx;
-	u32 new_target = 0;
+	u32 new_target;
 
 	lockdep_assert_held(&cluster->lock);
 
-	list_for_each_entry(ctx, &cluster->client_list, node) {
-		if (ctx->client.level > new_target)
-			new_target = ctx->client.level;
-	}
-
 	/*
-	 * new_target == 0 means no client has an active request. Fall back
-	 * to agg_applied_level (U32_MAX at init, a real kHz value once any
-	 * level has been set). The U32_MAX sentinel is intentional: it lets
-	 * a thermal cap take effect even before any client makes a request,
-	 * by producing new_target = min(U32_MAX, cap) = cap. When no thermal
-	 * cap is active, min(U32_MAX, U32_MAX) = U32_MAX = agg_applied_level,
-	 * so the equality check below short-circuits with no SCMI call.
+	 * Defensive bail-out. recompute_and_update is called from:
+	 *   - handle_level_set (via cluster_ioctl, which gates on
+	 *     freq_table+num_levels — so init has completed by the time we
+	 *     get here),
+	 *   - vm_cpufreq_cdev_set_state (cdev is created only after
+	 *     init_freq_table succeeds, so init has completed).
+	 * Both paths imply freq_table and num_levels are populated. Keep
+	 * the check as belt-and-suspenders against a future refactor that
+	 * adds another caller path.
 	 */
-	new_target = new_target ?: cluster->agg_applied_level;
-	new_target = min_t(u32, new_target, cluster->thermal_cap_khz);
-
-	if (new_target == cluster->agg_applied_level)
+	if (!cluster->freq_table || !cluster->num_levels)
 		return 0;
 
-	return vm_cpufreq_set_level(cluster, new_target, urgent);
+	new_target = 0;
+	list_for_each_entry(ctx, &cluster->client_list, node)
+		if (ctx->client.freq_khz > new_target)
+			new_target = ctx->client.freq_khz;
+
+	/*
+	 * No active client request: fall back to agg_applied_freq_khz, which
+	 * is U32_MAX before any apply has happened and a real kHz value
+	 * thereafter. The U32_MAX sentinel ensures the first thermal cdev
+	 * fire with no clients pushes the cap itself: min(U32_MAX, cap) =
+	 * cap. After any apply, the fallback is whatever was last applied,
+	 * so subsequent cdev events without clients re-converge against the
+	 * same value (equality check below short-circuits when the cap
+	 * doesn't actually change the target).
+	 *
+	 * Userspace-governor semantics: cluster_release does NOT call
+	 * recompute_and_update, so a closing client cannot trigger a drop
+	 * here. Firmware stays at the last applied freq until the next
+	 * SET or cdev event re-aggregates.
+	 */
+	new_target = new_target ?: cluster->agg_applied_freq_khz;
+
+	new_target = min_t(u32, new_target, cluster->thermal_cap_khz);
+
+	if (new_target == cluster->agg_applied_freq_khz)
+		return 0;
+
+	return vm_cpufreq_apply_freq_khz(cluster, new_target, urgent);
 }
 
 /* Initialize frequency table from OPP table */
 static int vm_cpufreq_init_freq_table(struct vm_cpufreq_cluster *cluster)
 {
-	struct device *dev = cluster->miscdev.this_device;
+	struct device *dev = cluster->opp_dev;
 	unsigned long freq_hz = 0;
 	struct dev_pm_opp *opp;
 	int count, i = 0;
@@ -346,7 +416,8 @@ static int vm_cpufreq_init_freq_table(struct vm_cpufreq_cluster *cluster)
 		return -ENODEV;
 	}
 
-	cluster->freq_table = kcalloc(count, sizeof(*cluster->freq_table), GFP_KERNEL);
+	cluster->freq_table = kcalloc(count, sizeof(*cluster->freq_table),
+				      GFP_KERNEL);
 	if (!cluster->freq_table)
 		return -ENOMEM;
 
@@ -359,12 +430,17 @@ static int vm_cpufreq_init_freq_table(struct vm_cpufreq_cluster *cluster)
 		opp = dev_pm_opp_find_freq_ceil(dev, &freq_hz);
 	}
 
-	if (!IS_ERR(opp))
+	if (!IS_ERR(opp)) {
 		dev_pm_opp_put(opp);
-	else if (PTR_ERR(opp) != -ERANGE) {
+	} else if (PTR_ERR(opp) != -ERANGE) {
+		int err = PTR_ERR(opp);
+
+		dev_err(cluster->dev,
+			"init_freq_table: dev_pm_opp_find_freq_ceil failed: %d (after %d entries)\n",
+			err, i);
 		kfree(cluster->freq_table);
 		cluster->freq_table = NULL;
-		return PTR_ERR(opp);
+		return err;
 	}
 
 	cluster->num_levels = i;
@@ -374,6 +450,25 @@ static int vm_cpufreq_init_freq_table(struct vm_cpufreq_cluster *cluster)
 		cluster->freq_table = NULL;
 		return -ENODEV;
 	}
+
+	/*
+	 * Detect Hz->kHz truncation collisions. SCMI-supplied OPPs are
+	 * MHz-grain in practice, but if firmware ever advertises two OPPs
+	 * whose Hz values fall in the same kHz bucket, freq_table ends up
+	 * with duplicates and freq_to_index() becomes ambiguous. Warn so
+	 * the underlying firmware bug is visible rather than silently
+	 * latent. OPPs are appended in ascending order, so adjacency check
+	 * suffices.
+	 */
+	for (i = 1; i < cluster->num_levels; i++) {
+		if (cluster->freq_table[i] == cluster->freq_table[i - 1]) {
+			dev_warn_once(cluster->dev,
+				"duplicate kHz bucket at index %d (%u kHz); Hz->kHz collision in OPP table\n",
+				i, cluster->freq_table[i]);
+			break;
+		}
+	}
+
 	return 0;
 }
 
@@ -411,7 +506,6 @@ static int vm_cpufreq_cdev_set_state(struct thermal_cooling_device *cdev,
 
 	dev_dbg(cluster->dev, "Thermal cdev:%s state:%lu (max_state:%lu)\n",
 		cdev->type, state, cdev_data->max_state);
-	/*@TODO: check if thermal cap is set correctly*/
 	guard(mutex)(&cluster->lock);
 	cluster->thermal_cap_khz = cluster->freq_table[cdev_data->max_state - state];
 
@@ -521,6 +615,23 @@ static void vm_cpufreq_remove_cooling_device(struct vm_cpufreq_cluster *cluster)
 }
 
 /* File operations */
+/*
+ * cluster_open is invoked by the misc framework's open path, which holds
+ * the framework's internal mutex across the entire f_op->open() call
+ * (see drivers/char/misc.c). vm_cpufreq_release_all() reaches kref_put()
+ * only after the misc device is unregistered, which acquires the same
+ * framework mutex — so the two are serialized: while we are inside
+ * cluster_open the cluster cannot reach refcount 0 and be freed under us.
+ *
+ * Within that outer barrier, cluster->lock then orders the ph read here
+ * against release_all's WRITE_ONCE(ph, NULL): if release_all wrote NULL
+ * first, we observe it and bail with -ENODEV; otherwise we acquire the
+ * client kref before dropping the lock, keeping the cluster alive past
+ * the framework mutex release.
+ *
+ * If this code is ever ported off the misc framework, the framework-mutex
+ * half of the contract has to be replaced explicitly.
+ */
 static int cluster_open(struct inode *inode, struct file *filp)
 {
 	struct miscdevice *mdev = filp->private_data;
@@ -540,8 +651,16 @@ static int cluster_open(struct inode *inode, struct file *filp)
 	if (!READ_ONCE(cluster->ph))
 		return -ENODEV;
 
+	/*
+	 * Cap concurrent clients to bound memory and per-ioctl aggregation
+	 * cost. See VM_CPUFREQ_MAX_CLIENTS for rationale.
+	 */
+	if (cluster->client_count >= VM_CPUFREQ_MAX_CLIENTS)
+		return -EBUSY;
+
 	kref_get(&cluster->ref);
 	list_add_tail(&ctx->node, &cluster->client_list);
+	cluster->client_count++;
 
 	filp->private_data = no_free_ptr(ctx);
 	return 0;
@@ -559,9 +678,18 @@ static int cluster_release(struct inode *inode, struct file *filp)
 
 	scoped_guard(mutex, &cluster->lock) {
 		list_del(&ctx->node);
-		if (vm_cpufreq_recompute_and_update(cluster, true))
-			dev_dbg(cluster->dev,
-				"Failed to update level on client close\n");
+		WARN_ON(!cluster->client_count);
+		cluster->client_count--;
+		/*
+		 * Userspace-governor semantics: a closing client withdraws
+		 * its vote from the aggregation list (the list_del above)
+		 * but does not push firmware to a new level. Firmware stays
+		 * at the last applied freq until the next SET ioctl or
+		 * thermal cdev event triggers a fresh recompute. Userspace
+		 * that wants firmware to drop on exit must explicitly SET
+		 * a lower level before closing — same convention as
+		 * cpufreq's userspace governor (sticky last value).
+		 */
 	}
 
 	filp->private_data = NULL;
@@ -574,7 +702,7 @@ static int handle_level_set(struct vm_cpufreq_cluster *cluster,
 {
 	struct cpu_perf_level_req req;
 	u32 freq_khz;
-	u32 old_level;
+	u32 old_freq_khz;
 	int ret;
 
 	if (copy_from_user(&req, argp, sizeof(req)))
@@ -588,11 +716,11 @@ static int handle_level_set(struct vm_cpufreq_cluster *cluster,
 		return -EINVAL;
 
 	guard(mutex)(&cluster->lock);
-	old_level = ctx->client.level;
-	ctx->client.level = freq_khz;
+	old_freq_khz = ctx->client.freq_khz;
+	ctx->client.freq_khz = freq_khz;
 	ret = vm_cpufreq_recompute_and_update(cluster, false);
 	if (ret)
-		ctx->client.level = old_level;
+		ctx->client.freq_khz = old_freq_khz;
 
 	return ret;
 }
@@ -604,7 +732,7 @@ static int handle_level_get(struct vm_cpufreq_cluster *cluster,
 	u32 freq_khz;
 	int ret;
 
-	ret = vm_cpufreq_get_level(cluster, &freq_khz);
+	ret = vm_cpufreq_query_freq_khz(cluster, &freq_khz);
 	if (ret)
 		return ret;
 
@@ -625,6 +753,13 @@ static int handle_get_available_levels(struct vm_cpufreq_cluster *cluster,
 	u32 i;
 
 	/*
+	 * num_levels and freq_table[] are post-init immutable. Sysfs and
+	 * ioctl readers reach this code only after init_freq_table has
+	 * completed: the cluster_ioctl entry guard returns -ENODEV during
+	 * the brief window between misc-device registration and
+	 * init_freq_table completing; the policy_kobj used by sysfs is
+	 * created after init_freq_table.
+	 *
 	 * Cap num_levels to MAX_PERF_LEVELS so that userspace cannot read
 	 * avail.num_levels and then index avail.levels[] beyond its bounds.
 	 */
@@ -677,13 +812,7 @@ static long cluster_ioctl(struct file *file, unsigned int cmd,
 		return -ENODEV;
 	}
 
-	/*
-	 * freq_table is populated once during probe and freed only after all
-	 * file descriptors are closed.  A NULL here means probe did not fully
-	 * complete — reject all commands uniformly rather than checking in each
-	 * individual handler.
-	 */
-	if (!cluster->freq_table) {
+	if (!cluster->freq_table || !cluster->num_levels) {
 		srcu_read_unlock(&cluster->hw_srcu, srcu_idx);
 		return -ENODEV;
 	}
@@ -754,7 +883,7 @@ static ssize_t vm_cpufreq_scaling_cur_freq_show(
 	u32 freq_khz;
 	int ret;
 
-	ret = vm_cpufreq_get_level(cluster, &freq_khz);
+	ret = vm_cpufreq_query_freq_khz(cluster, &freq_khz);
 	if (ret)
 		return ret;
 
@@ -769,7 +898,13 @@ static ssize_t vm_cpufreq_scaling_available_frequencies_show(
 	int count = 0, ret;	/* int matches sysfs_emit_at()'s 'int at' parameter */
 	u32 index;
 
-	if (cluster->num_levels == 0)
+	/*
+	 * Sysfs reaches this function via policy_kobj, which is only
+	 * created after misc-device registration and init_freq_table
+	 * complete. freq_table and num_levels are stable thereafter; no
+	 * extra ordering needed.
+	 */
+	if (!cluster->freq_table || !cluster->num_levels)
 		return sysfs_emit(buf, "\n");
 
 	for (index = 0; index < cluster->num_levels; index++) {
@@ -877,12 +1012,19 @@ static void vm_cpufreq_remove_policy_structure(struct vm_cpufreq_cluster *cluste
 	if (!cluster->policy_kobj)
 		return;
 
-	for_each_cpu(cpu, &cluster->cpus) {
+	/*
+	 * Only tear down the symlinks we actually created. If sysfs_create_link
+	 * returned -EEXIST during create (because another cpufreq driver had
+	 * already populated cpuN/cpufreq), we never tracked that CPU and must
+	 * not delete the symlink owned by the other driver.
+	 */
+	for_each_cpu(cpu, &cluster->policy_link_cpus) {
 		cpu_dev = get_cpu_device(cpu);
 		if (!cpu_dev)
 			continue;
 		sysfs_remove_link(&cpu_dev->kobj, "cpufreq");
 	}
+	cpumask_clear(&cluster->policy_link_cpus);
 
 	/* Decrement refcount of kobj; this eventually calls vm_policy_release */
 	kobject_put(cluster->policy_kobj);
@@ -898,6 +1040,8 @@ static int vm_cpufreq_create_policy_structure(struct vm_cpufreq_cluster *cluster
 
 	if (!cpufreq_global_kobj)
 		return -ENODEV;
+
+	cpumask_clear(&cluster->policy_link_cpus);
 
 	node = kzalloc(sizeof(*node), GFP_KERNEL);
 	if (!node)
@@ -930,18 +1074,19 @@ static int vm_cpufreq_create_policy_structure(struct vm_cpufreq_cluster *cluster
 
 		ret = sysfs_create_link(&cpu_dev->kobj, cluster->policy_kobj,
 					"cpufreq");
-		if (ret && ret != -EEXIST) {
+		if (ret == -EEXIST) {
 			/*
-			 * vm_cpufreq_remove_policy_structure() iterates the
-			 * full cpumask and calls sysfs_remove_link() for every
-			 * CPU, including those whose symlinks were never created.
-			 * sysfs_remove_link() is a no-op on non-existent entries,
-			 * so all previously created symlinks are cleaned up and
-			 * no resource leak occurs.
+			 * Another cpufreq driver already owns this symlink.
+			 * Leave it alone and skip tracking; on remove we will
+			 * not touch it.
 			 */
+			continue;
+		}
+		if (ret) {
 			vm_cpufreq_remove_policy_structure(cluster);
 			return ret;
 		}
+		cpumask_set_cpu(cpu, &cluster->policy_link_cpus);
 	}
 
 	return 0;
@@ -978,14 +1123,31 @@ static void vm_cpufreq_release_all(void *data)
 			WRITE_ONCE(cluster->ph, NULL);
 		synchronize_srcu(&cluster->hw_srcu);
 
-		/* Remove cooling device */
+		/*
+		 * vm_cpufreq_remove_cooling_device is a synchronization point
+		 * with in-flight thermal cdev callbacks: it calls
+		 * thermal_cooling_device_unregister, which synchronously waits
+		 * for any running set_cur_state callback to finish and then
+		 * frees cdev_data. After it returns, no callback can re-enter
+		 * the driver via this cluster's cdev. The kref_put below must
+		 * therefore not be reordered before this call — otherwise an
+		 * in-flight callback could observe a freed cluster.
+		 */
 		vm_cpufreq_remove_cooling_device(cluster);
 
 		vm_cpufreq_remove_policy_structure(cluster);
-		dev_pm_opp_remove_all_dynamic(cluster->miscdev.this_device);
+		dev_pm_opp_remove_all_dynamic(cluster->opp_dev);
 
 		/*
-		 * misc_deregister works even if registration failed (if zeroed),
+		 * Unregistering the misc device is the synchronization point
+		 * with in-flight cluster_open: it acquires the misc framework
+		 * mutex which the framework's open path holds across
+		 * f_op->open(). After it returns, no cluster_open call is in
+		 * progress and no new one can start, so the kref_put below
+		 * cannot race with a cluster_open observing a half-torn-down
+		 * cluster. Do not reorder kref_put before this call.
+		 *
+		 * The unregister works even if registration failed (if zeroed),
 		 * but our logic ensures we only list_add after success.
 		 */
 		misc_deregister(&cluster->miscdev);
@@ -1001,7 +1163,8 @@ static int vm_cpufreq_process_domain(struct scmi_device *sdev,
 				     struct vm_cpufreq_context *ctx)
 {
 	struct vm_cpufreq_cluster *cluster;
-	int ret;
+	struct device *cpu_dev;
+	int cpu, ret;
 
 	cluster = kzalloc(sizeof(*cluster), GFP_KERNEL);
 	if (!cluster)
@@ -1013,7 +1176,7 @@ static int vm_cpufreq_process_domain(struct scmi_device *sdev,
 	cluster->perf_ops = perf_ops;
 	cluster->dev = &sdev->dev;
 	cluster->thermal_cap_khz = U32_MAX;
-	cluster->agg_applied_level = U32_MAX;
+	cluster->agg_applied_freq_khz = U32_MAX;
 	mutex_init(&cluster->lock);
 	INIT_LIST_HEAD(&cluster->client_list);
 	INIT_LIST_HEAD(&cluster->list);
@@ -1026,11 +1189,6 @@ static int vm_cpufreq_process_domain(struct scmi_device *sdev,
 	}
 
 	ret = perf_ops->transition_latency_get(ph, domain_id);
-	/*
-	 * transition_latency_get() returns nanoseconds (the SCMI OPP
-	 * trans_latency_us field multiplied by 1000).  Convert to
-	 * microseconds for comparison with ktime_us_delta().
-	 */
 	cluster->transition_latency_us = (ret > 0) ?
 		(u32)(ret / 1000) : DEFAULT_TRANSITION_LATENCY_US;
 	dev_info(&sdev->dev, "Domain %d: transition_latency=%u us%s\n",
@@ -1039,83 +1197,80 @@ static int vm_cpufreq_process_domain(struct scmi_device *sdev,
 
 	vm_cpufreq_build_cpumask(cluster, domain_id);
 
-	/*
-	 * Skip domains that have no associated CPUs.  cpumask_first() on an
-	 * empty mask returns nr_cpu_ids, which would produce a nonsensical
-	 * "policy<nr_cpu_ids>" sysfs directory.
-	 */
 	if (cpumask_empty(&cluster->cpus)) {
 		dev_dbg(&sdev->dev, "Domain %d: no CPUs, skipping\n", domain_id);
 		kref_put(&cluster->ref, vm_cpufreq_cluster_release_mem);
 		return 0;
 	}
 
+	cpu = cpumask_first(&cluster->cpus);
+	cpu_dev = get_cpu_device(cpu);
+	if (!cpu_dev) {
+		dev_err(&sdev->dev, "Domain %d: get_cpu_device(%d) failed\n",
+			domain_id, cpu);
+		ret = -ENODEV;
+		goto err_free_cluster;
+	}
+
+	ret = perf_ops->device_opps_add(ph, cpu_dev, domain_id);
+	if (ret) {
+		dev_err(&sdev->dev,
+			"Domain %d: device_opps_add(cpu_dev=%s) failed: %d\n",
+			domain_id, dev_name(cpu_dev), ret);
+		goto err_free_cluster;
+	}
+	cluster->opp_dev = cpu_dev;
+	dev_info(&sdev->dev, "Domain %d: OPPs on cpu_dev=%s (no init window)\n",
+		 domain_id, dev_name(cpu_dev));
+
+	ret = vm_cpufreq_init_freq_table(cluster);
+	if (ret) {
+		dev_err(&sdev->dev,
+			"Domain %d: init_freq_table failed: %d\n",
+			domain_id, ret);
+		goto err_remove_opps;
+	}
+
 	cluster->miscdev.minor = MISC_DYNAMIC_MINOR;
 	cluster->miscdev.name = kasprintf(GFP_KERNEL, "cpu-freq-domain%d", domain_id);
 	if (!cluster->miscdev.name) {
-		kref_put(&cluster->ref, vm_cpufreq_cluster_release_mem);
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto err_remove_opps;
 	}
 	cluster->miscdev.fops = &cluster_fops;
 	cluster->miscdev.parent = &sdev->dev;
 
-	/*
-	 * misc_register must happen before OPPs so that 'this_device' is
-	 * populated.  Cleanup from here on uses goto err_dereg.
-	 */
 	ret = misc_register(&cluster->miscdev);
 	if (ret) {
-		kref_put(&cluster->ref, vm_cpufreq_cluster_release_mem);
-		return ret;
+		dev_err(&sdev->dev,
+			"Domain %d: misc device registration failed: %d\n",
+			domain_id, ret);
+		goto err_remove_opps;
 	}
 
-	ret = perf_ops->device_opps_add(ph, cluster->miscdev.this_device, domain_id);
-	if (ret)
-		goto err_dereg;
-
-	ret = vm_cpufreq_init_freq_table(cluster);
-	if (ret)
-		goto err_remove_opps;
-
-	/*
-	 * The sysfs policy structure is a convenience interface only.
-	 * A failure here (e.g. cpufreq_global_kobj not available) must not
-	 * prevent the misc device ioctl path from functioning.
-	 */
 	ret = vm_cpufreq_create_policy_structure(cluster);
 	if (ret)
 		dev_warn(&sdev->dev,
 			 "Domain %d: sysfs policy structure unavailable: %d\n",
 			 domain_id, ret);
 
-	/*
-	 * Create cooling device for thermal management.
-	 * A failure here should not prevent the main functionality.
-	 */
 	ret = vm_cpufreq_create_cooling_device(cluster);
 	if (ret)
 		dev_warn(&sdev->dev,
 			 "Domain %d: cooling device creation failed: %d\n",
 			 domain_id, ret);
 
-	/*
-	 * Success: commit to global list.
-	 * Only now will vm_cpufreq_release_all() see this cluster.
-	 */
 	list_add(&cluster->list, &ctx->clusters);
 
-	dev_info(&sdev->dev, "Registered domain %d with %d CPUs\n",
-		 domain_id, cpumask_weight(&cluster->cpus));
+	dev_info(&sdev->dev, "Registered domain %d with %d CPUs (opp_dev=%s)\n",
+		 domain_id, cpumask_weight(&cluster->cpus),
+		 dev_name(cluster->opp_dev));
 
 	return 0;
 
 err_remove_opps:
-	dev_pm_opp_remove_all_dynamic(cluster->miscdev.this_device);
-err_dereg:
-	scoped_guard(mutex, &cluster->lock)
-		WRITE_ONCE(cluster->ph, NULL);
-	synchronize_srcu(&cluster->hw_srcu);
-	misc_deregister(&cluster->miscdev);
+	dev_pm_opp_remove_all_dynamic(cluster->opp_dev);
+err_free_cluster:
 	kref_put(&cluster->ref, vm_cpufreq_cluster_release_mem);
 	return ret;
 }
@@ -1190,7 +1345,14 @@ static int vm_cpufreq_probe(struct scmi_device *sdev)
 
 	for (i = 0; i < num_domains; i++) {
 		ret = vm_cpufreq_process_domain(sdev, ph, perf_ops, i, ctx);
-		/* Continue even if one domain fails, but warn */
+		/*
+		 * -EPROBE_DEFER from a domain means a downstream dependency
+		 * isn't ready yet. Propagate so the kernel retries the whole
+		 * probe; devm cleanup will tear down any clusters built so far.
+		 */
+		if (ret == -EPROBE_DEFER)
+			return ret;
+		/* Other failures: warn and continue with remaining domains. */
 		if (ret)
 			dev_warn(dev, "Failed to process domain %d: %d\n", i, ret);
 	}
