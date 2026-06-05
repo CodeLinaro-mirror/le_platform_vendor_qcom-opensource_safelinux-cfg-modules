@@ -1587,7 +1587,8 @@ int kiumd_hyp_unassign_sg(struct sg_table *sgt, int *source_vm_list,
 	struct scatterlist *sg;
 	u64 src_vmid_list[2] = {0};
 	u64 src_vmid_list_copy[2] = {0};
-	int ret, i;
+	int ret = 0;
+	int i = 0;
 
 	if (source_nelems <= 0)
 		return -EINVAL;
