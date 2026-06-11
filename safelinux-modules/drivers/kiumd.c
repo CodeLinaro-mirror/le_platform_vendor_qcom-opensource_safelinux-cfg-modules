@@ -1210,9 +1210,9 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 				kiumd_dmabuf = smap->dmabuf_ptr;
 				pr_debug("kiumd_debug: Driver close : unmap sgt_ptr:%pK\n",
 					 smap->sgt_ptr);
-				if (smap->ptselect == KGSL_GLOBAL_PT ||
-				    smap->ptselect == KGSL_PER_PROCESS_PT ||
-				    smap->ptselect == KGSL_DEFAULT_PT)
+				if (smap->kgsl_ctx.ptselect == KGSL_GLOBAL_PT ||
+				    smap->kgsl_ctx.ptselect == KGSL_PER_PROCESS_PT ||
+				    smap->kgsl_ctx.ptselect == KGSL_DEFAULT_PT)
 					continue;
 
 				if (smap->is_fixed_map) {
