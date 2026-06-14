@@ -69,7 +69,7 @@ struct vm_cpufreq_cluster {
 	ktime_t last_freq_change;
 	u32 transition_latency_us;
 
-	unsigned long *freq_table;
+	u32 *freq_table;
 	u32 num_levels;
 	u32 thermal_cap_khz;
 	/* Policy kobject for cpufreq hierarchy */
@@ -98,15 +98,7 @@ struct vm_policy_node {
 /* Global cpufreq kobject for policy hierarchy - No lock needed */
 static struct kobject *cpufreq_global_kobj;
 
-
-/* Cleanup helpers */
-static inline void vm_cpufreq_client_ctx_cleanup(struct vm_cpufreq_client_ctx *ctx_ptr)
-{
-	kfree(ctx_ptr);
-}
-
-DEFINE_FREE(vm_cpufreq_client_ctx, struct vm_cpufreq_client_ctx *,
-	    vm_cpufreq_client_ctx_cleanup(_T))
+DEFINE_FREE(vm_cpufreq_client_ctx, struct vm_cpufreq_client_ctx *, kfree(_T))
 
 static void vm_cpufreq_cluster_release_mem(struct kref *kref)
 {
@@ -129,13 +121,12 @@ DEFINE_FREE(vm_cpufreq_cluster, struct vm_cpufreq_cluster *,
 	if (_T)
 		kref_put(&_T->ref, vm_cpufreq_cluster_release_mem))
 
-
 /* Get domain ID for a CPU (from DT) */
 static int vm_cpufreq_parse_cpu_domain(int cpu)
 {
-	struct device *cpu_dev;
-	struct of_phandle_args domain_id;
 	struct device_node *np __free(device_node) = NULL;
+	struct of_phandle_args domain_id;
+	struct device *cpu_dev;
 	int ret;
 
 	if (!cpu_possible(cpu))
@@ -154,8 +145,20 @@ static int vm_cpufreq_parse_cpu_domain(int cpu)
 	ret = of_parse_phandle_with_args(np, "clocks", "#clock-cells", 0,
 					 &domain_id);
 	if (ret) {
+		int perf_idx;
+
+		/*
+		 * A CPU node may have multiple power domains (performance,
+		 * memory, power, etc.).  Find the one named "perf" rather than
+		 * blindly using index 0.  Matches scmi-cpufreq.c behaviour.
+		 */
+		perf_idx = of_property_match_string(np, "power-domain-names",
+						    "perf");
+		if (perf_idx < 0)
+			return -EINVAL;
+
 		ret = of_parse_phandle_with_args(np, "power-domains",
-						 "#power-domain-cells", 0,
+						 "#power-domain-cells", perf_idx,
 						 &domain_id);
 		if (ret)
 			return -EINVAL;
@@ -167,9 +170,9 @@ static int vm_cpufreq_parse_cpu_domain(int cpu)
 
 /* Helper: Convert index to frequency using Array - O(1) */
 static int vm_cpufreq_index_to_freq(struct vm_cpufreq_cluster *cluster,
-				    u32 index, unsigned long *freq_khz)
+				    u32 index, u32 *freq_khz)
 {
-	if (!cluster || !freq_khz || index >= cluster->num_levels)
+	if (index >= cluster->num_levels)
 		return -EINVAL;
 
 	*freq_khz = cluster->freq_table[index];
@@ -178,12 +181,9 @@ static int vm_cpufreq_index_to_freq(struct vm_cpufreq_cluster *cluster,
 
 /* Helper: Convert frequency to index - Linear scan */
 static int vm_cpufreq_freq_to_index(struct vm_cpufreq_cluster *cluster,
-				    unsigned long freq_khz, u32 *index)
+				    u32 freq_khz, u32 *index)
 {
 	u32 i;
-
-	if (!cluster || !index)
-		return -EINVAL;
 
 	for (i = 0; i < cluster->num_levels; i++) {
 		if (cluster->freq_table[i] == freq_khz) {
@@ -195,16 +195,13 @@ static int vm_cpufreq_freq_to_index(struct vm_cpufreq_cluster *cluster,
 	return -EINVAL;
 }
 
-/* Get performance level via SCMI */
-static int vm_cpufreq_get_level(struct vm_cpufreq_cluster *cluster, u32 *level)
+/* Get current frequency in kHz via SCMI */
+static int vm_cpufreq_get_level(struct vm_cpufreq_cluster *cluster, u32 *freq_khz)
 {
-	int ret;
 	ktime_t start_time, end_time;
+	unsigned long freq_hz;
+	int ret, srcu_idx;
 	s64 duration_us;
-	int srcu_idx;
-
-	if (!level)
-		return -EINVAL;
 
 	/*
 	 * Acquire SRCU lock to protect against concurrent driver removal
@@ -217,59 +214,34 @@ static int vm_cpufreq_get_level(struct vm_cpufreq_cluster *cluster, u32 *level)
 		goto out;
 	}
 
-	if (!cluster->perf_ops->level_get) {
+	if (!cluster->perf_ops->freq_get) {
 		ret = -EOPNOTSUPP;
 		goto out;
 	}
 
 	start_time = ktime_get();
-	ret = cluster->perf_ops->level_get(cluster->ph, cluster->domain,
-					   level, false);
+	ret = cluster->perf_ops->freq_get(cluster->ph, cluster->domain,
+					  &freq_hz, false);
 	end_time = ktime_get();
 	duration_us = ktime_us_delta(end_time, start_time);
 
 	if (!ret)
-		trace_vm_cpufreq_level_get(cluster->domain, *level, ret,
-					   duration_us);
+		*freq_khz = (u32)(freq_hz / 1000);
+
+	trace_vm_cpufreq_level_get(cluster->domain, ret ? 0 : *freq_khz, ret,
+				   duration_us);
 out:
 	srcu_read_unlock(&cluster->hw_srcu, srcu_idx);
 	return ret;
 }
 
-/*
- * Helper: Get current frequency in kHz.
- *
- * Design note: in this driver the SCMI performance "level" is a frequency
- * value in kHz, not an opaque index.  level_set() is always called with a
- * kHz value (see vm_cpufreq_set_level()), so level_get() returns a kHz
- * value directly.  No index-to-frequency conversion is required here.
- * handle_level_get() converts the returned kHz value to a user-visible
- * index via vm_cpufreq_freq_to_index() because the ioctl ABI exposes
- * indices, not raw frequencies.
- */
-static int vm_cpufreq_get_freq(struct vm_cpufreq_cluster *cluster, u64 *freq_khz)
-{
-	u32 scmi_level;
-	int ret;
-
-	if (!freq_khz)
-		return -EINVAL;
-
-	ret = vm_cpufreq_get_level(cluster, &scmi_level);
-	if (ret)
-		return ret;
-
-	*freq_khz = scmi_level;
-	return 0;
-}
-
 /* Set performance level via SCMI - caller must hold cluster->lock */
-static int vm_cpufreq_set_level(struct vm_cpufreq_cluster *cluster, u32 level)
+static int vm_cpufreq_set_level(struct vm_cpufreq_cluster *cluster, u32 level,
+				bool urgent)
 {
 	ktime_t start_time, end_time;
+	int ret, srcu_idx;
 	s64 duration_us;
-	int ret;
-	int srcu_idx;
 
 	lockdep_assert_held(&cluster->lock);
 
@@ -285,22 +257,27 @@ static int vm_cpufreq_set_level(struct vm_cpufreq_cluster *cluster, u32 level)
 		goto out;
 	}
 
-	if (rate_limit && cluster->last_freq_change != 0) {
-		ktime_t now = ktime_get();
-		s64 elapsed_us = ktime_us_delta(now, cluster->last_freq_change);
+	if (!cluster->perf_ops->freq_set) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+
+	if (!urgent && rate_limit && cluster->last_freq_change != 0) {
+		s64 elapsed_us = ktime_us_delta(ktime_get(), cluster->last_freq_change);
 
 		if (elapsed_us < cluster->transition_latency_us) {
 			dev_dbg(cluster->dev,
 				"Rate limit: rejecting level change (%lld us since last, need %u us)\n",
 				elapsed_us, cluster->transition_latency_us);
 			ret = -EAGAIN;
+			trace_vm_cpufreq_level_set(cluster->domain, level, ret, 0);
 			goto out;
 		}
 	}
 
 	start_time = ktime_get();
-	ret = cluster->perf_ops->level_set(cluster->ph, cluster->domain,
-					   level, false);
+	ret = cluster->perf_ops->freq_set(cluster->ph, cluster->domain,
+					  (u64)level * 1000, false);
 	end_time = ktime_get();
 	duration_us = ktime_us_delta(end_time, start_time);
 
@@ -317,7 +294,8 @@ out:
 }
 
 /* Recompute aggregated request and apply if needed */
-static int vm_cpufreq_recompute_and_update(struct vm_cpufreq_cluster *cluster)
+static int vm_cpufreq_recompute_and_update(struct vm_cpufreq_cluster *cluster,
+					   bool urgent)
 {
 	struct vm_cpufreq_client_ctx *ctx;
 	u32 new_target = 0;
@@ -329,25 +307,31 @@ static int vm_cpufreq_recompute_and_update(struct vm_cpufreq_cluster *cluster)
 			new_target = ctx->client.level;
 	}
 
-	new_target = new_target ?: U32_MAX;
+	/*
+	 * new_target == 0 means no client has an active request. Fall back
+	 * to agg_applied_level (U32_MAX at init, a real kHz value once any
+	 * level has been set). The U32_MAX sentinel is intentional: it lets
+	 * a thermal cap take effect even before any client makes a request,
+	 * by producing new_target = min(U32_MAX, cap) = cap. When no thermal
+	 * cap is active, min(U32_MAX, U32_MAX) = U32_MAX = agg_applied_level,
+	 * so the equality check below short-circuits with no SCMI call.
+	 */
+	new_target = new_target ?: cluster->agg_applied_level;
 	new_target = min_t(u32, new_target, cluster->thermal_cap_khz);
 
-	/* Keep agg_applied_level at U32_MAX while no clients are active */
-	cluster->agg_applied_level = (new_target == U32_MAX) ?
-				     U32_MAX : cluster->agg_applied_level;
 	if (new_target == cluster->agg_applied_level)
 		return 0;
 
-	return vm_cpufreq_set_level(cluster, new_target);
+	return vm_cpufreq_set_level(cluster, new_target, urgent);
 }
 
 /* Initialize frequency table from OPP table */
 static int vm_cpufreq_init_freq_table(struct vm_cpufreq_cluster *cluster)
 {
 	struct device *dev = cluster->miscdev.this_device;
-	struct dev_pm_opp *opp;
 	unsigned long freq_hz = 0;
-	int count, i;
+	struct dev_pm_opp *opp;
+	int count, i = 0;
 
 	if (!dev)
 		return -ENODEV;
@@ -366,23 +350,30 @@ static int vm_cpufreq_init_freq_table(struct vm_cpufreq_cluster *cluster)
 	if (!cluster->freq_table)
 		return -ENOMEM;
 
-	for (i = 0; i < count; i++) {
-		opp = dev_pm_opp_find_freq_ceil(dev, &freq_hz);
-		if (IS_ERR(opp)) {
-			/* Free now; set NULL to prevent double-free in release_mem */
-			kfree(cluster->freq_table);
-			cluster->freq_table = NULL;
-			return PTR_ERR(opp);
-		}
-		dev_pm_opp_put(opp);
-
-
-		cluster->freq_table[i] = freq_hz / 1000;
+	opp = dev_pm_opp_find_freq_ceil(dev, &freq_hz);
+	while (!IS_ERR(opp) && i < count) {
+		freq_hz = dev_pm_opp_get_freq(opp);
+		cluster->freq_table[i++] = (u32)(freq_hz / 1000);
 		freq_hz++;
+		dev_pm_opp_put(opp);
+		opp = dev_pm_opp_find_freq_ceil(dev, &freq_hz);
 	}
 
-	/* Loop runs exactly 'count' times; num_levels == count on success */
+	if (!IS_ERR(opp))
+		dev_pm_opp_put(opp);
+	else if (PTR_ERR(opp) != -ERANGE) {
+		kfree(cluster->freq_table);
+		cluster->freq_table = NULL;
+		return PTR_ERR(opp);
+	}
+
 	cluster->num_levels = i;
+	if (cluster->num_levels == 0) {
+		dev_err(cluster->dev, "OPP table emptied during init (TOCTOU)\n");
+		kfree(cluster->freq_table);
+		cluster->freq_table = NULL;
+		return -ENODEV;
+	}
 	return 0;
 }
 
@@ -428,7 +419,7 @@ static int vm_cpufreq_cdev_set_state(struct thermal_cooling_device *cdev,
 	 * Immediately re-apply the aggregation so that any active clients
 	 * are throttled without waiting for their next ioctl.
 	 */
-	return vm_cpufreq_recompute_and_update(cluster);
+	return vm_cpufreq_recompute_and_update(cluster, true);
 }
 
 static int vm_cpufreq_cdev_get_state(struct thermal_cooling_device *cdev,
@@ -542,7 +533,6 @@ static int cluster_open(struct inode *inode, struct file *filp)
 		return -ENOMEM;
 
 	ctx->cluster = cluster;
-	ctx->client.level = 0;
 	INIT_LIST_HEAD(&ctx->node);
 
 	guard(mutex)(&cluster->lock);
@@ -559,20 +549,19 @@ static int cluster_open(struct inode *inode, struct file *filp)
 
 static int cluster_release(struct inode *inode, struct file *filp)
 {
+	struct vm_cpufreq_cluster *cluster_ref __free(vm_cpufreq_cluster) = NULL;
 	struct vm_cpufreq_client_ctx *ctx __free(vm_cpufreq_client_ctx) =
 		filp->private_data;
 	struct vm_cpufreq_cluster *cluster;
-	struct vm_cpufreq_cluster *cluster_ref __free(vm_cpufreq_cluster) = NULL;
-
-	if (!ctx)
-		return 0;
 
 	cluster = ctx->cluster;
 	cluster_ref = cluster; /* Hold ref to put it at end of function */
 
 	scoped_guard(mutex, &cluster->lock) {
 		list_del(&ctx->node);
-		vm_cpufreq_recompute_and_update(cluster);
+		if (vm_cpufreq_recompute_and_update(cluster, true))
+			dev_dbg(cluster->dev,
+				"Failed to update level on client close\n");
 	}
 
 	filp->private_data = NULL;
@@ -584,30 +573,28 @@ static int handle_level_set(struct vm_cpufreq_cluster *cluster,
 			     char __user *argp)
 {
 	struct cpu_perf_level_req req;
-	unsigned long freq_khz;
+	u32 freq_khz;
+	u32 old_level;
 	int ret;
 
 	if (copy_from_user(&req, argp, sizeof(req)))
 		return -EFAULT;
 
-	if (req.level >= cluster->num_levels)
-		return -EINVAL;
-
 	ret = vm_cpufreq_index_to_freq(cluster, req.level, &freq_khz);
 	if (ret)
 		return ret;
 
-	/*
-	 * Reject zero and values that would truncate when stored in the u32
-	 * client.level field.  On 64-bit kernels ULONG_MAX >> 1 is far above
-	 * U32_MAX and would silently truncate any frequency above ~4.3 GHz.
-	 */
-	if (unlikely(freq_khz == 0 || freq_khz > U32_MAX))
+	if (unlikely(freq_khz == 0))
 		return -EINVAL;
 
 	guard(mutex)(&cluster->lock);
+	old_level = ctx->client.level;
 	ctx->client.level = freq_khz;
-	return vm_cpufreq_recompute_and_update(cluster);
+	ret = vm_cpufreq_recompute_and_update(cluster, false);
+	if (ret)
+		ctx->client.level = old_level;
+
+	return ret;
 }
 
 static int handle_level_get(struct vm_cpufreq_cluster *cluster,
@@ -642,10 +629,25 @@ static int handle_get_available_levels(struct vm_cpufreq_cluster *cluster,
 	 * avail.num_levels and then index avail.levels[] beyond its bounds.
 	 */
 	avail.num_levels = min_t(u32, cluster->num_levels, (u32)MAX_PERF_LEVELS);
-	for (i = 0; i < avail.num_levels; i++)
+	for (i = 0; i < avail.num_levels; i++) {
 		avail.levels[i] = i;
+		avail.freq_khz[i] = cluster->freq_table[i];
+	}
 
 	if (copy_to_user(argp, &avail, sizeof(avail)))
+		return -EFAULT;
+
+	return 0;
+}
+
+static int handle_get_transition_latency(struct vm_cpufreq_cluster *cluster,
+					 char __user *argp)
+{
+	struct cpu_perf_transition_latency lat = {0};
+
+	lat.latency_us = cluster->transition_latency_us;
+
+	if (copy_to_user(argp, &lat, sizeof(lat)))
 		return -EFAULT;
 
 	return 0;
@@ -655,18 +657,11 @@ static long cluster_ioctl(struct file *file, unsigned int cmd,
 			  unsigned long arg)
 {
 	struct vm_cpufreq_client_ctx *ctx = file->private_data;
-	struct vm_cpufreq_cluster *cluster;
 	char __user *argp = (char __user *)arg;
-	int ret = -EINVAL;
-	int srcu_idx;
-
-	/* Defensive: private_data is set in cluster_open; guard against races */
-	if (!ctx)
-		return -EINVAL;
+	struct vm_cpufreq_cluster *cluster;
+	int ret = -ENOTTY, srcu_idx;
 
 	cluster = ctx->cluster;
-	if (!cluster)
-		return -EINVAL;
 
 	if (_IOC_TYPE(cmd) != VM_CPUFREQ_IOC_MAGIC)
 		return -ENOTTY;
@@ -678,6 +673,17 @@ static long cluster_ioctl(struct file *file, unsigned int cmd,
 	srcu_idx = srcu_read_lock(&cluster->hw_srcu);
 
 	if (!READ_ONCE(cluster->ph)) {
+		srcu_read_unlock(&cluster->hw_srcu, srcu_idx);
+		return -ENODEV;
+	}
+
+	/*
+	 * freq_table is populated once during probe and freed only after all
+	 * file descriptors are closed.  A NULL here means probe did not fully
+	 * complete — reject all commands uniformly rather than checking in each
+	 * individual handler.
+	 */
+	if (!cluster->freq_table) {
 		srcu_read_unlock(&cluster->hw_srcu, srcu_idx);
 		return -ENODEV;
 	}
@@ -703,6 +709,13 @@ static long cluster_ioctl(struct file *file, unsigned int cmd,
 			goto out;
 		}
 		ret = handle_get_available_levels(cluster, argp);
+		break;
+	case CPU_PERF_TRANSITION_LATENCY_GET:
+		if (_IOC_SIZE(cmd) != sizeof(struct cpu_perf_transition_latency)) {
+			ret = -EINVAL;
+			goto out;
+		}
+		ret = handle_get_transition_latency(cluster, argp);
 		break;
 	default:
 		ret = -ENOTTY;
@@ -738,34 +751,31 @@ struct vm_cpufreq_attr {
 static ssize_t vm_cpufreq_scaling_cur_freq_show(
 				struct vm_cpufreq_cluster *cluster, char *buf)
 {
-	u64 freq_khz;
+	u32 freq_khz;
 	int ret;
 
-	ret = vm_cpufreq_get_freq(cluster, &freq_khz);
+	ret = vm_cpufreq_get_level(cluster, &freq_khz);
 	if (ret)
 		return ret;
 
-	return sysfs_emit(buf, "%llu\n", freq_khz);
+	return sysfs_emit(buf, "%u\n", freq_khz);
 }
 VM_CPUFREQ_ATTR_RO(scaling_cur_freq);
 
 static ssize_t vm_cpufreq_scaling_available_frequencies_show(
 				struct vm_cpufreq_cluster *cluster, char *buf)
 {
-	unsigned long freq_khz;
-	int count = 0;	/* int matches sysfs_emit_at()'s 'int at' parameter */
+	u32 freq_khz;
+	int count = 0, ret;	/* int matches sysfs_emit_at()'s 'int at' parameter */
 	u32 index;
-	int ret;
 
 	if (cluster->num_levels == 0)
 		return sysfs_emit(buf, "\n");
 
 	for (index = 0; index < cluster->num_levels; index++) {
-		ret = vm_cpufreq_index_to_freq(cluster, index, &freq_khz);
-		if (ret)
-			continue;
-
-		ret = sysfs_emit_at(buf, count, "%lu ", freq_khz);
+		if (vm_cpufreq_index_to_freq(cluster, index, &freq_khz))
+			break;
+		ret = sysfs_emit_at(buf, count, "%u ", freq_khz);
 		if (ret < 0)
 			break;
 		count += ret;
@@ -783,14 +793,21 @@ VM_CPUFREQ_ATTR_RO(scaling_available_frequencies);
 static ssize_t vm_cpufreq_affected_cpus_show(
 				struct vm_cpufreq_cluster *cluster, char *buf)
 {
-	ssize_t i = 0;
 	unsigned int cpu;
+	ssize_t i = 0;
 
 	for_each_cpu(cpu, &cluster->cpus) {
-		i += sysfs_emit_at(buf, i, "%u ", cpu);
+		int ret = sysfs_emit_at(buf, i, "%u ", cpu);
+
+		if (ret < 0)
+			break;
+		i += ret;
 		if (i >= (PAGE_SIZE - 5))
 			break;
 	}
+
+	if (i == 0)
+		return sysfs_emit(buf, "\n");
 
 	/* Strip trailing space and terminate with newline */
 	i--;
@@ -799,10 +816,18 @@ static ssize_t vm_cpufreq_affected_cpus_show(
 }
 VM_CPUFREQ_ATTR_RO(affected_cpus);
 
+static ssize_t vm_cpufreq_cpuinfo_transition_latency_show(
+				struct vm_cpufreq_cluster *cluster, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", cluster->transition_latency_us);
+}
+VM_CPUFREQ_ATTR_RO(cpuinfo_transition_latency);
+
 static struct attribute *vm_cpufreq_attrs[] = {
 	&vm_cpufreq_attr_scaling_cur_freq.attr,
 	&vm_cpufreq_attr_scaling_available_frequencies.attr,
 	&vm_cpufreq_attr_affected_cpus.attr,
+	&vm_cpufreq_attr_cpuinfo_transition_latency.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(vm_cpufreq);
@@ -810,10 +835,10 @@ ATTRIBUTE_GROUPS(vm_cpufreq);
 static ssize_t vm_cpufreq_attr_show(struct kobject *kobj,
 				    struct attribute *attr, char *buf)
 {
-	struct vm_policy_node *node =
-		container_of(kobj, struct vm_policy_node, kobj);
 	struct vm_cpufreq_attr *vattr =
 		container_of(attr, struct vm_cpufreq_attr, attr);
+	struct vm_policy_node *node =
+		container_of(kobj, struct vm_policy_node, kobj);
 
 	if (!vattr->show)
 		return -EIO;
@@ -846,8 +871,8 @@ static const struct kobj_type vm_policy_ktype = {
 
 static void vm_cpufreq_remove_policy_structure(struct vm_cpufreq_cluster *cluster)
 {
-	int cpu;
 	struct device *cpu_dev;
+	int cpu;
 
 	if (!cluster->policy_kobj)
 		return;
@@ -867,9 +892,9 @@ static void vm_cpufreq_remove_policy_structure(struct vm_cpufreq_cluster *cluste
 static int vm_cpufreq_create_policy_structure(struct vm_cpufreq_cluster *cluster)
 {
 	struct vm_policy_node *node;
+	struct device *cpu_dev;
 	char name[16];
 	int cpu, ret;
-	struct device *cpu_dev;
 
 	if (!cpufreq_global_kobj)
 		return -ENODEV;
@@ -925,11 +950,17 @@ static int vm_cpufreq_create_policy_structure(struct vm_cpufreq_cluster *cluster
 static void vm_cpufreq_build_cpumask(struct vm_cpufreq_cluster *cluster,
 				     int domain_id)
 {
-	int cpu;
+	int cpu, ret;
 
 	cpumask_clear(&cluster->cpus);
 	for_each_possible_cpu(cpu) {
-		if (vm_cpufreq_parse_cpu_domain(cpu) == domain_id)
+		ret = vm_cpufreq_parse_cpu_domain(cpu);
+		if (ret < 0) {
+			dev_dbg(cluster->dev,
+				"CPU %d: failed to parse domain: %d\n", cpu, ret);
+			continue;
+		}
+		if (ret == domain_id)
 			cpumask_set_cpu(cpu, &cluster->cpus);
 	}
 }
@@ -937,22 +968,21 @@ static void vm_cpufreq_build_cpumask(struct vm_cpufreq_cluster *cluster,
 /* This is called via devm action on driver remove/failure */
 static void vm_cpufreq_release_all(void *data)
 {
-	struct vm_cpufreq_context *ctx = data;
 	struct vm_cpufreq_cluster *cluster, *tmp;
+	struct vm_cpufreq_context *ctx = data;
 
 	list_for_each_entry_safe(cluster, tmp, &ctx->clusters, list) {
 		list_del(&cluster->list);
 
-		WRITE_ONCE(cluster->ph, NULL);
+		scoped_guard(mutex, &cluster->lock)
+			WRITE_ONCE(cluster->ph, NULL);
 		synchronize_srcu(&cluster->hw_srcu);
 
 		/* Remove cooling device */
 		vm_cpufreq_remove_cooling_device(cluster);
 
 		vm_cpufreq_remove_policy_structure(cluster);
-
-		if (cluster->miscdev.this_device)
-			dev_pm_opp_remove_all_dynamic(cluster->miscdev.this_device);
+		dev_pm_opp_remove_all_dynamic(cluster->miscdev.this_device);
 
 		/*
 		 * misc_deregister works even if registration failed (if zeroed),
@@ -996,7 +1026,16 @@ static int vm_cpufreq_process_domain(struct scmi_device *sdev,
 	}
 
 	ret = perf_ops->transition_latency_get(ph, domain_id);
-	cluster->transition_latency_us = (ret > 0) ? ret : DEFAULT_TRANSITION_LATENCY_US;
+	/*
+	 * transition_latency_get() returns nanoseconds (the SCMI OPP
+	 * trans_latency_us field multiplied by 1000).  Convert to
+	 * microseconds for comparison with ktime_us_delta().
+	 */
+	cluster->transition_latency_us = (ret > 0) ?
+		(u32)(ret / 1000) : DEFAULT_TRANSITION_LATENCY_US;
+	dev_info(&sdev->dev, "Domain %d: transition_latency=%u us%s\n",
+		 domain_id, cluster->transition_latency_us,
+		 (ret > 0) ? " (from SCMI)" : " (default fallback)");
 
 	vm_cpufreq_build_cpumask(cluster, domain_id);
 
@@ -1073,7 +1112,8 @@ static int vm_cpufreq_process_domain(struct scmi_device *sdev,
 err_remove_opps:
 	dev_pm_opp_remove_all_dynamic(cluster->miscdev.this_device);
 err_dereg:
-	WRITE_ONCE(cluster->ph, NULL);
+	scoped_guard(mutex, &cluster->lock)
+		WRITE_ONCE(cluster->ph, NULL);
 	synchronize_srcu(&cluster->hw_srcu);
 	misc_deregister(&cluster->miscdev);
 	kref_put(&cluster->ref, vm_cpufreq_cluster_release_mem);
@@ -1092,12 +1132,23 @@ static bool vm_cpufreq_scmi_dev_used_by_cpus(struct device *scmi_dev)
 
 	for_each_possible_cpu(cpu) {
 		struct device_node *np __free(device_node) = NULL;
+		struct device_node *np2 __free(device_node) = NULL;
+
+		int perf_idx;
 
 		cpu_dev = get_cpu_device(cpu);
 		if (!cpu_dev)
 			continue;
 		np = of_parse_phandle(dev_of_node(cpu_dev), "clocks", 0);
 		if (np && np == scmi_np)
+			return true;
+		perf_idx = of_property_match_string(dev_of_node(cpu_dev),
+						    "power-domain-names", "perf");
+		if (perf_idx < 0)
+			continue;
+		np2 = of_parse_phandle(dev_of_node(cpu_dev), "power-domains",
+				       perf_idx);
+		if (np2 && np2 == scmi_np)
 			return true;
 	}
 
@@ -1106,13 +1157,12 @@ static bool vm_cpufreq_scmi_dev_used_by_cpus(struct device *scmi_dev)
 
 static int vm_cpufreq_probe(struct scmi_device *sdev)
 {
-	int ret;
-	struct device *dev = &sdev->dev;
 	const struct scmi_handle *handle = sdev->handle;
 	const struct scmi_perf_proto_ops *perf_ops;
 	struct scmi_protocol_handle *ph;
+	struct device *dev = &sdev->dev;
 	struct vm_cpufreq_context *ctx;
-	int num_domains, i;
+	int num_domains, ret, i;
 
 	if (!handle || !vm_cpufreq_scmi_dev_used_by_cpus(dev))
 		return -ENODEV;
@@ -1145,8 +1195,10 @@ static int vm_cpufreq_probe(struct scmi_device *sdev)
 			dev_warn(dev, "Failed to process domain %d: %d\n", i, ret);
 	}
 
-	if (list_empty(&ctx->clusters))
+	if (list_empty(&ctx->clusters)) {
+		dev_warn(dev, "No domains with CPUs found; check DT clock/power-domain bindings\n");
 		return -ENODEV;
+	}
 
 	return 0;
 }
