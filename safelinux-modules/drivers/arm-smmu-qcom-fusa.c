@@ -71,6 +71,9 @@
 static bool smmu_fusa_inj_only_one = true;
 module_param(smmu_fusa_inj_only_one, bool, 0644);
 
+static bool smmu_fusa_only_one_client = true;
+module_param(smmu_fusa_only_one_client, bool, 0644);
+
 #define QSMMU_F_TBU500			BIT(1)
 #define QSMMU_F_QTB500			BIT(1) /* QTB500 uses same fault path as TBU500 */
 #define QSMMU_F_QTB600			BIT(2)
@@ -506,17 +509,12 @@ static int check_tcu_fault_injection(struct qsmmu_fusa *qsmmu_fusa,
 	inject_tcu_fault(qsmmu_fusa, fault_code, inject_enable);
 
 	res = check_for_injected_tcu_fault(qsmmu_fusa, fault_code);
-	if (res) {
+	if (res)
 		dev_err(qsmmu_fusa->dev, "TCU FuSa error injection failed\n");
-	} else {
-		if (inject_enable) {
-			writel(0, qsmmu_fusa->tcu_fusa_base + FUSA_TCU_ERROR_INJECT_REGISTER);
-			writel(0, qsmmu_fusa->tcu_fusa_base + FUSA_TCU_IRQ_SET_REGISTER);
-		} else {
-			writel(0, qsmmu_fusa->tcu_fusa_base + FUSA_TCU_IRQ_SET_REGISTER);
-		}
-		clear_tcu_fusa_fault(qsmmu_fusa, fault_code);
-	}
+
+	writel(0, qsmmu_fusa->tcu_fusa_base + FUSA_TCU_ERROR_INJECT_REGISTER);
+	writel(0, qsmmu_fusa->tcu_fusa_base + FUSA_TCU_IRQ_SET_REGISTER);
+	clear_tcu_fusa_fault(qsmmu_fusa, fault_code);
 
 	return res;
 }
@@ -908,8 +906,14 @@ static int qsmmu_fusa_test(struct qsmmu_fusa *qsmmu_fusa)
 		qsmmu_fusa->tdev->test_dev = &test_pdev->dev;
 		mutex_unlock(&qsmmu_fusa->tdev->state_lock);
 		ret = fusa_fault_injection_tcu_test(qsmmu_fusa);
-		if (!ret && qsmmu_fusa->tbu_fault_injection)
-			ret = fusa_fault_injection_tbu_test(qsmmu_fusa, client_id);
+		if (!ret && qsmmu_fusa->tbu_fault_injection) {
+			int tbu_ret = fusa_fault_injection_tbu_test(qsmmu_fusa, client_id);
+
+			if (tbu_ret)
+				dev_warn(qsmmu_fusa->dev,
+					 "FuSa TBU client %u injection failed (%d) - subsystem gated? skipping\n",
+					 client_id, tbu_ret);
+		}
 
 out:
 		/* unmap dma data */
@@ -937,6 +941,10 @@ out:
 		}
 
 		client_id++;
+		if (qsmmu_fusa->tbu_fault_injection && smmu_fusa_only_one_client) {
+			of_node_put(child);
+			break;
+		}
 	}
 
 	return ret;
@@ -1057,11 +1065,11 @@ static int qsmmu_fusa_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	spin_lock_init(&qsmmu_fusa->lock);
-	ret = qcom_smmu_hw_irq_setup(qsmmu_fusa);
 #ifdef CONFIG_DEBUG_FS
 	init_waitqueue_head(&qsmmu_fusa->wq);
 	qcom_smmu_create_debug_dir(qsmmu_fusa);
 #endif
+	ret = qcom_smmu_hw_irq_setup(qsmmu_fusa);
 
 	return ret;
 }
