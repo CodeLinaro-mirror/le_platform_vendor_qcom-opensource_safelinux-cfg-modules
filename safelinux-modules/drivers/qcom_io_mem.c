@@ -14,7 +14,8 @@
 #include <linux/io-pgtable.h>
 #include <linux/iommu_iova_map.h>
 #include <linux/interrupt.h>
-#include <linux/miscdevice.h>
+#include <linux/cdev.h>
+#include <linux/fs.h>
 #include <uapi/misc/kiumd.h>
 #include <linux/kiumd_common.h>
 #include <linux/of.h>
@@ -23,11 +24,14 @@
 #include <linux/xarray.h>
 #include <linux/pm_runtime.h>
 
+#define CREATE_TRACE_POINTS
+#include "safelinux_modules_trace.h"
+
 #define IS_PGTABLE_SET(kiusr) \
 	((kiusr.ptselect == KGSL_GLOBAL_PT) || (kiusr.ptselect == KGSL_PER_PROCESS_PT))
 
 #define GET_KGSL_DATA(file) \
-	container_of((file)->private_data, struct umd_kgsl_data, mdev)
+	((struct umd_kgsl_data *)((file)->private_data))
 
 struct irq_context {
 	int hwirq;
@@ -51,14 +55,27 @@ struct umd_kgsl_data {
 	int num_regs;
 	struct platform_device *pdev;
 	struct device *dev;
-	struct miscdevice mdev;
+	dev_t devt;
+	struct cdev cdev;
+	const char *char_dev_name;
+	struct class *chrdev_class;
 	struct kiumd_ctx *kiumdctx;
 	struct irq_context *irq_ctx;
 	int num_irqs;
 	struct kgsl_fault_info *fault_info;
+	struct kmem_cache *addr_cache;
 };
 
-static struct kmem_cache *kgsl_addr_cache;
+struct gpu_parent_drv {
+	struct mutex        init_lock;
+	int                 parent_count;
+	struct class        *chrdev_class;
+	struct kmem_cache   *addr_cache;
+	struct platform_driver pdrv;
+};
+
+#define to_gpu_parent_drv(d) \
+	container_of(d, struct gpu_parent_drv, pdrv)
 
 /**
  * umd_kgsl_register_eventfd - Register an eventfd for a given IRQ
@@ -256,6 +273,8 @@ static int umd_kgsl_process_pt_alloc(char __user *arg, struct umd_kgsl_data *kgs
 		ret = -EINVAL;
 		goto free_pt_context;
 	}
+
+	trace_umd_kgsl_process_pt_alloc(dev_name(kgsl_data->dev), kiusr.pt_id);
 
 	return 0;
 
@@ -617,6 +636,8 @@ static int umd_kgsl_perprocess_pgtble_set(char __user *arg, struct umd_kgsl_data
 
 	smmu_dom->pgtbl_ops = pgtable_ops;
 
+	trace_umd_kgsl_perprocess_pgtble_set(dev_name(kgsl_data->dev), kiusr.pt_id);
+
 	return 0;
 }
 
@@ -896,7 +917,8 @@ static int umd_kgsl_dmabuf_map(char __user *arg, struct umd_kgsl_data *kgsl_data
 	struct smmu_map_data *smap;
 	struct kiumd_user kiusr;
 	struct device *dev;
-	int size, ret = 0;
+	u64 size;
+	int ret = 0;
 
 	if (copy_from_user(&kiusr, arg, sizeof(struct kiumd_user)))
 		return -EFAULT;
@@ -922,7 +944,7 @@ static int umd_kgsl_dmabuf_map(char __user *arg, struct umd_kgsl_data *kgsl_data
 		goto smap_free;
 	}
 
-	ret = set_kgsl_map_iova(kgsl_addr_cache, kiumd_ctx, kiusr, smap);
+	ret = set_kgsl_map_iova(kgsl_data->addr_cache, kiumd_ctx, kiusr, smap);
 	if (ret) {
 		ret = -EINVAL;
 		goto dmabuf_put;
@@ -934,6 +956,9 @@ static int umd_kgsl_dmabuf_map(char __user *arg, struct umd_kgsl_data *kgsl_data
 		ret = kiumd_dmabuf_priv_map(smap);
 	else
 		ret = kiumd_dmabuf_map(smap);
+
+	trace_umd_kgsl_dmabuf_map(dev_name(dev), smap->kgsl_ctx.iova, size,
+							kiusr.ptselect, kiusr.pt_id);
 
 	if (ret)
 		goto dmabuf_put;
@@ -954,7 +979,7 @@ static int umd_kgsl_dmabuf_map(char __user *arg, struct umd_kgsl_data *kgsl_data
 	return 0;
 
 clean_map_res:
-	clean_map(kgsl_addr_cache, kiumd_ctx, smap);
+	clean_map(kgsl_data->addr_cache, kiumd_ctx, smap);
 dmabuf_put:
 	dma_buf_put(smap->dmabuf_ptr);
 smap_free:
@@ -1008,7 +1033,12 @@ static int umd_kgsl_dmabuf_unmap(char __user *arg, struct umd_kgsl_data *kgsl_da
 	}
 
 	if (smap->is_kgsl_ctx)
-		clear_kgsl_map_iova(kgsl_addr_cache, kiumd_ctx, smap);
+		clear_kgsl_map_iova(kgsl_data->addr_cache, kiumd_ctx, smap);
+
+
+	trace_umd_kgsl_dmabuf_unmap(dev_name(dev), dma_addr,
+				smap->size, smap->kgsl_ctx.ptselect, smap->kgsl_ctx.pt_id);
+
 
 	if (smap->is_iova_zero)
 		kiumd_dmabuf_zero_unmap(smap);
@@ -1289,10 +1319,13 @@ static int umd_kgsl_init_fault_handler(struct umd_kgsl_data *kgsl_data)
 
 static int umd_kgsl_open(struct inode *inode, struct file *file)
 {
-	struct umd_kgsl_data *kgsl_data = GET_KGSL_DATA(file);
+	struct umd_kgsl_data *kgsl_data;
+
+	kgsl_data = container_of(inode->i_cdev, struct umd_kgsl_data, cdev);
+	file->private_data = kgsl_data;
 
 	dev_info(kgsl_data->dev, "Device %s opened successfully with minor: %d\n",
-						kgsl_data->mdev.name, MINOR(inode->i_rdev));
+		 kgsl_data->char_dev_name, MINOR(inode->i_rdev));
 	return 0;
 }
 
@@ -1315,6 +1348,18 @@ static int umd_kgsl_release(struct inode *inode, struct file *file)
 }
 
 
+static void umd_kgsl_cleanup_chrdev(void *data)
+{
+	struct umd_kgsl_data *kgsl_data = data;
+
+	if (kgsl_data->devt) {
+		device_destroy(kgsl_data->chrdev_class, kgsl_data->devt);
+		cdev_del(&kgsl_data->cdev);
+		unregister_chrdev_region(kgsl_data->devt, 1);
+		kgsl_data->devt = 0;
+	}
+}
+
 static const struct file_operations umd_kgsl_fops = {
 	.owner = THIS_MODULE,
 	.open = umd_kgsl_open,
@@ -1322,6 +1367,46 @@ static const struct file_operations umd_kgsl_fops = {
 	.release = umd_kgsl_release,
 	.mmap = umd_kgsl_mmap,
 };
+
+static int umd_kgsl_register_chrdev(struct umd_kgsl_data *kgsl_data, struct class *chrdev_class)
+{
+	struct device *dev;
+	int ret;
+
+	kgsl_data->chrdev_class = chrdev_class;
+
+	ret = alloc_chrdev_region(&kgsl_data->devt, 0, 1, kgsl_data->char_dev_name);
+	if (ret)
+		return ret;
+
+	cdev_init(&kgsl_data->cdev, &umd_kgsl_fops);
+	kgsl_data->cdev.owner = THIS_MODULE;
+
+	ret = cdev_add(&kgsl_data->cdev, kgsl_data->devt, 1);
+	if (ret)
+		goto err_unregister_chrdev;
+
+	dev = device_create(chrdev_class, kgsl_data->dev, kgsl_data->devt,
+			    NULL, "%s", kgsl_data->char_dev_name);
+	if (IS_ERR(dev)) {
+		ret = PTR_ERR(dev);
+		goto err_cdev_del;
+	}
+
+	/*
+	 * Tie cdev teardown to the child device lifetime so it is cleaned up
+	 * automatically on both probe failure unwind and driver removal.
+	 */
+	return devm_add_action_or_reset(kgsl_data->dev, umd_kgsl_cleanup_chrdev, kgsl_data);
+
+err_cdev_del:
+	cdev_del(&kgsl_data->cdev);
+err_unregister_chrdev:
+	unregister_chrdev_region(kgsl_data->devt, 1);
+	kgsl_data->devt = 0;
+
+	return ret;
+}
 
 static int populate_resources(struct platform_device *pdev, struct umd_kgsl_data *kgsl_data)
 {
@@ -1415,7 +1500,8 @@ static int allocate_kgsl_data_memory(struct umd_kgsl_data *kgsl_data,
 }
 
 
-static int umd_kgsl_init(struct device *parent_dev, struct device_node *child_np)
+static int umd_kgsl_init(struct device *parent_dev, struct device_node *child_np,
+			 struct class *chrdev_class, struct kmem_cache *addr_cache)
 {
 	struct kiumd_kgsl_context *kgsl_context;
 	struct platform_device *child_pdev;
@@ -1435,6 +1521,7 @@ static int umd_kgsl_init(struct device *parent_dev, struct device_node *child_np
 
 	kgsl_data->pdev = child_pdev;
 	kgsl_data->dev = &child_pdev->dev;
+	kgsl_data->addr_cache = addr_cache;
 
 	ret = populate_resources(child_pdev, kgsl_data);
 	if (ret)
@@ -1484,11 +1571,11 @@ static int umd_kgsl_init(struct device *parent_dev, struct device_node *child_np
 	if (of_property_read_string(child_np, "name", &dev_name_from_dt))
 		return dev_err_probe(&child_pdev->dev, -EINVAL, "No 'name' property in DT\n");
 
-	kgsl_data->mdev.minor = MISC_DYNAMIC_MINOR;
-	kgsl_data->mdev.name = devm_kasprintf(&child_pdev->dev, GFP_KERNEL, "rgs/%s",
-									dev_name_from_dt);
-	kgsl_data->mdev.fops = &umd_kgsl_fops;
-	kgsl_data->mdev.parent = parent_dev;
+	kgsl_data->char_dev_name = devm_kasprintf(&child_pdev->dev, GFP_KERNEL, "rgs/%s",
+						  dev_name_from_dt);
+
+	if (!kgsl_data->char_dev_name)
+		return -ENOMEM;
 
 	kgsl_priv = devm_kzalloc(&child_pdev->dev, sizeof(*kgsl_priv), GFP_KERNEL);
 	if (!kgsl_priv)
@@ -1507,45 +1594,143 @@ static int umd_kgsl_init(struct device *parent_dev, struct device_node *child_np
 	ret = of_dma_configure(&child_pdev->dev, child_np, true);
 	if (ret)
 		return dev_err_probe(&child_pdev->dev, ret,
-					"Failed to configure DMA for child device\n");
+				"Failed to configure DMA for child device\n");
+
+	ret = umd_kgsl_register_chrdev(kgsl_data, chrdev_class);
+	if (ret)
+		return dev_err_probe(&child_pdev->dev, ret,
+				     "Failed to register child char device\n");
 
 	ret = umd_kgsl_init_fault_handler(kgsl_data);
 	if (ret)
 		return dev_err_probe(&child_pdev->dev, ret,
-						"Failed to init fault handler\n");
+				     "Failed to init fault handler\n");
+
+	ret = devm_pm_runtime_set_active_enabled(&child_pdev->dev);
+	if (ret)
+		return dev_err_probe(&child_pdev->dev, ret,
+				     "Failed to enable runtime PM\n");
+
+	ret = pm_runtime_resume_and_get(&child_pdev->dev);
+	if (ret < 0)
+		return dev_err_probe(&child_pdev->dev, ret,
+				     "Failed to resume runtime PM\n");
 
 	dev_info(&child_pdev->dev, "Child device initialized with resources and interrupts\n");
 	return 0;
 }
 
 
+static int umd_kgsl_destroy_child(struct device *dev, void *data)
+{
+	if (pm_runtime_enabled(dev))
+		pm_runtime_put_noidle(dev);
+	of_platform_device_destroy(dev, NULL);
+	return 0;
+}
+
 static int gpu_parent_probe(struct platform_device *pdev)
 {
+	struct gpu_parent_drv *gpdrv =
+		to_gpu_parent_drv(to_platform_driver(pdev->dev.driver));
 	struct device_node *child_np;
 	int ret;
 
-	for_each_available_child_of_node(pdev->dev.of_node, child_np) {
-		if (of_device_is_compatible(child_np, "qcom,gpu-umd-platform")) {
-			ret = umd_kgsl_init(&pdev->dev, child_np);
-			if (ret) {
-				of_node_put(child_np);
-				return dev_err_probe(&pdev->dev, ret,
-						"Failed to initialize child device with error\n");
-			}
+	/*
+	 * Multiple parent devices may probe concurrently. The mutex serializes
+	 * the creation of the shared chrdev_class and addr_cache so that only
+	 * the first parent to probe creates them. Subsequent parents skip the
+	 * if-block and reuse the already-initialized pointers.
+	 *
+	 * The incremented parent_count acts as a reference: as long as it is
+	 * non-zero, gpu_parent_remove() will not free the shared resources,
+	 * so chrdev_class and addr_cache remain valid after the lock is dropped.
+	 */
+	mutex_lock(&gpdrv->init_lock);
+	if (++gpdrv->parent_count == 1) {
+		gpdrv->chrdev_class = class_create("kgsl_umd");
+		if (IS_ERR(gpdrv->chrdev_class)) {
+			--gpdrv->parent_count;
+			mutex_unlock(&gpdrv->init_lock);
+			return dev_err_probe(&pdev->dev, PTR_ERR(gpdrv->chrdev_class),
+					     "Failed to create char device class\n");
+		}
+
+		gpdrv->addr_cache = kmem_cache_create("kgsl_iommu_addr_cache",
+						      sizeof(struct iommu_addr_entry), 0, 0, NULL);
+		if (!gpdrv->addr_cache) {
+			class_destroy(gpdrv->chrdev_class);
+			gpdrv->chrdev_class = NULL;
+			--gpdrv->parent_count;
+			mutex_unlock(&gpdrv->init_lock);
+			return dev_err_probe(&pdev->dev, -ENOMEM,
+					     "kiumd kmem cache creation failed\n");
 		}
 	}
+	mutex_unlock(&gpdrv->init_lock);
 
-	kgsl_addr_cache = kmem_cache_create("kgsl_iommu_addr_cache",
-						sizeof(struct iommu_addr_entry), 0, 0, NULL);
-	if (!kgsl_addr_cache)
-		return dev_err_probe(&pdev->dev, -ENOMEM, "kiumd kmem cache creation failed\n");
+	/*
+	 * Guard against a second parent observing a non-zero parent_count
+	 * that was left behind by a first parent whose class_create or
+	 * kmem_cache_create failed and rolled back the count. In that case
+	 * chrdev_class or addr_cache would still be NULL.
+	 */
+	if (!gpdrv->chrdev_class || !gpdrv->addr_cache)
+		return dev_err_probe(&pdev->dev, -EINVAL,
+				     "Shared resources not initialized\n");
+
+	for_each_available_child_of_node(pdev->dev.of_node, child_np) {
+		if (!of_device_is_compatible(child_np, "qcom,gpu-umd-platform"))
+			continue;
+
+		ret = umd_kgsl_init(&pdev->dev, child_np,
+				    gpdrv->chrdev_class, gpdrv->addr_cache);
+		if (!ret)
+			continue;
+
+		/* Release the ref held by for_each_available_child_of_node. */
+		of_node_put(child_np);
+		device_for_each_child_reverse(&pdev->dev, NULL, umd_kgsl_destroy_child);
+		mutex_lock(&gpdrv->init_lock);
+		if (--gpdrv->parent_count == 0) {
+			kmem_cache_destroy(gpdrv->addr_cache);
+			gpdrv->addr_cache = NULL;
+			class_destroy(gpdrv->chrdev_class);
+			gpdrv->chrdev_class = NULL;
+		}
+		mutex_unlock(&gpdrv->init_lock);
+		return dev_err_probe(&pdev->dev, ret,
+				"Failed to initialize child device with error\n");
+	}
 
 	return 0;
 }
 
 static int gpu_parent_remove(struct platform_device *pdev)
 {
-	kmem_cache_destroy(kgsl_addr_cache);
+	struct gpu_parent_drv *gpdrv =
+		to_gpu_parent_drv(to_platform_driver(pdev->dev.driver));
+
+	/*
+	 * Destroying each child pdev triggers its devm actions, which invoke
+	 * umd_kgsl_cleanup_chrdev() to tear down the cdev, chrdev region, and
+	 * /dev node, and release the runtime PM usage count — all before the
+	 * class is destroyed below.
+	 */
+
+	device_for_each_child_reverse(&pdev->dev, NULL, umd_kgsl_destroy_child);
+
+	mutex_lock(&gpdrv->init_lock);
+	if (--gpdrv->parent_count == 0) {
+		kmem_cache_destroy(gpdrv->addr_cache);
+		gpdrv->addr_cache = NULL;
+
+		if (gpdrv->chrdev_class) {
+			class_destroy(gpdrv->chrdev_class);
+			gpdrv->chrdev_class = NULL;
+		}
+	}
+	mutex_unlock(&gpdrv->init_lock);
 
 	dev_info(&pdev->dev, "gpu_parent device removed\n");
 	return 0;
@@ -1557,16 +1742,31 @@ static const struct of_device_id gpu_parent_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, gpu_parent_of_match);
 
-static struct platform_driver gpu_parent_driver = {
-	.driver = {
-		.name = "gpu_parent",
-		.of_match_table = gpu_parent_of_match,
+static struct gpu_parent_drv gpu_parent = {
+	.parent_count = 0,
+	.pdrv = {
+		.driver = {
+			.name = "gpu_parent",
+			.of_match_table = gpu_parent_of_match,
+		},
+		.probe = gpu_parent_probe,
+		.remove = gpu_parent_remove,
 	},
-	.probe = gpu_parent_probe,
-	.remove = gpu_parent_remove,
 };
 
-module_platform_driver(gpu_parent_driver);
+static int __init gpu_parent_module_init(void)
+{
+	mutex_init(&gpu_parent.init_lock);
+	return platform_driver_register(&gpu_parent.pdrv);
+}
+
+static void __exit gpu_parent_module_exit(void)
+{
+	platform_driver_unregister(&gpu_parent.pdrv);
+}
+
+module_init(gpu_parent_module_init);
+module_exit(gpu_parent_module_exit);
 
 MODULE_IMPORT_NS(DMA_BUF);
 MODULE_LICENSE("GPL");

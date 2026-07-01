@@ -861,6 +861,120 @@ TRACE_EVENT(kiumd_vfio_ctx_init_end,
 
 	TP_printk("vfio_fd=%d", __entry->vfio_fd)
 );
+
+
+TRACE_EVENT(umd_kgsl_dmabuf_map,
+
+	TP_PROTO(const char *dev_name,
+		u64 iova,
+		u64 size,
+		int ptselect,
+		int pt_id),
+
+	TP_ARGS(dev_name, iova, size, ptselect, pt_id),
+
+	TP_STRUCT__entry(
+		__string(dev_name, dev_name)
+		__field(u64, iova)
+		__field(u64, size)
+		__field(int, ptselect)
+		__field(int, pt_id)
+	),
+
+	TP_fast_assign(
+		__assign_str(dev_name, dev_name);
+		__entry->iova = iova;
+		__entry->size = size;
+		__entry->ptselect = ptselect;
+		__entry->pt_id = pt_id;
+	),
+
+	TP_printk("dev=%s iova=0x%llx size=0x%llx ptselect=%d pt_id=%d",
+		__get_str(dev_name),
+		__entry->iova,
+		__entry->size,
+		__entry->ptselect,
+		__entry->pt_id)
+);
+
+
+TRACE_EVENT(umd_kgsl_dmabuf_unmap,
+
+	TP_PROTO(const char *dev_name,
+		unsigned long dma_addr,
+		u64 size,
+		int ptselect,
+		int pt_id),
+
+	TP_ARGS(dev_name, dma_addr, size, ptselect, pt_id),
+
+	TP_STRUCT__entry(
+		__string(dev_name, dev_name)
+		__field(unsigned long, dma_addr)
+		__field(u64, size)
+		__field(int, ptselect)
+		__field(int, pt_id)
+	),
+
+	TP_fast_assign(
+		__assign_str(dev_name, dev_name);
+		__entry->dma_addr = dma_addr;
+		__entry->size = size;
+		__entry->ptselect = ptselect;
+		__entry->pt_id = pt_id;
+	),
+
+	TP_printk("dev=%s dma_addr=0x%lx size=0x%llx ptselect=%d pt_id=%d",
+		__get_str(dev_name),
+		__entry->dma_addr,
+		__entry->size,
+		__entry->ptselect,
+		__entry->pt_id)
+);
+
+TRACE_EVENT(umd_kgsl_process_pt_alloc,
+
+	TP_PROTO(const char *dev_name, int pt_id),
+
+	TP_ARGS(dev_name, pt_id),
+
+	TP_STRUCT__entry(
+		__string(dev_name, dev_name)
+		__field(int, pt_id)
+	),
+
+	TP_fast_assign(
+		__assign_str(dev_name, dev_name);
+		__entry->pt_id = pt_id;
+	),
+
+	TP_printk("dev=%s pt_id=%d",
+		__get_str(dev_name),
+		__entry->pt_id)
+);
+
+TRACE_EVENT(umd_kgsl_perprocess_pgtble_set,
+
+	TP_PROTO(const char *dev_name, int pt_id),
+
+	TP_ARGS(dev_name, pt_id),
+
+	TP_STRUCT__entry(
+		__string(dev_name, dev_name)
+		__field(int, pt_id)
+	),
+
+	TP_fast_assign(
+		__assign_str(dev_name, dev_name);
+		__entry->pt_id = pt_id;
+	),
+
+	TP_printk("dev=%s pt_id=%d",
+		__get_str(dev_name),
+		__entry->pt_id)
+);
+
+
 #endif    // TRACE_SAFELINUX_COMMON
 #endif /* TRACE_SAFELINUX_MODULES */
 
