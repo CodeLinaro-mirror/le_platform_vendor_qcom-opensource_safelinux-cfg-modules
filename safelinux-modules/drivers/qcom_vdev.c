@@ -195,6 +195,11 @@ static irqreturn_t vdev_automasked_irq_handler(int irq, void *dev_id)
 	struct irq_data *d = irq_get_irq_data(irq);
 	int ret = IRQ_NONE;
 
+	if (d == NULL) {
+		pr_err("%s: failed to get irq data for irq %d\n", __func__, irq);
+		return ret;
+	}
+
 	if (!irq_ctx->masked) {
 		ret = IRQ_HANDLED;
 		/* automask maskable interrupts */
@@ -223,6 +228,11 @@ static irqreturn_t vdev_irq_handler(int irq, void *dev_id)
 {
 	struct vdev_irq  *irq_ctx = (struct vdev_irq  *)dev_id;
 	struct irq_data *d = irq_get_irq_data(irq);
+
+	if (d == NULL) {
+		pr_err("%s: failed to get irq data for irq %d\n", __func__, irq);
+		return IRQ_NONE;
+	}
 
 	vdev_send_eventfd(irq_ctx);
 
