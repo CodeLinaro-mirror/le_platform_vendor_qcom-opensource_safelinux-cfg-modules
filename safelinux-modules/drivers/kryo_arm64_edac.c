@@ -120,11 +120,17 @@ static inline void clear_errxstatus_valid(u64 val)
 	asm volatile("msr s3_0_c5_c4_2, %0" : : "r" (val));
 }
 
+static inline void sysfs_notify_dirent_safe(struct kernfs_node *kn)
+{
+	if (kn)
+		sysfs_notify_dirent(kn);
+}
+
 static void kryo_edac_handle_ce(struct edac_device_ctl_info *edac_dev,
 				int inst_nr, int block_nr, const char *msg)
 {
 	edac_device_handle_ce(edac_dev, inst_nr, block_nr, msg);
-	sysfs_notify_dirent(per_cpu(cpu_kn.ce[block_nr], smp_processor_id()));
+	sysfs_notify_dirent_safe(per_cpu(cpu_kn.ce[block_nr], smp_processor_id()));
 #ifdef CONFIG_EDAC_KRYO_ARM64_PANIC_ON_CE
 	panic("EDAC %s CE: %s\n", edac_dev->ctl_name, msg);
 #endif
@@ -139,7 +145,7 @@ static void kryo_edac_handle_ue(struct edac_device_ctl_info *edac_dev,
 	 * errors. Recommended to panic from kernel in case of uncorrectbale
 	 * errors.
 	 */
-	sysfs_notify_dirent(per_cpu(cpu_kn.ue[block_nr], smp_processor_id()));
+	sysfs_notify_dirent_safe(per_cpu(cpu_kn.ue[block_nr], smp_processor_id()));
 }
 
 struct errors_edac {
@@ -181,6 +187,14 @@ struct erp_drvdata {
 
 static struct erp_drvdata *panic_handler_drvdata;
 
+/*
+ * Per-CPU raw spinlock used by kryo_l1_l2_handler and kryo_l3_scu_handler.
+ * raw_spinlock_t is used (rather than spinlock_t) so the lock can be safely
+ * acquired from hard-IRQ context on PREEMPT_RT kernels.  Each CPU serialises
+ * only its own error-register reads, avoiding cross-CPU contention.
+ */
+static DEFINE_PER_CPU(raw_spinlock_t, erp_handler_lock);
+
 static void l1_l2_irq_enable(void *info)
 {
 	int irq = *(int *)info;
@@ -204,7 +218,7 @@ static int request_erp_irq(struct platform_device *pdev, const char *propname,
 	struct erp_drvdata *temp = NULL;
 
 	irq = platform_get_irq_byname(pdev, propname);
-	if( allocated_irq != NULL)
+	if (allocated_irq != NULL)
 		*allocated_irq = irq;
 	if (irq < 0) {
 		pr_err("ARM64 CPU ERP: Could not find <%s> IRQ property. Proceeding anyway.\n",
@@ -436,9 +450,10 @@ static bool kryo_check_l3_scu_error(struct edac_device_ctl_info *edev_ctl)
 	if (KRYO_ERRXSTATUS_VALID(errxstatus) &&
 		KRYO_ERRXMISC_LVL(errxmisc) == L3_BIT) {
 		if (l3_is_bus_error(errxstatus)) {
-			if (edev_ctl->panic_on_ue) {
+			clear_errxstatus_valid(errxstatus);
+			ret = EDAC_OK;
+			if (edev_ctl->panic_on_ue)
 				panic("Causing panic due to Bus Error\n");
-			}
 			goto unlock;
 		}
 		if (KRYO_ERRXSTATUS_UE(errxstatus)) {
@@ -474,12 +489,16 @@ static int kryo_cpu_panic_notify(struct notifier_block *this,
 static irqreturn_t kryo_l1_l2_handler(int irq, void *drvdata)
 {
 	irqreturn_t irq_status = IRQ_HANDLED;
-	bool edac_l1_l2_status = kryo_check_l1_l2_ecc(panic_handler_drvdata->edev_ctl);
+	unsigned long flags;
+	bool edac_l1_l2_status;
 
-	if (unlikely(edac_l1_l2_status == EDAC_SPURIOUS))
-	{
+	raw_spin_lock_irqsave(this_cpu_ptr(&erp_handler_lock), flags);
+	edac_l1_l2_status = kryo_check_l1_l2_ecc(panic_handler_drvdata->edev_ctl);
+	raw_spin_unlock_irqrestore(this_cpu_ptr(&erp_handler_lock), flags);
+
+	if (unlikely(edac_l1_l2_status == EDAC_SPURIOUS)) {
 		edac_cpu_printk(KERN_CRIT, EDAC_CPU, "EDAC spurious L1/L2 interrupt detected!!!\n");
-		sysfs_notify_dirent(per_cpu(cpu_kn.ue[L1], smp_processor_id()));
+		sysfs_notify_dirent_safe(per_cpu(cpu_kn.ue[L1], smp_processor_id()));
 		irq_status = IRQ_NONE;
 	}
 	return irq_status;
@@ -487,15 +506,19 @@ static irqreturn_t kryo_l1_l2_handler(int irq, void *drvdata)
 
 static irqreturn_t kryo_l3_scu_handler(int irq, void *drvdata)
 {
-	irqreturn_t irq_status = IRQ_HANDLED;
 	struct erp_drvdata *drv = drvdata;
 	struct edac_device_ctl_info *edev_ctl = drv->edev_ctl;
-	bool edac_l3_status = kryo_check_l3_scu_error(edev_ctl);
+	irqreturn_t irq_status = IRQ_HANDLED;
+	unsigned long flags;
+	bool edac_l3_status;
 
-	if (unlikely(edac_l3_status == EDAC_SPURIOUS))
-	{
+	raw_spin_lock_irqsave(this_cpu_ptr(&erp_handler_lock), flags);
+	edac_l3_status = kryo_check_l3_scu_error(edev_ctl);
+	raw_spin_unlock_irqrestore(this_cpu_ptr(&erp_handler_lock), flags);
+
+	if (unlikely(edac_l3_status == EDAC_SPURIOUS)) {
 		edac_cpu_printk(KERN_CRIT, EDAC_CPU, "EDAC spurious L3 interrupt detected!!!\n");
-		sysfs_notify_dirent(per_cpu(cpu_kn.ue[L3], smp_processor_id()));
+		sysfs_notify_dirent_safe(per_cpu(cpu_kn.ue[L3], smp_processor_id()));
 		irq_status = IRQ_NONE;
 	}
 
@@ -557,6 +580,21 @@ static int kryo_pmu_cpu_pm_notify(struct notifier_block *self,
 	return NOTIFY_OK;
 }
 
+static void kryo_cpu_erp_teardown(struct erp_drvdata *drv)
+{
+	atomic_notifier_chain_unregister(&panic_notifier_list, &drv->nb_panic);
+	panic_handler_drvdata = NULL;
+
+	if (drv->erp_cpu_drvdata) {
+		on_each_cpu(l1_l2_irq_disable, &drv->ppi, 1);
+		free_percpu_irq(drv->ppi, drv->erp_cpu_drvdata);
+		free_percpu(drv->erp_cpu_drvdata);
+		drv->erp_cpu_drvdata = NULL;
+	}
+
+	edac_device_del_device(drv->edev_ctl->dev);
+}
+
 static int kryo_cpu_erp_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -566,6 +604,9 @@ static int kryo_cpu_erp_probe(struct platform_device *pdev)
 	int num_irqs, irq, cpu;
 
 	init_regs_on_cpu(true);
+
+	for_each_possible_cpu(cpu)
+		raw_spin_lock_init(per_cpu_ptr(&erp_handler_lock, cpu));
 
 	drv = devm_kzalloc(dev, sizeof(*drv), GFP_KERNEL);
 
@@ -586,8 +627,6 @@ static int kryo_cpu_erp_probe(struct platform_device *pdev)
 	drv->edev_ctl->panic_on_ue = ARM64_ERP_PANIC_ON_UE;
 	drv->nb_pm.notifier_call = kryo_pmu_cpu_pm_notify;
 	drv->nb_panic.notifier_call = kryo_cpu_panic_notify;
-	atomic_notifier_chain_register(&panic_notifier_list,
-				       &drv->nb_panic);
 	platform_set_drvdata(pdev, drv);
 
 	rc = edac_device_add_device(drv->edev_ctl);
@@ -595,6 +634,8 @@ static int kryo_cpu_erp_probe(struct platform_device *pdev)
 		goto out_mem;
 
 	panic_handler_drvdata = drv;
+	atomic_notifier_chain_register(&panic_notifier_list,
+				       &drv->nb_panic);
 
 	for_each_possible_cpu(cpu) {
 		struct edac_device_instance *instance = &drv->edev_ctl->instances[cpu];
@@ -602,8 +643,15 @@ static int kryo_cpu_erp_probe(struct platform_device *pdev)
 		for (int i = 0; i < NUM_KRYO_BLOCKS; i++) {
 			per_cpu(cpu_kn.ue[i], cpu) = sysfs_get_dirent(instance->blocks[i].kobj.sd,
 								      "ue_count");
+			if (!per_cpu(cpu_kn.ue[i], cpu))
+				pr_warn("KRYO ERP: no sysfs ue_count for cpu%d L%d\n",
+					cpu, i + 1);
+
 			per_cpu(cpu_kn.ce[i], cpu) = sysfs_get_dirent(instance->blocks[i].kobj.sd,
 								      "ce_count");
+			if (!per_cpu(cpu_kn.ce[i], cpu))
+				pr_warn("KRYO ERP: no sysfs ce_count for cpu%d L%d\n",
+					cpu, i + 1);
 		}
 	}
 
@@ -648,7 +696,7 @@ static int kryo_cpu_erp_probe(struct platform_device *pdev)
 	return 0;
 
 out_dev:
-	edac_device_del_device(dev);
+	kryo_cpu_erp_teardown(drv);
 out_mem:
 	edac_device_free_ctl_info(drv->edev_ctl);
 	return rc;
@@ -659,14 +707,10 @@ static int kryo_cpu_erp_remove(struct platform_device *pdev)
 	struct erp_drvdata *drv = dev_get_drvdata(&pdev->dev);
 	struct edac_device_ctl_info *edac_ctl = drv->edev_ctl;
 
-	if (drv->erp_cpu_drvdata != NULL) {
-		on_each_cpu(l1_l2_irq_disable, &(drv->ppi), 1);
-		free_percpu_irq(drv->ppi, drv->erp_cpu_drvdata);
-		free_percpu(drv->erp_cpu_drvdata);
-	}
-
 	cpu_pm_unregister_notifier(&(drv->nb_pm));
-	edac_device_del_device(edac_ctl->dev);
+
+	kryo_cpu_erp_teardown(drv);
+
 	edac_device_free_ctl_info(edac_ctl);
 
 	return 0;

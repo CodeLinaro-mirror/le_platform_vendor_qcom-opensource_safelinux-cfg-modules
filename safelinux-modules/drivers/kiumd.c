@@ -1278,6 +1278,7 @@ static int kiumd_close(struct inode *inode, struct file *filp)
 
 	kfree(ki_ctx->pgtable_ctx);
 	kfree(ki_ctx->res_mem_area);
+	kfree(ki_ctx->kgsl_context);
 	kfree(ki_ctx);
 
 	return 0;
