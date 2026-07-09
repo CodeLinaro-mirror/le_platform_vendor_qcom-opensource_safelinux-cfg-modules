@@ -408,18 +408,22 @@ static int profiler_info_init(struct conf_data *desc, struct platform_device *pd
 
 	for (int i = 0; i < desc->num_llcc_channels; i++) {
 		profiler->llcc_mmap_base[i] = devm_platform_ioremap_resource(pdev, i);
-		if (IS_ERR(profiler->llcc_mmap_base[i]))
+		if (IS_ERR(profiler->llcc_mmap_base[i])) {
+			pr_err("Failed to ioremap llcc register for i: %d\n", i);
 			return dev_err_probe(&pdev->dev, PTR_ERR(profiler->llcc_mmap_base[i]),
 						"Failed to ioremap llcc registers\n");
+		}
 	}
 
 	for (int i = 0; i < desc->gemnoc_channels; i++) {
 		profiler->gemnoc_mmap_base[i] =
 			devm_platform_ioremap_resource(pdev,
 						(desc->num_llcc_channels + i));
-		if (IS_ERR(profiler->gemnoc_mmap_base[i]))
+		if (IS_ERR(profiler->gemnoc_mmap_base[i])) {
+			pr_err("Failed to ioremap gemnoc register for i: %d\n", i);
 			return dev_err_probe(&pdev->dev, PTR_ERR(profiler->gemnoc_mmap_base[i]),
 						"Failed to ioremap gemnoc registers\n");
+		}
 	}
 
 	profiler->mmnoc_base = devm_platform_ioremap_resource(pdev,
@@ -545,6 +549,18 @@ static int bwprofiler_remove(struct platform_device *pdev)
 	return 0;
 }
 
+static const struct conf_data seca_ddr_info = {
+	.num_llcc_channels = 8,
+	.num_gemnoc_metrics = 8,
+	.num_hf_metrics = 16,
+	.num_sf_metrics = 12,
+	.llcc_offset = 0x69010,
+	.cabo_offset = 0x10B0A0,
+	.mmnoc_hf_offset = 0x47140,
+	.mmnoc_sf_offset = 0xA140,
+	.gemnoc_channels = 4,
+};
+
 static const struct conf_data sa8797_ddr_info = {
 	.num_llcc_channels = 16,
 	.num_gemnoc_metrics = 8,
@@ -581,6 +597,7 @@ static const struct conf_data sa7255_ddr_info = {
 	.gemnoc_channels = 4,
 };
 static const struct of_device_id bwprofiler_of_match[] = {
+	{ .compatible = "qcom,seca_ddr_bwprofiler", .data = &seca_ddr_info},
 	{ .compatible = "qcom,sa8797_ddr_bwprofiler", .data = &sa8797_ddr_info},
 	{ .compatible = "qcom,sa8775_ddr_bwprofiler", .data = &sa8775_ddr_info},
 	{ .compatible = "qcom,sa8255_ddr_bwprofiler", .data = &sa8775_ddr_info},
