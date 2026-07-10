@@ -2,23 +2,22 @@
  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
-#include <linux/module.h>
-#include <linux/device.h>
-#include <linux/miscdevice.h>
-#include <linux/platform_device.h>
-#include <linux/of.h>
-#include <linux/errno.h>
-#include <linux/pm_runtime.h>
-#include <linux/pm_opp.h>
-#include <linux/reset.h>
-#include <linux/pm_domain.h>
-#include <linux/ktime.h>
-#include <linux/list.h>
 #include <linux/atomic.h>
 #include <linux/debugfs.h>
-#include <linux/seq_file.h>
+#include <linux/device.h>
+#include <linux/errno.h>
+#include <linux/ktime.h>
+#include <linux/list.h>
+#include <linux/miscdevice.h>
+#include <linux/module.h>
 #include <linux/mutex.h>
-#include <linux/kref.h>
+#include <linux/of.h>
+#include <linux/platform_device.h>
+#include <linux/pm_domain.h>
+#include <linux/pm_opp.h>
+#include <linux/pm_runtime.h>
+#include <linux/reset.h>
+#include <linux/seq_file.h>
 #include <uapi/misc/qcom_uscmi.h>
 
 #define CREATE_TRACE_POINTS
@@ -79,7 +78,6 @@ struct qcom_uscmi_client {
  * @dev: Platform device pointer
  * @miscdev: Miscellaneous device for /dev node
  * @name: Device name
- * @kref: Reference counter for device lifetime management
  * @dev_lock: Lock for serializing all operations and protecting device state
  * @clients: List of clients
  * @pd_list: List of power domains (contains pd_devs array)
@@ -103,12 +101,8 @@ struct qcom_uscmi_dev {
 	struct miscdevice miscdev;
 	const char *name;
 
-	/* Reference counting for device lifetime */
-	struct kref kref;
-
 	/* Locks */
-	struct mutex
-		dev_lock; /* Protects device state, client list, and serializes operations */
+	struct mutex dev_lock;
 
 	/* Client management */
 	struct list_head clients;
@@ -152,103 +146,6 @@ static void qcom_uscmi_client_free(struct qcom_uscmi_client *cl)
 DEFINE_FREE(qcom_uscmi_client, struct qcom_uscmi_client *,
 	if (_T)
 		qcom_uscmi_client_free(_T))
-
-/**
- * qcom_uscmi_get - Increment reference count on uscmi device
- * @uscmi: USCMI device structure
- *
- * Return: Pointer to uscmi device
- */
-static struct qcom_uscmi_dev *qcom_uscmi_get(struct qcom_uscmi_dev *uscmi)
-{
-	if (uscmi)
-		kref_get(&uscmi->kref);
-	return uscmi;
-}
-
-/**
- * qcom_uscmi_release_device - Release callback for kref
- * @kref: Reference counter
- *
- * Called when the last reference to the uscmi device is dropped.
- * Frees all resources associated with the device.
- */
-static void qcom_uscmi_release_device(struct kref *kref)
-{
-	struct qcom_uscmi_dev *uscmi =
-		container_of(kref, struct qcom_uscmi_dev, kref);
-	struct qcom_uscmi_client *cl, *tmp;
-	int i;
-
-	dev_info(uscmi->dev,
-		 "Releasing uscmi device (last reference dropped)\n");
-
-	/* Clean up any remaining clients */
-	mutex_lock(&uscmi->dev_lock);
-	list_for_each_entry_safe(cl, tmp, &uscmi->clients, node) {
-		list_del(&cl->node);
-		qcom_uscmi_client_free(cl);
-	}
-	mutex_unlock(&uscmi->dev_lock);
-
-	/* Detach power domains if still attached */
-	if (uscmi->pd_list)
-		dev_pm_domain_detach_list(uscmi->pd_list);
-
-	if (uscmi->resets) {
-		for (i = 0; i < uscmi->reset_count; i++) {
-			if (uscmi->resets[i])
-				reset_control_put(uscmi->resets[i]);
-		}
-		kfree(uscmi->resets);
-	}
-
-	if (uscmi->reset_names) {
-		for (i = 0; i < uscmi->reset_count; i++)
-			kfree(uscmi->reset_names[i]);
-		kfree(uscmi->reset_names);
-	}
-
-	kfree(uscmi->domain_names);
-
-	mutex_destroy(&uscmi->dev_lock);
-	/* Free dynamically allocated resources */
-	kfree(uscmi->name);
-	kfree(uscmi);
-}
-
-/**
- * qcom_uscmi_put - Decrement reference count on uscmi device
- * @uscmi: USCMI device structure
- *
- * Decrements the reference count and frees the device if this was the last reference.
- */
-static void qcom_uscmi_put(struct qcom_uscmi_dev *uscmi)
-{
-	if (uscmi)
-		kref_put(&uscmi->kref, qcom_uscmi_release_device);
-}
-
-/**
- * qcom_uscmi_dev_free - Free uscmi device and all nested allocations
- * @uscmi: Pointer to uscmi device structure
- *
- * Custom cleanup function for use with __free() attribute.
- * Frees the uscmi structure and all its nested allocations.
- * Used during probe failure paths only.
- */
-static void qcom_uscmi_dev_free(struct qcom_uscmi_dev *uscmi)
-{
-	if (uscmi) {
-		debugfs_remove_recursive(uscmi->debugfs_dir);
-		/* Decrement the initial reference (1) to trigger release */
-		qcom_uscmi_put(uscmi);
-	}
-}
-
-DEFINE_FREE(qcom_uscmi_dev, struct qcom_uscmi_dev *,
-	if (_T)
-		qcom_uscmi_dev_free(_T))
 
 /**
  * get_pd_dev - Get power domain device by name
@@ -491,7 +388,7 @@ static int __do_power_vote(struct device *pd, struct qcom_uscmi_client *cl,
 		/* Fix TOCTOU race: use atomic_fetch_dec and validate */
 		old_vote = atomic_fetch_dec(&cl->pwr_votes[idx]);
 		if (old_vote <= 0) {
-			/* Restore the counter since we shouldn't have decremented */
+			/* Restore the counter */
 			atomic_inc(&cl->pwr_votes[idx]);
 			dev_warn(pd,
 				 "[client %s:%d] power refcount already 0\n",
@@ -503,8 +400,9 @@ static int __do_power_vote(struct device *pd, struct qcom_uscmi_client *cl,
 		if (ret < 0) {
 			dev_err(pd, "Power off failed (err=%d)\n", ret);
 			/*
-			 * Note: pm_runtime_put_sync can fail but still decrement usage_count.
-			 * Our vote counter is already decremented to stay in sync.
+			 * Note: pm_runtime_put_sync can fail but still
+			 * decrement usage_count. Our vote counter is already
+			 * decremented to stay in sync.
 			 */
 		}
 
@@ -586,8 +484,9 @@ static int do_power_operation(scmi_oper_ioctl_t *req,
 out_detach:
 	if (ret < 0) {
 		atomic64_inc(&uscmi->stats.error_count);
-		dev_err(pd != NULL ? pd : uscmi->dev, "power operation(%d) failed with err=%d\n",
-			req->oper, ret);
+		dev_err(pd != NULL ? pd : uscmi->dev,
+			"power operation(%d) failed with err=%d\n", req->oper,
+			ret);
 	}
 
 	end_time = ktime_get();
@@ -623,9 +522,11 @@ static int dev_pm_opp_apply_level(struct device *dev, unsigned int level)
 }
 
 /**
- * recalculate_perf_level - Recalculate aggregated performance level for a domain
+ * recalculate_perf_level - Recalculate aggregated performance level for a
+ * domain
  * @uscmi: Driver structure
- * @domain_idx: Index of the domain to recalculate (must be valid, caller ensures this)
+ * @domain_idx: Index of the domain to recalculate (must be valid, caller
+ * ensures this)
  *
  * This function recalculates the aggregated performance level for a domain
  * based on the votes from all clients. It finds the maximum performance level
@@ -792,8 +693,9 @@ static int do_performance_operation(scmi_oper_ioctl_t *req,
 out_detach:
 	if (ret < 0) {
 		atomic64_inc(&uscmi->stats.error_count);
-		dev_err(pd != NULL ? pd : uscmi->dev, "perf operation(%d) failed with err=%d\n",
-			req->oper, ret);
+		dev_err(pd != NULL ? pd : uscmi->dev,
+			"perf operation(%d) failed with err=%d\n", req->oper,
+			ret);
 	}
 
 	end_time = ktime_get();
@@ -959,9 +861,8 @@ static int qcom_uscmi_open(struct inode *inode, struct file *filp)
 
 	if (!uscmi)
 		return -EINVAL;
-	qcom_uscmi_get(uscmi);
 
-	/* Hold lock for entire operation - coarse locking is fine, mutex allows sleeping */
+	/* Hold lock for entire operation */
 	mutex_lock(&uscmi->dev_lock);
 
 	/* Check client limit BEFORE allocating anything */
@@ -973,7 +874,6 @@ static int qcom_uscmi_open(struct inode *inode, struct file *filp)
 	client_count = atomic_read(&uscmi->stats.client_count);
 	if (client_count >= client_limit) {
 		mutex_unlock(&uscmi->dev_lock);
-		qcom_uscmi_put(uscmi);
 		dev_err(uscmi->dev,
 			"Client limit reached (%d clients), rejecting connection\n",
 			client_count);
@@ -984,7 +884,6 @@ static int qcom_uscmi_open(struct inode *inode, struct file *filp)
 	cl = kzalloc(sizeof(*cl), GFP_KERNEL);
 	if (!cl) {
 		mutex_unlock(&uscmi->dev_lock);
-		qcom_uscmi_put(uscmi);
 		return -ENOMEM;
 	}
 
@@ -996,7 +895,6 @@ static int qcom_uscmi_open(struct inode *inode, struct file *filp)
 	ret = allocate_client_votes(cl, uscmi->domain_count);
 	if (ret) {
 		mutex_unlock(&uscmi->dev_lock);
-		qcom_uscmi_put(uscmi);
 		return ret;
 	}
 
@@ -1041,7 +939,8 @@ static void cleanup_client_domain(struct qcom_uscmi_dev *uscmi,
 		__do_perf_vote(pd, uscmi, cl, idx, -1);
 
 		/* Power off domain */
-		pm_runtime_put_sync(pd);
+		if (ret >= 0)
+			pm_runtime_put_sync(pd);
 	}
 
 	/* Release power votes (may power off) */
@@ -1075,10 +974,10 @@ static int cleanup_client_votes(struct qcom_uscmi_dev *uscmi,
 	ret = qcom_uscmi_attach_domains(uscmi);
 	if (ret < 0) {
 		/*
-		 * If we cannot attach domains, we cannot safely access the power domain
-		 * devices to decrease their reference counts. We must abort cleanup
-		 * to prevent operating on invalid devices, even though this leaks
-		 * hardware votes.
+		 * If we cannot attach domains, we cannot safely access the
+		 * power domain devices to decrease their reference counts. We
+		 * must abort cleanup to prevent operating on invalid devices,
+		 * even though this leaks hardware votes.
 		 */
 		dev_err(uscmi->dev,
 			"Failed to attach domains for cleanup: %d\n", ret);
@@ -1146,7 +1045,6 @@ static int qcom_uscmi_release(struct inode *inode, struct file *filp)
 	filp->private_data = NULL;
 
 	/* Drop reference acquired in open() */
-	qcom_uscmi_put(uscmi);
 
 	dev_dbg(dev, "fd closed and cleaned up\n");
 
@@ -1262,7 +1160,7 @@ static int uscmi_stats_show(struct seq_file *s, void *unused)
 		int active_count = 0;
 		int agg_perf_level = -1;
 
-		/* Calculate active clients and aggregated perf level for this domain */
+		/* Calculate active clients and aggregated perf level */
 		list_for_each_entry(cl, &uscmi->clients, node) {
 			if (cl->pwr_votes && atomic_read(&cl->pwr_votes[i]) > 0)
 				active_count++;
@@ -1286,11 +1184,10 @@ static int uscmi_stats_show(struct seq_file *s, void *unused)
 
 		if (cl->pwr_votes && cl->prf_votes) {
 			for (i = 0; i < uscmi->domain_count; i++) {
-				seq_printf(
-					s,
-					"    Domain %d: Power votes=%d, Perf level=%d\n",
-					i, atomic_read(&cl->pwr_votes[i]),
-					cl->prf_votes[i]);
+				seq_printf(s,
+					   "    Domain %d: Power votes=%d, Perf level=%dn",
+					   i, atomic_read(&cl->pwr_votes[i]),
+					   cl->prf_votes[i]);
 			}
 		}
 	}
@@ -1330,7 +1227,8 @@ static void uscmi_debugfs_init(struct qcom_uscmi_dev *uscmi)
 	struct dentry *stats_file, *dir;
 	int i, num_pd_names;
 
-	/* Set default configuration (stats already zero-initialized by kzalloc) */
+	/* Set default configuration (stats already zero-initialized by kzalloc)
+	 */
 	uscmi->client_limit = DEFAULT_CLIENT_LIMIT;
 
 	/* Cache domain names if available (for debugging) */
@@ -1338,8 +1236,8 @@ static void uscmi_debugfs_init(struct qcom_uscmi_dev *uscmi)
 		num_pd_names =
 			of_property_count_strings(np, "power-domain-names");
 		if (num_pd_names > 0 && num_pd_names == uscmi->domain_count) {
-			uscmi->domain_names = kcalloc(
-				uscmi->domain_count,
+			uscmi->domain_names = devm_kcalloc(
+				dev, uscmi->domain_count,
 				sizeof(*uscmi->domain_names), GFP_KERNEL);
 			if (uscmi->domain_names) {
 				for (i = 0; i < uscmi->domain_count; i++) {
@@ -1375,8 +1273,9 @@ static void uscmi_debugfs_init(struct qcom_uscmi_dev *uscmi)
 	if (!IS_ERR_OR_NULL(dir)) {
 		/*
 		 * Add configuration options.
-		 * Note: client_limit will be validated and clamped in qcom_uscmi_open()
-		 * to prevent setting it to unsafe values (0 or > 10000).
+		 * Note: client_limit will be validated and clamped in
+		 * qcom_uscmi_open() to prevent setting it to unsafe values (0
+		 * or > 10000).
 		 */
 		debugfs_create_u32("client_limit", 0644, dir,
 				   &uscmi->client_limit);
@@ -1449,9 +1348,9 @@ static int uscmi_setup_device_name(struct qcom_uscmi_dev *uscmi)
 	const char *name;
 
 	if (!of_property_read_string(np, "qcom,dev-name", &name))
-		uscmi->name = kstrdup(name, GFP_KERNEL);
+		uscmi->name = devm_kstrdup(dev, name, GFP_KERNEL);
 	else
-		uscmi->name = kasprintf(GFP_KERNEL, "%pOFn", np);
+		uscmi->name = devm_kasprintf(dev, GFP_KERNEL, "%pOFn", np);
 
 	if (!uscmi->name)
 		return -ENOMEM;
@@ -1517,12 +1416,13 @@ static int uscmi_init_reset_controls(struct qcom_uscmi_dev *uscmi)
 	uscmi->reset_count = num_resets;
 
 	/* Allocate arrays for reset controls and names */
-	uscmi->reset_names =
-		kcalloc(num_resets, sizeof(*uscmi->reset_names), GFP_KERNEL);
+	uscmi->reset_names = devm_kcalloc(
+		dev, num_resets, sizeof(*uscmi->reset_names), GFP_KERNEL);
 	if (!uscmi->reset_names)
 		return -ENOMEM;
 
-	uscmi->resets = kcalloc(num_resets, sizeof(*uscmi->resets), GFP_KERNEL);
+	uscmi->resets = devm_kcalloc(dev, num_resets, sizeof(*uscmi->resets),
+				     GFP_KERNEL);
 	if (!uscmi->resets)
 		return -ENOMEM;
 
@@ -1538,7 +1438,7 @@ static int uscmi_init_reset_controls(struct qcom_uscmi_dev *uscmi)
 			return ret;
 		}
 
-		uscmi->reset_names[i] = kstrdup(name, GFP_KERNEL);
+		uscmi->reset_names[i] = devm_kstrdup(dev, name, GFP_KERNEL);
 		if (!uscmi->reset_names[i])
 			return -ENOMEM;
 
@@ -1547,10 +1447,9 @@ static int uscmi_init_reset_controls(struct qcom_uscmi_dev *uscmi)
 			ret = PTR_ERR(uscmi->resets[i]);
 			if (ret == -ENOENT) {
 				uscmi->resets[i] = NULL;
-				dev_info(
-					dev,
-					"Reset control %s not available (optional)\n",
-					name);
+				dev_info(dev,
+					 "Reset control %s not available (optional)\n",
+					 name);
 			} else {
 				dev_err(dev,
 					"Failed to get reset control %s: %d\n",
@@ -1577,18 +1476,17 @@ static int uscmi_init_reset_controls(struct qcom_uscmi_dev *uscmi)
 static int qcom_uscmi_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
-	struct qcom_uscmi_dev *uscmi __free(qcom_uscmi_dev) = NULL;
+	struct qcom_uscmi_dev *uscmi;
 	int err;
 
 	/* Allocate main device structure - use kzalloc, not devm */
-	uscmi = kzalloc(sizeof(*uscmi), GFP_KERNEL);
+	uscmi = devm_kzalloc(dev, sizeof(*uscmi), GFP_KERNEL);
 	if (!uscmi)
 		return dev_err_probe(dev, -ENOMEM,
 				     "failed to allocate uscmi dev\n");
 
 	/* Initialize device structure */
 	uscmi->dev = dev;
-	kref_init(&uscmi->kref); /* Initialize with refcount = 1 */
 	mutex_init(&uscmi->dev_lock);
 	INIT_LIST_HEAD(&uscmi->clients);
 
@@ -1618,20 +1516,17 @@ static int qcom_uscmi_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, uscmi);
 
 	/* Log successful initialization */
-	dev_info(
-			dev,
-			"/dev/%s node created with %d power domain(s) and %d reset domain(s)\n",
-			uscmi->name, uscmi->domain_count, uscmi->reset_count);
-
-	/* Success - disable auto-cleanup and return */
-	no_free_ptr(uscmi);
+	dev_info(dev,
+		 "/dev/%s node created with %d power domain(s) and %d reset domain(s)\n",
+		 uscmi->name, uscmi->domain_count, uscmi->reset_count);
 	return 0;
 }
 
 static int qcom_uscmi_remove(struct platform_device *pdev)
 {
-	struct device *dev = &pdev->dev;
 	struct qcom_uscmi_dev *uscmi = platform_get_drvdata(pdev);
+	struct qcom_uscmi_client *cl, *tmp;
+	int i;
 
 	if (!uscmi)
 		return 0;
@@ -1641,19 +1536,34 @@ static int qcom_uscmi_remove(struct platform_device *pdev)
 
 	/*
 	 * Unregister miscdevice to prevent new open() calls.
-	 * After this, no new file descriptors can be created.
+	 * suppress_bind_attrs = true guarantees no open fds exist at
+	 * this point, so it is safe to free all resources immediately.
 	 */
 	misc_deregister(&uscmi->miscdev);
 
-	/*
-	 * Drop the initial reference from probe().
-	 * The uscmi structure will be freed when the last file descriptor
-	 * is closed (when kref reaches 0 in qcom_uscmi_release_device).
-	 * This ensures the structure remains valid as long as any fd is open.
-	 */
-	dev_info(dev, "/dev/%s node removed\n", uscmi->name);
-	qcom_uscmi_put(uscmi);
+	dev_info(uscmi->dev, "/dev/%s node removed\n", uscmi->name);
 
+	/* Clean up any remaining clients (defensive, should be empty) */
+	mutex_lock(&uscmi->dev_lock);
+	list_for_each_entry_safe(cl, tmp, &uscmi->clients, node) {
+		list_del(&cl->node);
+		qcom_uscmi_client_free(cl);
+	}
+	mutex_unlock(&uscmi->dev_lock);
+
+	/* Detach power domains if still attached */
+	if (uscmi->pd_list)
+		dev_pm_domain_detach_list(uscmi->pd_list);
+
+	/* Release reset controls */
+	if (uscmi->resets) {
+		for (i = 0; i < uscmi->reset_count; i++) {
+			if (uscmi->resets[i])
+				reset_control_put(uscmi->resets[i]);
+		}
+	}
+
+	mutex_destroy(&uscmi->dev_lock);
 	return 0;
 }
 
@@ -1688,10 +1598,12 @@ static struct platform_driver qcom_uscmi_driver = {
 		.pm = &qcom_uscmi_pm_ops,
 		.of_match_table = qcom_uscmi_match_table,
 		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
+		.suppress_bind_attrs = true,
 	},
 	.probe = qcom_uscmi_probe,
 	.remove = qcom_uscmi_remove,
 };
+
 static int __init qcom_uscmi_init(void)
 {
 	/* Create global debugfs root directory */
