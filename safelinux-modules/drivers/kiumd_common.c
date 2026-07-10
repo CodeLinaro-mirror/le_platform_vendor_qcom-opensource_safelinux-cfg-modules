@@ -859,6 +859,10 @@ void clear_kgsl_map_iova(struct kmem_cache *addr_cache,
 		spin_unlock(&global_map_lock);
 	} else {
 		pgtble_ctx = kiumd_get_pgtable_entry(kiumd_ctx, idx);
+		if (pgtble_ctx == NULL) {
+			pr_err("%s: failed to get pgtable entry for idx %d\n", __func__, idx);
+			return;
+		}
 		free_iova_range(addr_cache, pgtble_ctx, iova);
 	}
 
