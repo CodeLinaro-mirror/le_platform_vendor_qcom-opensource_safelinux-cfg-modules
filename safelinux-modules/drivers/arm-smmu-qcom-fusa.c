@@ -1120,7 +1120,7 @@ static const struct qsmmu_fusa_match_data md_qsmmu_tbu500 = {
 static const struct qsmmu_fusa_match_data md_qsmmu_qtb500 = {
 	.offset = 0,
 	.flags  = QSMMU_F_QTB500,
-	.enable_fault_injection = true,
+	.enable_fault_injection = false,
 };
 
 static const struct qsmmu_fusa_match_data md_qsmmu_qtb600 = {
