@@ -8,7 +8,7 @@
 #include <linux/unistd.h>
 
 #define KIUMD_SMMU_MAP_BUF		_IOWR('R', 10, struct kiumd_user)
-#define KIUMD_SMMU_UNMAP_BUF	        _IOWR('R', 11, struct kiumd_user)
+#define KIUMD_SMMU_UNMAP_BUF	        _IOWR('R', 11, struct kiumd_user_unmap)
 #define KIUMD_IOVA_MAP_CTRL             _IOWR('R', 14, struct kiumd_user)
 #define KIUMD_SET_PGTBL_CONTEXT          _IOWR('R', 15, struct kiumd_smmu_user)
 #define KIUMD_PER_PROCESS_ALLOC 	_IOWR('R', 16, struct kiumd_smmu_user)
@@ -17,12 +17,12 @@
 #define KIUMD_CUSTOM_IOVA_INIT          _IOWR('R', 20, struct kiumd_user)
 #define KIUMD_GLOBAL_PT_SET             _IOWR('R', 21, struct kiumd_smmu_user)
 #define KIUMD_SMMU_MMIO_MAP		_IOWR('R', 24, struct kiumd_smmu_mmio_map)
-#define KIUMD_SMMU_MMIO_UNMAP		_IOWR('R', 25, struct kiumd_smmu_mmio_map)
+#define KIUMD_SMMU_MMIO_UNMAP		_IOWR('R', 25, struct kiumd_user_unmap)
 #define KIUMD_SMMU_FAULT_HANDLE_REGISTER _IOWR('R', 26, struct kiumd_user)
 #define KIUMD_SMMU_FAULT_HANDLE_DEREGISTER _IOWR('R', 27, struct kiumd_user)
 #define KIUMD_VFIO_CTX_INIT	        _IOWR('R', 28, struct kiumd_dev_mem_info)
 #define KIUMD_SMMU_MANAGED_IOVA_MAP	_IOWR('R', 29, struct kiumd_user)
-#define KIUMD_SMMU_MANAGED_IOVA_UNMAP	_IOWR('R', 30, struct kiumd_user)
+#define KIUMD_SMMU_MANAGED_IOVA_UNMAP	_IOWR('R', 30, struct kiumd_user_unmap)
 #define KIUMD_SMMU_ASSIGN_BUF		_IOWR('R', 31, struct kiumd_user)
 #define KIUMD_SMMU_UNASSIGN_BUF		_IOWR('R', 32, struct kiumd_user)
 #define KIUMD_MANAGE_RUNTIME_PM        _IOWR('R', 33, struct kiumd_user)
@@ -131,6 +131,10 @@ struct kiumd_smmu_mmio_map {
 	__u64 reg_len;
 	char *reg_name;
 	int reg_idx;
+};
+
+struct kiumd_user_unmap {
+	__u32 id;
 };
 
 struct kiumd_mem_info {
