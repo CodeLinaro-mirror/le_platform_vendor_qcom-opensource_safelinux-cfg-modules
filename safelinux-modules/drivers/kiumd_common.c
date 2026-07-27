@@ -696,13 +696,11 @@ int kiumd_set_pgtble_ttbr1_context(struct iommu_domain *iommu_dom)
 
 	smmu_cfg = &smmu_dom->cfg;
 	cb = &smmu_dom->smmu->cbs[smmu_cfg->cbndx];
-	if (!(cb->tcr[0] & ARM_SMMU_TCR_EPD1)) {
+	if (!(cb->tcr[0] & ARM_SMMU_TCR_EPD1))
+		pr_err("%s: kgsl restarted, reprogramming TTBR1\n", __func__);
 		/** Not an error. During kgsl relaunch, we dont have to reprogram
 		 *  TTBR1 if its already enabled.
 		 */
-		pr_err("%s: TTBR1 is already enabled for the device\n", __func__);
-		return 0;
-	}
 
 	pagetable = io_pgtable_ops_to_pgtable(smmu_dom->pgtbl_ops);
 	if (!pagetable) {
