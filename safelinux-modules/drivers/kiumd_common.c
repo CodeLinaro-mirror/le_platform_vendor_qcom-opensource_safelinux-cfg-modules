@@ -1423,7 +1423,6 @@ void kiumd_mmio_unmap(struct smmu_map_data *smap)
 {
 	dma_unmap_resource(smap->dev, smap->context->iova,
 			   smap->context->size, 0, 0);
-	kfree(smap->context);
 }
 
 unsigned long get_hash_key(struct device *dev)
