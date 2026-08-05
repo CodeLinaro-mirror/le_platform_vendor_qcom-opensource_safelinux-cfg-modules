@@ -19,7 +19,7 @@
 #include <linux/of.h>
 #include <linux/of_address.h>
 
-#define BASE_ADDR		            0x23000000
+#define BASE_ADDR		            0x23040000
 #define MEM_SIZE		            0x1000
 #define DMA_CH			            4
 #define VLAN_N_VID		            4095
@@ -531,53 +531,6 @@ static void remove_one_vlan_gvm(int vid)
 	}
 }
 
-static int get_base_addr_by_compatible(const char *compatible,
-				       const char *reg_name,
-				       u64 *base_addr)
-{
-	struct device_node *np;
-	struct resource res;
-	int index;
-	int ret = 0;
-
-	if (!compatible || !reg_name || !base_addr)
-		return -EINVAL;
-
-	np = of_find_compatible_node(NULL, NULL, compatible);
-	if (!np) {
-		pr_err("%s: cannot find compatible node: %s\n",
-			__func__, compatible);
-		return -ENODEV;
-	}
-
-	index = of_property_match_string(np, "reg-names", reg_name);
-	if (index < 0) {
-		pr_err("%s: cannot find reg-names \"%s\" in node %pOF\n",
-			__func__, reg_name, np);
-		ret = index;
-		goto out_put_node;
-	}
-
-	ret = of_address_to_resource(np, index, &res);
-	if (ret) {
-		pr_err("%s: of_address_to_resource failed for %pOF, index=%d, ret=%d\n",
-			__func__, np, index, ret);
-		goto out_put_node;
-	}
-
-	*base_addr = (u64)res.start;
-
-	pr_info("%s: %pOF reg_name=%s base=0x%llx size=0x%llx\n",
-		__func__, np, reg_name,
-		(unsigned long long)*base_addr,
-		(unsigned long long)resource_size(&res));
-
-out_put_node:
-	of_node_put(np);
-	return ret;
-}
-
-
 static ssize_t device_write(struct file *device_file, const char *buffer,
 			    size_t len, loff_t *file_position)
 {
@@ -694,6 +647,47 @@ err_alloc:
 	return ret;
 }
 
+/*
+ * DMA virtualization is always on EMAC0 (0x23040000); DT alias "ethernet0"
+ * is its canonical name. of_find_node_by_path() resolves alias names that
+ * do not start with '/' (drivers/of/base.c: of_find_node_opts_by_path).
+ * Upstream precedent: stmmac_platform.c uses of_alias_get_id(np, "ethernet")
+ * for plat->bus_id; fec_main.c and sxgbe_platform.c do the same.
+ */
+static int get_base_addr_by_alias(const char *alias, const char *reg_name,
+				  u64 *base_addr)
+{
+	struct device_node *np;
+	struct resource res;
+	int index, ret;
+
+	np = of_find_node_by_path(alias);
+	if (!np) {
+		pr_err("no DT alias \"%s\"\n", alias);
+		return -ENODEV;
+	}
+
+	index = of_property_match_string(np, "reg-names", reg_name);
+	if (index < 0) {
+		pr_err("no reg-names \"%s\" in %pOF\n", reg_name, np);
+		ret = index;
+		goto out;
+	}
+
+	ret = of_address_to_resource(np, index, &res);
+	if (ret) {
+		pr_err("of_address_to_resource failed for %pOF: %d\n", np, ret);
+		goto out;
+	}
+
+	*base_addr = (u64)res.start;
+	pr_info("alias \"%s\" -> %pOF base=0x%llx\n", alias, np,
+		(unsigned long long)*base_addr);
+out:
+	of_node_put(np);
+	return ret;
+}
+
 static int __init filter_init(void)
 {
 	u64 base_addr = 0;
@@ -705,16 +699,10 @@ static int __init filter_init(void)
 		return -ENOMEM;
 	}
 
-	ret = get_base_addr_by_compatible("qcom,sa8620p-ethqos",
-					  "stmmaceth", &base_addr);
-	if (ret)
-		ret = get_base_addr_by_compatible("qcom,sa8255p-ethqos",
-						  "stmmaceth", &base_addr);
-
-	if (!ret)
+	if (!get_base_addr_by_alias("ethernet0", "stmmaceth", &base_addr))
 		mac_base = ioremap(base_addr, MEM_SIZE);
 	else {
-		pr_warn("Failed to get MAC base address from DT, falling back to module param 0x%lx\n",
+		pr_warn("DT alias lookup failed, falling back to param 0x%lx\n",
 			mac_base_addr);
 		mac_base = ioremap(mac_base_addr, MEM_SIZE);
 	}
