@@ -11,7 +11,6 @@
 #include <linux/dma-buf.h>
 #include <linux/dma-direction.h>
 #include <linux/firmware/qcom/qcom_scm.h>
-#include <linux/hashtable.h>
 #include <linux/iommu_iova_map.h>
 #include <linux/iova.h>
 #include <linux/kernel.h>
@@ -179,24 +178,13 @@ struct kiumd_secure_map_context {
  * @base: start address of reserved memory area
  *
  */
-struct kiumd_reserved_mem_area {
-	size_t size;
-	u64    base;
-};
-
-/**
- * struct kiumd_kgsl_context: to store GPU context
- * @kgsl_pt_id: pagetable id
- * @kgsl_start_iova: Starting iova for GPU
- * @kgsl_end_iova Ending iova for GPU
- * @kgsl_hash_lock: lock for pagetable add/retrieve
- */
-
-struct kiumd_kgsl_context {
-	u32 kgsl_pt_id;
-	unsigned long kgsl_start_iova;
-	unsigned long kgsl_end_iova;
-	spinlock_t kgsl_hash_lock;
+struct kiumd_reserved_mem {
+	int num_regions;
+	struct mutex resmem_lock;
+	struct kiumd_resmem_area {
+		size_t size;
+		u64    base;
+	} *area;
 };
 
 /**
@@ -205,18 +193,16 @@ struct kiumd_kgsl_context {
  * @start_iova: Starting iova for GPU
  * @end_iova: Ending iova for GPU
  * @rbtree: Red-black tree root for managing iova ranges
- * @node: Node for linking in a hash list
  * @ttbr0_addr: TTBR0 address for GPU
  * @pgtbl_ops_ptr: Pointer to pagetable operations for GPU
  * @last_allocated_end: Last allocated end address for GPU
  * @kgsl_rbtree_lock: lock for pagetable add/retrieve
  */
 struct pgtable_map {
-	unsigned long idx;
+	unsigned int idx;
 	unsigned long start_iova;
 	unsigned long end_iova;
 	struct rb_root rbtree;
-	struct hlist_node node;
 	struct mutex pgctx_lock;
 //Used only by GPU
 	unsigned long ttbr0_addr;
@@ -226,45 +212,19 @@ struct pgtable_map {
 	struct io_pgtable_ops *pgtable_ops;
 };
 
-
-/**
- * struct kiumd_ctx: Structure for kiumd_ctx .
- * @id: id to map/unmap entries in hashtable
- * @smmu_map_data: structurefor hashtable data
- * @smmu_lock: Lock for map/unmap operations
- * @resmem_lock: Lock for res_mem_area operations
- * @hyp_lock: Lock for hyp assign operations
- * @smmu_table: Hashtable to hold entries based on id
- * @reserved_mem_area: pointer to hold reserved memory area
- * @hyp_idx: id for hyp_map_data node entries in hashtable
- * @num_reserved_regions : number of reserved memory areas
- *
- */
-
 struct kiumd_ctx {
-	int id;
 	struct device *staging_dev;
-	u32 pt_id;
-	bool is_initialized;
-	struct hlist_node smmu_map_data;
-	struct hlist_node pgtable_map;
-	unsigned int hyp_idx;
-	struct hlist_node hyp_map_data;
-	spinlock_t smmu_lock;
-	spinlock_t pt_lock;
-	DECLARE_HASHTABLE(smmu_table, SMMU_MAPTABLE_SIZE);
-	DECLARE_HASHTABLE(hyp_table, SMMU_MAPTABLE_SIZE);
-	struct kiumd_reserved_mem_area *res_mem_area;
-	int num_reserved_regions;
-	struct mutex hyp_lock;
-	struct mutex resmem_lock;
-	struct mutex managed_rbtree_lock;
 	struct mutex map_lock;
+	struct xarray kiumd_xa_smap;
+	struct xarray kiumd_xa_hyp;
+	struct xarray kiumd_xa_kgsl_pt;
+	u32 pt_id;
+	struct hlist_node pgtable_map;
+	spinlock_t pt_lock;
+	struct kiumd_reserved_mem resmem;
+	struct mutex managed_rbtree_lock;
 	unsigned long pt_start_iova;
 	unsigned long pt_end_iova;
-	DECLARE_HASHTABLE(page_table, SMMU_MAPTABLE_SIZE);
-	DECLARE_HASHTABLE(kgsl_page_table, SMMU_MAPTABLE_SIZE);
-	struct kiumd_kgsl_context *kgsl_context;
 	unsigned long max_shift;
 	struct io_pgtable *pgtable;
 	struct pgtable_map *pgtable_ctx;
@@ -276,33 +236,36 @@ struct iommu_addr_entry {
 	struct rb_node rbnode;
 };
 
-/**
- * struct  smmu_map_data: Structure for hashtable data .
- * @id: id to map/unmap entries in hashtable
- * @sgt_ptr: sgt pointer value
- * @dmabuf_ptr: dma buf pointer for map operations
- * @dmabufattach: dmabufattach value
- * @node: hlist_node
- *
- */
 struct smmu_map_data {
-	int id;
-	struct sg_table *sgt_ptr;
-	struct dma_buf *dmabuf_ptr;
-	struct dma_buf_attachment *dmabufattach;
-	int dma_dir;
-	int ptselect;
-	bool is_iova_zero;
-	bool is_priv_map;
-	bool is_fixed_map;
-	struct device *dev;
+	int id;			// Map ID
+
+	struct device *dev;	//Device details
 	struct device *staging_dev;
-	u64 size;
-	unsigned long iova_rb;
-	bool is_kgsl_map;
-	bool is_kgsl_ctx;
-	struct kiumd_smmu_kgsl_ctx kgsl_ctx;
-	struct kiumd_smmu_mmio_ctx *context;
+
+	struct {		// Dma buf details
+		struct sg_table *sgt_ptr;
+		struct dma_buf *dmabuf_ptr;
+		struct dma_buf_attachment *dmabufattach;
+		int dma_dir;
+	};
+
+	struct kiumd_smmu_mmio_ctx *context;	//MMIO details
+
+	struct {		//map type details
+		bool is_iova_zero;
+		bool is_priv_map;
+		bool is_fixed_map;
+	};
+
+	struct {		// KGSL details
+		bool is_kgsl_map;
+		bool is_kgsl_ctx;
+		struct kiumd_smmu_kgsl_ctx kgsl_ctx;
+		int ptselect;
+	};
+
+	u64 size;		//Map res size
+	unsigned long iova_rb;  // iova/dma address
 	struct hlist_node node;
 };
 
@@ -331,9 +294,6 @@ int kiumd_set_pgtble_ttbr0_context(struct iommu_domain *iommu_dom,
 
 int kiumd_set_pgtble_ttbr1_context(struct iommu_domain *iommu_dom);
 
-struct pgtable_map *kiumd_get_pgtable_entry(struct kiumd_ctx *kiumd_ctx,
-					    unsigned long idx);
-
 bool check_pgtable_context(struct device *dev, struct pgtable_map *pgtable_ctx);
 
 struct iommu_domain *kiumd_iommu_get_dma_domain(struct device *dev);
@@ -355,7 +315,9 @@ unsigned long alloc_iova_range(struct kmem_cache *addr_cache, struct device *dev
 				struct pgtable_map *ptable_ctx, struct smmu_map_data *smap,
 				unsigned long max_shift, unsigned long fixed_iova, bool is_fix_map);
 
-void add_to_smmu_table(struct kiumd_ctx *ctx, struct smmu_map_data *map_data);
+int add_smap(struct kiumd_ctx *ctx, struct smmu_map_data *smap);
+
+struct smmu_map_data *remove_smap(struct kiumd_ctx *ctx, int id);
 
 u64 kiumd_get_dmabuf_size(int dmabuf_fd);
 
