@@ -271,6 +271,7 @@ static u32 check_tbu_fault(u32 fisr, u8 *severity)
 static irqreturn_t qcom_smmu_tcu_fault(int irq, void *dev)
 {
 	struct qsmmu_fusa *qsmmu_fusa = dev;
+	struct irq_data *irq_data;
 	struct irq_desc *desc;
 	unsigned long flags;
 	u8 severity;
@@ -284,9 +285,17 @@ static irqreturn_t qcom_smmu_tcu_fault(int irq, void *dev)
 		writel(fisr, qsmmu_fusa->tcu_fusa_base);
 	}
 
-	desc = irq_data_to_desc(irq_get_irq_data(irq));
+	irq_data = irq_get_irq_data(irq);
+	if (unlikely(!irq_data))
+		return IRQ_NONE;
+
+	desc = irq_data_to_desc(irq_data);
 	if (unlikely(!desc))
 		return IRQ_NONE;
+
+	if (unlikely(!desc->action || !desc->action->name))
+		return IRQ_NONE;
+
 	spin_lock_irqsave(&qsmmu_fusa->lock, flags);
 	scnprintf(qsmmu_fusa->hw_fault.fault_source, BUFFER_SZ, "%s",
 	          desc->action->name);
@@ -318,14 +327,22 @@ static irqreturn_t qcom_smmu_client_fault(int irq, void *dev)
 {
 	struct qsmmu_fusa *qsmmu_fusa = dev;
 	void __iomem *client_status_reg;
+	struct irq_data *irq_data;
 	struct irq_desc *desc;
 	unsigned long flags;
 	char *client_name;
 	u32 fisr, client_index, ret;
 	u8 severity;
 
-	desc = irq_data_to_desc(irq_get_irq_data(irq));
+	irq_data = irq_get_irq_data(irq);
+	if (unlikely(!irq_data))
+		return IRQ_NONE;
+
+	desc = irq_data_to_desc(irq_data);
 	if (unlikely(!desc))
+		return IRQ_NONE;
+
+	if (unlikely(!desc->action || !desc->action->name))
 		return IRQ_NONE;
 
 	client_name = strnstr(desc->action->name, "CLIENT", strlen(desc->action->name));
@@ -1103,7 +1120,7 @@ static const struct qsmmu_fusa_match_data md_qsmmu_tbu500 = {
 static const struct qsmmu_fusa_match_data md_qsmmu_qtb500 = {
 	.offset = 0,
 	.flags  = QSMMU_F_QTB500,
-	.enable_fault_injection = true,
+	.enable_fault_injection = false,
 };
 
 static const struct qsmmu_fusa_match_data md_qsmmu_qtb600 = {
