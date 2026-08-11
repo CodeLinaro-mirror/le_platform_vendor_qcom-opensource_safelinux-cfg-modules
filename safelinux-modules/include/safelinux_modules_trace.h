@@ -957,6 +957,31 @@ TRACE_EVENT(umd_kgsl_perprocess_pgtble_set,
 
 
 #endif    // TRACE_SAFELINUX_COMMON
+
+#if defined(TRACE_SAFELINUX_IOMMU_FAULTS)
+TRACE_EVENT(iommu_fault,
+	TP_PROTO(const char *dev_name, const char *event,
+		 u64 iova, u32 fsr, int flags),
+	TP_ARGS(dev_name, event, iova, fsr, flags),
+	TP_STRUCT__entry(
+		__string(dev_name,	dev_name)
+		__string(event,		event)
+		__field(u64,		iova)
+		__field(u32,		fsr)
+		__field(int,		flags)
+	),
+	TP_fast_assign(
+		__assign_str(dev_name, dev_name);
+		__assign_str(event,    event);
+		__entry->iova  = iova;
+		__entry->fsr   = fsr;
+		__entry->flags = flags;
+	),
+	TP_printk("dev=%s event=%s iova=0x%llx fsr=0x%08x flags=0x%x",
+		  __get_str(dev_name), __get_str(event),
+		  __entry->iova, __entry->fsr, __entry->flags)
+);
+#endif /* TRACE_SAFELINUX_IOMMU_FAULTS */
 #endif /* TRACE_SAFELINUX_MODULES */
 
 /* This part must be outside protection */
