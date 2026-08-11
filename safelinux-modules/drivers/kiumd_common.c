@@ -209,43 +209,6 @@ int kiumd_iommu_custom_iova_init(struct device *dev)
 	return 0;
 }
 
-/**
- * kiumd_get_pgtable_entry - Searche for a pagetable entry in
- * the given context's hash table based on the provided index
- *
- * Parameters:
- * @kiumd_ctx: Pointer to the kiumd context
- * @idx: Index of the pagetable entry to retrieve
- * @is_process: Flag indicating if the context is process-specific
- *
- * Return: Pointer to the found pagetable entry, or NULL if not found.
- */
-struct pgtable_map *kiumd_get_pgtable_entry(struct kiumd_ctx *kiumd_ctx,
-					    unsigned long idx)
-{
-	struct kiumd_kgsl_context *kgsl_context;
-	struct pgtable_map *pgtble_ctx;
-	bool found = false;
-
-	kgsl_context = kiumd_ctx->kgsl_context;
-	spin_lock(&kgsl_context->kgsl_hash_lock);
-	hash_for_each_possible(kiumd_ctx->kgsl_page_table, pgtble_ctx, node, idx) {
-		if (pgtble_ctx->idx == idx) {
-			found = true;
-			break;
-		}
-	}
-
-	spin_unlock(&kgsl_context->kgsl_hash_lock);
-	if (!found) {
-		pr_err("%s:%d wrong id:%lu passed by client to get enrty in hash map\n",
-			__func__, __LINE__, idx);
-		return NULL;
-	}
-
-	return pgtble_ctx;
-}
-
 bool check_ptselect(struct kiumd_user *kiusr)
 {
 	return ((kiusr->ptselect == KGSL_GLOBAL_PT)
@@ -858,7 +821,7 @@ void clear_kgsl_map_iova(struct kmem_cache *addr_cache,
 		bitmap_clear(global_map, bit, size >> PAGE_SHIFT);
 		spin_unlock(&global_map_lock);
 	} else {
-		pgtble_ctx = kiumd_get_pgtable_entry(kiumd_ctx, idx);
+		pgtble_ctx = xa_load(&kiumd_ctx->kiumd_xa_kgsl_pt, idx);
 		free_iova_range(addr_cache, pgtble_ctx, iova);
 	}
 
@@ -881,9 +844,7 @@ void clean_map(struct kmem_cache *addr_cache, struct kiumd_ctx *kiumd_ctx,
 	if (smap->iova_rb)
 		(void)free_allocated_iova(addr_cache, kiumd_ctx, smap->iova_rb);
 
-	spin_lock(&kiumd_ctx->smmu_lock);
-	hash_del(&smap->node);
-	spin_unlock(&kiumd_ctx->smmu_lock);
+	remove_smap(kiumd_ctx, smap->id);
 }
 
 
@@ -1050,7 +1011,7 @@ static uint64_t get_pgtble_and_alloc_iova(struct kmem_cache *addr_cache,
 	struct pgtable_map *pgtble_ctx;
 	uint64_t addr;
 
-	pgtble_ctx = kiumd_get_pgtable_entry(kiumd_ctx, idx);
+	pgtble_ctx = xa_load(&kiumd_ctx->kiumd_xa_kgsl_pt, idx);
 	if (!pgtble_ctx) {
 		pr_err("%s:%d Invalid id for hash table: id: %d\n", __func__,
 			__LINE__, idx);
@@ -1113,12 +1074,25 @@ int set_kgsl_map_iova(struct kmem_cache *addr_cache, struct kiumd_ctx *kiumd_ctx
 	return 0;
 }
 
-void add_to_smmu_table(struct kiumd_ctx *ctx, struct smmu_map_data *map_data)
+int add_smap(struct kiumd_ctx *ctx, struct smmu_map_data *smap)
 {
-	spin_lock(&ctx->smmu_lock);
-	map_data->id = ctx->id++;
-	hash_add(ctx->smmu_table, &map_data->node, map_data->id);
-	spin_unlock(&ctx->smmu_lock);
+	int ret;
+
+	ret = xa_alloc(&ctx->kiumd_xa_smap, &smap->id, smap, xa_limit_31b,
+		       GFP_KERNEL);
+
+	if (ret)
+		dev_err(smap->dev, ":couldnt allocate ID\n");
+
+	return ret;
+
+}
+
+struct smmu_map_data *remove_smap(struct kiumd_ctx *ctx, int id)
+{
+
+	return xa_erase(&ctx->kiumd_xa_smap, id);
+
 }
 
 int set_allocated_iova(struct device *dev, unsigned long iova)
@@ -1410,15 +1384,6 @@ int kiumd_mmio_map(struct smmu_map_data *smap)
 
 }
 
-void release_map_data(struct kiumd_ctx *kiumd_ctx, struct smmu_map_data *smap)
-{
-	spin_lock(&kiumd_ctx->smmu_lock);
-	hash_del(&smap->node);
-	kfree(smap);
-	spin_unlock(&kiumd_ctx->smmu_lock);
-}
-
-
 void kiumd_dmabuf_zero_unmap(struct smmu_map_data *smap)
 {
 	struct iommu_domain *iommu_dom;
@@ -1458,7 +1423,6 @@ void kiumd_mmio_unmap(struct smmu_map_data *smap)
 {
 	dma_unmap_resource(smap->dev, smap->context->iova,
 			   smap->context->size, 0, 0);
-	kfree(smap->context);
 }
 
 unsigned long get_hash_key(struct device *dev)
@@ -1587,7 +1551,8 @@ int kiumd_hyp_unassign_sg(struct sg_table *sgt, int *source_vm_list,
 	struct scatterlist *sg;
 	u64 src_vmid_list[2] = {0};
 	u64 src_vmid_list_copy[2] = {0};
-	int ret, i;
+	int ret = 0;
+	int i = 0;
 
 	if (source_nelems <= 0)
 		return -EINVAL;

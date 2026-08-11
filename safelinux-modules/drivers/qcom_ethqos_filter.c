@@ -5,6 +5,8 @@
  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 */
 
+#define pr_fmt(fmt) "[qcom-ethqos-filter] %s: " fmt, __func__
+
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/io.h>
@@ -14,20 +16,23 @@
 #include <linux/uaccess.h>
 #include <linux/device.h>
 #include <linux/cdev.h>
+#include <linux/of.h>
+#include <linux/of_address.h>
 
-#define BASE_ADDR 	0x23000000
-#define MEM_SIZE  	0x1000
-#define DMA_CH 		4
-#define VLAN_N_VID	4095
+#define BASE_ADDR		            0x23000000
+#define MEM_SIZE		            0x1000
+#define DMA_CH			            4
+#define VLAN_N_VID		            4095
+#define MAX_VLAN_FILTERS	        32
 
 /*MAC_PACKET_FILTER RA & VTFE*/
-#define MAC_PACKET_FILTER		0x00000008
+#define MAC_PACKET_FILTER		    0x00000008
 #define MAC_PACKET_FILTER_RA		BIT(31)
 #define MAC_PACKET_FILTER_VTFE		BIT(16)
 
 /*VLAN MACRO*/
-#define MAC_VLAN_CTRL_TAG		0x00000050
-#define MAC_VLAN_DATA_TAG		0x00000054
+#define MAC_VLAN_TAG_CTRL		    0x00000050
+#define MAC_VLAN_TAG_DATA		    0x00000054
 
 /* MAC VLAN DATA Bit */
 #define MAC_VLAN_TAG_DATA_VID		GENMASK(15, 0)
@@ -44,54 +49,56 @@
 #define MAC_VLAN_TAG_CTRL_OFS_SHIFT	2
 
 /*HW VLAN tags supported*/
-#define MAC_HW_FEATURE3			0x00000128
-#define MAC_HW_FEAT_NRVF 		GENMASK(2, 0)
+#define MAC_HW_FEATURE3			    0x00000128
+#define MAC_HW_FEAT_NRVF		    GENMASK(2, 0)
 
 /*enable dynamic routing on queue0*/
 #define MAC_MTL_RXQ_DMA_MAP0		0x00000C30
 #define MAC_MTL_RXQ_DMA_MAP1		0x00000C34
-#define MTL_QUEUE_TO_DMA		0
+#define MTL_QUEUE_TO_DMA		    0
 
-#define MODIFY_DYNAMIC_DMA(queue, value, set) \
-	do { \
-		switch (queue) { \
-		case 0: \
-		case 4: \
-			if (set) \
-				value |= (1 << 4); \
-			else \
-				value &= ~(1 << 4); \
-			break; \
-		case 1: \
-		case 5: \
-			if (set) \
-				value |= (1 << 12); \
-			else \
-				value &= ~(1 << 12); \
-			break; \
-		case 2: \
-		case 6: \
-			if (set) \
-				value |= (1 << 20); \
-			else \
-				value &= ~(1 << 20); \
-			break; \
-		case 3: \
-		case 7: \
-			if (set) \
-				value |= (1 << 28); \
-			else \
-				value &= ~(1 << 28); \
-			break; \
-		default: \
-			break; \
-		} \
+#define MODIFY_DYNAMIC_DMA(queue, value, set)                  \
+	do {                                                       \
+		switch (queue) {                                       \
+		case 0:                                                \
+		case 4:                                                \
+			if (set)                                           \
+				value |= (1 << 4);                             \
+			else                                               \
+				value &= ~(1 << 4);                            \
+			break;                                             \
+		case 1:                                                \
+		case 5:                                                \
+			if (set)                                           \
+				value |= (1 << 12);                            \
+			else                                               \
+				value &= ~(1 << 12);                           \
+			break;                                             \
+		case 2:                                                \
+		case 6:                                                \
+			if (set)                                           \
+				value |= (1 << 20);                            \
+			else                                               \
+				value &= ~(1 << 20);                           \
+			break;                                             \
+		case 3:                                                \
+		case 7:                                                \
+			if (set)                                           \
+				value |= (1 << 28);                            \
+			else                                               \
+				value &= ~(1 << 28);                           \
+			break;                                             \
+		default:                                               \
+			break;                                             \
+		}                                                      \
 	} while (0)
 
-#define DEVICE_NAME "qcom_ethqos_filter_dev"
-#define CLASS_NAME "qcom_ethqos_filter_class"
-#define BUF_LEN 120
-#define EMAC_LINK_DOWN 2
+#define DEVICE_NAME		    "qcom_ethqos_filter_dev"
+#define CLASS_NAME		    "qcom_ethqos_filter_class"
+#define BUF_LEN			    120
+#define EMAC_LINK_DOWN		2
+#define VLAN_OP_DELAY_US	1000
+#define VLAN_OP_TIMEOUT_US	500000
 
 /* Command Line params */
 static unsigned long mac_base_addr = BASE_ADDR;
@@ -110,21 +117,20 @@ static int vlan_num;
 module_param(vlan_num, int, 0444);
 MODULE_PARM_DESC(vlan_num, "Number of VLAN IDs");
 
-static int vlan_ids[32] = {0};
+static int vlan_ids[MAX_VLAN_FILTERS] = {0};
 module_param_array(vlan_ids, int, NULL, 0444);
 MODULE_PARM_DESC(vlan_ids, "Array of VLAN IDs");
 
 enum {
 	DEL_GVM_THIN_VLAN = 2,
 	ADD_GVM_THIN_VLAN = 3,
-	ADD_ALL_VLAN = 4,
+	ADD_ALL_GVM_THIN_VLAN = 4,
 	GVM_REMOVE = 5
 };
 
 struct mac_device_info {
 	int num_vlan;
-	int vlan_filter[32];
-	int pvm_vlan_filter[32];
+	int vlan_filter[MAX_VLAN_FILTERS];
 };
 
 struct char_device_info {
@@ -137,7 +143,13 @@ struct char_device_info {
 struct mac_device_info *hw;
 static struct char_device_info char_dev_info;
 void __iomem *mac_base;
-static int vlan_added;
+
+static uint32_t build_gvm_vlan_filter(int vid, int dma_ch)
+{
+	return MAC_VLAN_TAG_DATA_ETV | MAC_VLAN_TAG_DATA_VEN |
+	       MAC_VLAN_TAG_DATA_DOVLTC | MAC_VLAN_TAG_DATA_DMACHEN |
+	       (dma_ch << MAC_VLAN_TAG_DATA_DMACHN) | vid;
+}
 
 static void enable_mac_packet_filter_config(void)
 {
@@ -192,28 +204,29 @@ static int write_vlan_filter(int index, uint32_t data)
 	if (index >= hw->num_vlan)
 		return -EINVAL;
 
-	writel(data, ioaddr + MAC_VLAN_DATA_TAG);
+	writel(data, ioaddr + MAC_VLAN_TAG_DATA);
 
-	val = readl(ioaddr + MAC_VLAN_CTRL_TAG);
+	val = readl(ioaddr + MAC_VLAN_TAG_CTRL);
 	val &= ~(MAC_VLAN_TAG_CTRL_OFS_MASK |
 		 MAC_VLAN_TAG_CTRL_CT |
 		 MAC_VLAN_TAG_CTRL_OB);
 	val |= (index << MAC_VLAN_TAG_CTRL_OFS_SHIFT) | MAC_VLAN_TAG_CTRL_OB;
-	writel(val, ioaddr + MAC_VLAN_CTRL_TAG);
+	writel(val, ioaddr + MAC_VLAN_TAG_CTRL);
 
 	/* Wait for done */
-	ret = readl_poll_timeout(ioaddr + MAC_VLAN_CTRL_TAG,
-		 val, !(val & MAC_VLAN_TAG_CTRL_OB), 1, 10);
+	ret = readl_poll_timeout(ioaddr + MAC_VLAN_TAG_CTRL,
+		 val, !(val & MAC_VLAN_TAG_CTRL_OB),
+		 VLAN_OP_DELAY_US, VLAN_OP_TIMEOUT_US);
 
 	if (!ret)
 		return ret;
-	pr_err("Timeout accessing MAC_VLAN_Tag_Filter\n");
+	pr_err("Timeout writing MAC_VLAN_Tag_Filter index %d\n", index);
 	return -EBUSY;
 }
 
 static int add_hw_vlan_rx_fltr_with_route(int vid, int dma_ch)
 {
-	uint32_t val = 0;
+	uint32_t val;
 	int ret, i;
 	int index = -1;
 
@@ -222,16 +235,20 @@ static int add_hw_vlan_rx_fltr_with_route(int vid, int dma_ch)
 		return -EINVAL;
 	}
 
-	/* Extended Rx VLAN Filter Enable */
-	val |= MAC_VLAN_TAG_DATA_ETV | MAC_VLAN_TAG_DATA_VEN | vid;
-	val |= MAC_VLAN_TAG_DATA_DOVLTC;
-	val |= MAC_VLAN_TAG_DATA_DMACHEN;
-	val |= (dma_ch << MAC_VLAN_TAG_DATA_DMACHN);
+	val = build_gvm_vlan_filter(vid, dma_ch);
 
 	for (i = 0; i < hw->num_vlan; i++) {
 		if (hw->vlan_filter[i] == val)
 			return 0;
-		else if (!(hw->vlan_filter[i] & MAC_VLAN_TAG_DATA_VEN))
+
+		if ((hw->vlan_filter[i] & MAC_VLAN_TAG_DATA_VEN) &&
+		    ((hw->vlan_filter[i] & MAC_VLAN_TAG_DATA_VID) == vid)) {
+			pr_err("Guest VLAN %d conflicts with existing filter[%d]=0x%x, expected 0x%x\n",
+			       vid, i, hw->vlan_filter[i], val);
+			return -EEXIST;
+		}
+
+		if (!(hw->vlan_filter[i] & MAC_VLAN_TAG_DATA_VEN))
 			index = i;
 	}
 
@@ -249,16 +266,15 @@ static int add_hw_vlan_rx_fltr_with_route(int vid, int dma_ch)
 
 static int del_hw_vlan_rx_fltr(int vid)
 {
+	uint32_t val = build_gvm_vlan_filter(vid, dma_ch);
 	int i, ret = 0;
 
 	/* Extended Rx VLAN Filter disable */
 	for (i = 0; i < hw->num_vlan; i++) {
-		if ((hw->vlan_filter[i] & MAC_VLAN_TAG_DATA_VID) == vid
-		    &&  hw->vlan_filter[i] != hw->pvm_vlan_filter[i]) {
+		if (hw->vlan_filter[i] == val) {
 			ret = write_vlan_filter(i, 0);
 			if (!ret) {
 				hw->vlan_filter[i] = 0;
-				hw->pvm_vlan_filter[i] = 0;
 			} else
 				return ret;
 		}
@@ -266,14 +282,14 @@ static int del_hw_vlan_rx_fltr(int vid)
 	return ret;
 }
 
-void read_available_vlan_tags(void)
+static int read_available_vlan_tags(void)
 {
 	void __iomem *ioaddr = mac_base;
 	uint32_t read_tag_reg, read_data_reg;
-	int i;
+	int i, ret;
 
 	for (i = 0; i < hw->num_vlan; i++) {
-		read_tag_reg = readl(ioaddr + MAC_VLAN_CTRL_TAG);
+		read_tag_reg = readl(ioaddr + MAC_VLAN_TAG_CTRL);
 		read_tag_reg &= ~(MAC_VLAN_TAG_CTRL_OFS_MASK |
 				  MAC_VLAN_TAG_CTRL_CT |
 				  MAC_VLAN_TAG_CTRL_OB);
@@ -281,21 +297,26 @@ void read_available_vlan_tags(void)
 				 MAC_VLAN_TAG_CTRL_OFS_MASK) |
 				 MAC_VLAN_TAG_CTRL_CT |
 				 MAC_VLAN_TAG_CTRL_OB);
-		writel(read_tag_reg, ioaddr + MAC_VLAN_CTRL_TAG);
+		writel(read_tag_reg, ioaddr + MAC_VLAN_TAG_CTRL);
+
+		/* Wait for done */
+		ret = readl_poll_timeout(ioaddr + MAC_VLAN_TAG_CTRL,
+					 read_tag_reg,
+					 !(read_tag_reg & MAC_VLAN_TAG_CTRL_OB),
+					 VLAN_OP_DELAY_US, VLAN_OP_TIMEOUT_US);
+		if (ret) {
+			pr_err("Timeout reading MAC_VLAN_Tag_Filter index %d\n", i);
+			return -EBUSY;
+		}
 
 		/*read data and store in local array*/
-		read_data_reg = readl(ioaddr + MAC_VLAN_DATA_TAG);
+		read_data_reg = readl(ioaddr + MAC_VLAN_TAG_DATA);
 		hw->vlan_filter[i] = read_data_reg;
-		hw->pvm_vlan_filter[i] = read_data_reg;
 		pr_debug("vlan added at index %d is %lu\n",
 			 i, (hw->vlan_filter[i] & MAC_VLAN_TAG_DATA_VID));
-		/* Wait for done */
-		readl_poll_timeout(ioaddr + MAC_VLAN_CTRL_TAG,
-				   read_tag_reg,
-				   !(read_tag_reg & MAC_VLAN_TAG_CTRL_OB),
-				   1, 10);
 	}
 	pr_debug("vlan array updated with HW\n");
+	return 0;
 }
 
 static int get_hw_num_vlan(void)
@@ -344,84 +365,155 @@ static void remove_char_device(void)
 	pr_debug("chrdev: Device removed successfully\n");
 }
 
-static void add_all_vlan_gvm(void)
+static void release_hw_vlan_state(void)
+{
+	if (!hw)
+		return;
+
+	disable_dynamic_dma_ch_selection(dma_dynamic_ch);
+	disable_mac_packet_filter_config();
+	kfree(hw);
+	hw = NULL;
+}
+
+static int init_hw_vlan_state(void)
+{
+	int ret;
+
+	hw = kzalloc(sizeof(struct mac_device_info), GFP_KERNEL);
+	if (!hw)
+		return -ENOMEM;
+
+	hw->num_vlan = get_hw_num_vlan();
+	enable_mac_packet_filter_config();
+	enable_dynamic_dma_ch_selection(dma_dynamic_ch);
+
+	ret = read_available_vlan_tags();
+	if (ret)
+		release_hw_vlan_state();
+
+	return ret;
+}
+
+static int add_all_vlan_gvm(void)
 {
 	int i, ret;
 
-	if (vlan_num > 0 && vlan_added == 0) {
-		vlan_added = 1;
-		hw = kzalloc(sizeof(struct mac_device_info), GFP_KERNEL);
-		if (!hw) {
-			pr_err("Failed to allocate memory to mac_device_info\n");
-			iounmap(mac_base);
-			remove_char_device();
-			return;
-		}
-		hw->num_vlan = get_hw_num_vlan();
-		enable_mac_packet_filter_config();
-		enable_dynamic_dma_ch_selection(dma_dynamic_ch);
-		read_available_vlan_tags();
+	if (vlan_num > MAX_VLAN_FILTERS) {
+		pr_err("Invalid VLAN count %d, maximum is %d\n",
+		       vlan_num, MAX_VLAN_FILTERS);
+		return -EINVAL;
+	}
+
+	if (vlan_num > 0 && !hw) {
+		ret = init_hw_vlan_state();
+		if (ret)
+			return ret;
 
 		for (i = 0; i < vlan_num; i++) {
 			ret = add_hw_vlan_rx_fltr_with_route(vlan_ids[i], dma_ch);
-			if (ret)
+			if (ret) {
 				pr_err("Failed to add VLAN filter for ID %d: %d\n",
 				       vlan_ids[i], ret);
+				while (--i >= 0)
+					del_hw_vlan_rx_fltr(vlan_ids[i]);
+				release_hw_vlan_state();
+				return ret;
+			}
 		}
+		pr_info("All GVM VLAN filters added successfully\n");
 	}
+	return 0;
 }
 
 static void add_last_vlan_gvm(int vid)
 {
-	if (vlan_num >= 32) {
-		pr_err("Maximum number of VLANs (32) already configured\n");
+	int i, ret;
+	bool was_hw_null = !hw;
+
+	for (i = 0; i < vlan_num; i++) {
+		if (vlan_ids[i] == vid) {
+			pr_info("GVM VLAN %d is already configured\n", vid);
+			return;
+		}
+	}
+
+	if (vlan_num >= MAX_VLAN_FILTERS) {
+		pr_err("Maximum number of VLANs (%d) already configured\n",
+		       MAX_VLAN_FILTERS);
 		return;
 	}
 
-	vlan_num++;
-	vlan_ids[vlan_num-1] = vid;
-	if (vlan_num > 0) {
-		if (vlan_added == 0) {
-			hw = kzalloc(sizeof(struct mac_device_info), GFP_KERNEL);
-			if (!hw) {
-				iounmap(mac_base);
-				remove_char_device();
-				vlan_num--;
-				return;
-			}
-			hw->num_vlan = get_hw_num_vlan();
-			enable_mac_packet_filter_config();
-			enable_dynamic_dma_ch_selection(dma_dynamic_ch);
-			read_available_vlan_tags();
-		}
-		vlan_added = 1;
-		add_hw_vlan_rx_fltr_with_route(vlan_ids[vlan_num-1], dma_ch);
+	if (was_hw_null) {
+		ret = init_hw_vlan_state();
+		if (ret)
+			return;
 	}
+
+	ret = add_hw_vlan_rx_fltr_with_route(vid, dma_ch);
+	if (ret) {
+		pr_err("Failed to add GVM VLAN %d filter: %d\n", vid, ret);
+		if (was_hw_null)
+			release_hw_vlan_state();
+		return;
+	}
+
+	vlan_ids[vlan_num++] = vid;
+	pr_info("GVM VLAN %d filter added successfully\n", vid);
 }
 
 static void remove_all_vlan_gvm(void)
 {
-	int i;
+	int i, ret;
+	bool failed = false;
 
-	if (vlan_num > 0 && vlan_added == 1) {
-		for (i = 0; i < vlan_num; i++)
-			del_hw_vlan_rx_fltr(vlan_ids[i]);
+	if (vlan_num > 0 && hw) {
+		for (i = 0; i < vlan_num; i++) {
+			ret = del_hw_vlan_rx_fltr(vlan_ids[i]);
+			if (ret) {
+				pr_err("Failed to remove GVM VLAN %d filter: %d\n",
+				       vlan_ids[i], ret);
+				failed = true;
+			}
+		}
 
-		disable_dynamic_dma_ch_selection(dma_dynamic_ch);
-		disable_mac_packet_filter_config();
-		kfree(hw);
-		vlan_added = 0;
+		release_hw_vlan_state();
+		if (failed)
+			pr_err("GVM VLAN filter remove-all finished with errors\n");
+		else
+			pr_info("All GVM VLAN filters removed\n");
 	}
+
+	memset(vlan_ids, 0, sizeof(vlan_ids));
+	vlan_num = 0;
+}
+
+/*
+ * Drop only the software shadow on link-down.  Keep HW filters and VTFE/RA
+ * active, and preserve vlan_ids[]/vlan_num so link-up can reprogram them.
+ */
+static void invalidate_vlan_sw_cache(void)
+{
+	kfree(hw);
+	hw = NULL;
+	pr_info("GVM VLAN filter cache deactivated\n");
 }
 
 static void remove_one_vlan_gvm(int vid)
 {
-	int i, index = -1;
+	int i, index = -1, ret;
 
-	if (vlan_num > 0 && vlan_added == 1) {
+	if (vlan_num > 0) {
 		for (i = 0; i < vlan_num; i++) {
 			if (vlan_ids[i] == vid) {
-				del_hw_vlan_rx_fltr(vlan_ids[i]);
+				if (hw) {
+					ret = del_hw_vlan_rx_fltr(vlan_ids[i]);
+					if (ret) {
+						pr_err("Failed to remove GVM VLAN %d filter: %d\n",
+						       vid, ret);
+						return;
+					}
+				}
 				index = i;
 				break;
 			}
@@ -432,14 +524,57 @@ static void remove_one_vlan_gvm(int vid)
 			vlan_ids[vlan_num - 1] = 0;
 			vlan_num--;
 
-			if (vlan_num == 0) {
-				vlan_added = 0;
-				disable_dynamic_dma_ch_selection(dma_dynamic_ch);
-				disable_mac_packet_filter_config();
-				kfree(hw);
-			}
+			if (vlan_num == 0)
+				release_hw_vlan_state();
+			pr_info("GVM VLAN %d filter removed\n", vid);
 		}
 	}
+}
+
+static int get_base_addr_by_compatible(const char *compatible,
+				       const char *reg_name,
+				       u64 *base_addr)
+{
+	struct device_node *np;
+	struct resource res;
+	int index;
+	int ret = 0;
+
+	if (!compatible || !reg_name || !base_addr)
+		return -EINVAL;
+
+	np = of_find_compatible_node(NULL, NULL, compatible);
+	if (!np) {
+		pr_err("%s: cannot find compatible node: %s\n",
+			__func__, compatible);
+		return -ENODEV;
+	}
+
+	index = of_property_match_string(np, "reg-names", reg_name);
+	if (index < 0) {
+		pr_err("%s: cannot find reg-names \"%s\" in node %pOF\n",
+			__func__, reg_name, np);
+		ret = index;
+		goto out_put_node;
+	}
+
+	ret = of_address_to_resource(np, index, &res);
+	if (ret) {
+		pr_err("%s: of_address_to_resource failed for %pOF, index=%d, ret=%d\n",
+			__func__, np, index, ret);
+		goto out_put_node;
+	}
+
+	*base_addr = (u64)res.start;
+
+	pr_info("%s: %pOF reg_name=%s base=0x%llx size=0x%llx\n",
+		__func__, np, reg_name,
+		(unsigned long long)*base_addr,
+		(unsigned long long)resource_size(&res));
+
+out_put_node:
+	of_node_put(np);
+	return ret;
 }
 
 
@@ -450,6 +585,7 @@ static ssize_t device_write(struct file *device_file, const char *buffer,
 	int vid = -1;
 	int pvm_link_state = -1;
 	int gvm_link_state = -1;
+	int ret;
 
 	if (len >= BUF_LEN) {
 		pr_err("chrdev: Input too large, maximum allowed is %d bytes\n", BUF_LEN - 1);
@@ -468,25 +604,31 @@ static ssize_t device_write(struct file *device_file, const char *buffer,
 		 &vlan_status, &vid, &pvm_link_state, &gvm_link_state) == 4) {
 		pr_debug("chrdev: Parsed VLAN status = %d, VID = %d, PVM = %d, GVM = %d\n",
 			 vlan_status, vid, pvm_link_state, gvm_link_state);
-		if (vlan_status == GVM_REMOVE) {
+		if (vlan_status != GVM_REMOVE &&
+		    (gvm_link_state == EMAC_LINK_DOWN ||
+		     pvm_link_state == EMAC_LINK_DOWN)) {
+			invalidate_vlan_sw_cache();
+			return len;
+		}
+
+		switch (vlan_status) {
+		case GVM_REMOVE:
 			remove_all_vlan_gvm();
-			vlan_num = 0;
-			pr_info("chrdev: VLAN config deleted successfully\n");
-		} else if (gvm_link_state == EMAC_LINK_DOWN) {
-			remove_all_vlan_gvm();
-			pr_info("chrdev: all VLAN filters removed successfully\n");
-		} else if (pvm_link_state == EMAC_LINK_DOWN) {
-			remove_all_vlan_gvm();
-			pr_info("chrdev: all VLAN filters removed successfully\n");
-		} else if (vlan_status == ADD_GVM_THIN_VLAN) {
+			break;
+		case ADD_GVM_THIN_VLAN:
 			add_last_vlan_gvm(vid);
-			pr_info("chrdev: qcom_ethqos_filter vlan %d added successfully\n", vid);
-		} else if (vlan_status == DEL_GVM_THIN_VLAN) {
+			break;
+		case DEL_GVM_THIN_VLAN:
 			remove_one_vlan_gvm(vid);
-			pr_info("chrdev: qcom_ethqos_filter vlan %d deleted successfully\n", vid);
-		} else if (vlan_status == ADD_ALL_VLAN) {
-			add_all_vlan_gvm();
-			pr_info("chrdev: qcom_ethqos_filter all vlan filters present added successfully\n");
+			break;
+		case ADD_ALL_GVM_THIN_VLAN:
+			ret = add_all_vlan_gvm();
+			if (ret)
+				pr_err("Failed to add all GVM VLAN filters: %d\n", ret);
+			break;
+		default:
+			pr_err("chrdev: Unsupported VLAN status %d\n", vlan_status);
+			break;
 		}
 	} else {
 		pr_err("chrdev: Failed to parse VLAN info from input\n");
@@ -554,23 +696,40 @@ err_alloc:
 
 static int __init filter_init(void)
 {
+	u64 base_addr = 0;
+	int ret = 0;
+
 	pr_debug("qcom_ethqos_filter probe start\n");
 	if (create_char_device()) {
 		pr_err("Failed to create char device\n");
 		return -ENOMEM;
 	}
-	mac_base = ioremap(mac_base_addr, MEM_SIZE);
+
+	ret = get_base_addr_by_compatible("qcom,sa8620p-ethqos",
+					  "stmmaceth", &base_addr);
+	if (ret)
+		ret = get_base_addr_by_compatible("qcom,sa8255p-ethqos",
+						  "stmmaceth", &base_addr);
+
+	if (!ret)
+		mac_base = ioremap(base_addr, MEM_SIZE);
+	else {
+		pr_warn("Failed to get MAC base address from DT, falling back to module param 0x%lx\n",
+			mac_base_addr);
+		mac_base = ioremap(mac_base_addr, MEM_SIZE);
+	}
+
 	if (!mac_base) {
 		pr_err("Failed to map memory region\n");
 		remove_char_device();
 		return -ENOMEM;
 	}
-	add_all_vlan_gvm();
-	if (vlan_num > 0 && !hw) {
+	ret = add_all_vlan_gvm();
+	if (ret) {
 		pr_err("Failed to initialize VLAN filtering\n");
 		iounmap(mac_base);
 		remove_char_device();
-		return -ENOMEM;
+		return ret;
 	}
 	pr_debug("qcom_ethqos_filter probe end\n");
 	return 0;
