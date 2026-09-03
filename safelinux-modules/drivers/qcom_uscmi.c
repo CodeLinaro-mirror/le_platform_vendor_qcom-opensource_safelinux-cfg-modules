@@ -380,37 +380,30 @@ static int __do_power_vote(struct device *pd, struct qcom_uscmi_client *cl,
 			dev_err(pd, "Power on failed (err=%d)\n", ret);
 			return ret;
 		}
-
 		old_vote = atomic_fetch_inc(&cl->pwr_votes[idx]);
 		dev_dbg(pd, "[client %s:%d] power refcount incremented to %d\n",
 			cl->comm, cl->pid, old_vote + 1);
 	} else {
-		/* Fix TOCTOU race: use atomic_fetch_dec and validate */
 		old_vote = atomic_fetch_dec(&cl->pwr_votes[idx]);
 		if (old_vote <= 0) {
 			/* Restore the counter */
 			atomic_inc(&cl->pwr_votes[idx]);
 			dev_warn(pd,
-				 "[client %s:%d] power refcount already 0\n",
-				 cl->comm, cl->pid);
+					"[client %s:%d] power refcount already 0\n",
+					cl->comm, cl->pid);
 			return -EINVAL;
 		}
 
+		dev_dbg(pd, "[client %s:%d] power refcount decremented to %d\n",
+				cl->comm, cl->pid, old_vote - 1);
+
 		ret = pm_runtime_put_sync(pd);
 		if (ret < 0) {
+			pm_runtime_get_noresume(pd);
+			atomic_inc(&cl->pwr_votes[idx]);
 			dev_err(pd, "Power off failed (err=%d)\n", ret);
-			/*
-			 * Note: pm_runtime_put_sync can fail but still
-			 * decrement usage_count. Our vote counter is already
-			 * decremented to stay in sync.
-			 */
-		}
-
-		dev_dbg(pd, "[client %s:%d] power refcount decremented to %d\n",
-			cl->comm, cl->pid, old_vote - 1);
-
-		if (ret < 0)
 			return ret;
+		}
 	}
 
 	return 0;
@@ -579,7 +572,8 @@ static int recalculate_perf_level(struct qcom_uscmi_dev *uscmi, int domain_idx)
 static int __do_perf_vote(struct device *pd, struct qcom_uscmi_dev *uscmi,
 			  struct qcom_uscmi_client *cl, int idx, int level)
 {
-	int ret, max_level, prev_level;
+	int ret, max_level, prev_level, def_level = 0;
+	struct dev_pm_opp *def_opp;
 
 	if (!pd)
 		return -EINVAL;
@@ -603,8 +597,16 @@ static int __do_perf_vote(struct device *pd, struct qcom_uscmi_dev *uscmi,
 	/* Recalculate aggregated level */
 	max_level = recalculate_perf_level(uscmi, idx);
 
-	if (max_level < 0)
-		return 0; /* No active votes, nothing to apply */
+	if (max_level < 0) {
+		def_opp = dev_pm_opp_find_level_ceil(pd, &def_level);
+		if (IS_ERR(def_opp)) {
+			cl->prf_votes[idx] = prev_level;
+			dev_err(pd, "failed to find default opp level\n");
+			return -ENODEV;
+		}
+		max_level = def_level;
+		dev_pm_opp_put(def_opp);
+	}
 
 	dev_dbg(pd, "[agg] max perf level updated to %d\n", max_level);
 
@@ -949,7 +951,10 @@ static void cleanup_client_domain(struct qcom_uscmi_dev *uscmi,
 		dev_dbg(pd, "fd closing with power refcount=%d, releasing\n",
 			old_vote);
 		while (old_vote > 0) {
-			__do_power_vote(pd, cl, idx, false);
+			ret = __do_power_vote(pd, cl, idx, false);
+			if (ret < 0)
+				dev_err(pd, "[client %s:%d] failed to release power vote: %d\n",
+					cl->comm, cl->pid, ret);
 			old_vote--;
 		}
 	}
@@ -1044,8 +1049,6 @@ static int qcom_uscmi_release(struct inode *inode, struct file *filp)
 
 	filp->private_data = NULL;
 
-	/* Drop reference acquired in open() */
-
 	dev_dbg(dev, "fd closed and cleaned up\n");
 
 	return ret;
@@ -1120,6 +1123,7 @@ static int uscmi_stats_show(struct seq_file *s, void *unused)
 	struct qcom_uscmi_dev *uscmi = s->private;
 	struct qcom_uscmi_client *cl;
 	int i;
+
 	/* Read atomic values once to avoid repeated atomic operations */
 	long long power_on_count = atomic64_read(&uscmi->stats.power_on_count);
 	long long power_off_count =
@@ -1146,7 +1150,7 @@ static int uscmi_stats_show(struct seq_file *s, void *unused)
 	seq_printf(s, "  Error count: %lld\n", error_count);
 	seq_printf(s, "  Current clients: %d\n", client_count);
 	seq_printf(s, "  Maximum clients: %d\n", max_clients);
-	seq_printf(s, "  Client limit: %u\n", uscmi->client_limit);
+	seq_printf(s, "  Client limit: %u\n", READ_ONCE(uscmi->client_limit));
 
 	seq_puts(s, "\nDomain Status:\n");
 	/* Try to acquire lock, skip if busy to avoid deadlock */
@@ -1185,7 +1189,7 @@ static int uscmi_stats_show(struct seq_file *s, void *unused)
 		if (cl->pwr_votes && cl->prf_votes) {
 			for (i = 0; i < uscmi->domain_count; i++) {
 				seq_printf(s,
-					   "    Domain %d: Power votes=%d, Perf level=%dn",
+					   "    Domain %d: Power votes=%d, Perf level=%d\n",
 					   i, atomic_read(&cl->pwr_votes[i]),
 					   cl->prf_votes[i]);
 			}
@@ -1391,6 +1395,7 @@ static int uscmi_register_miscdev(struct qcom_uscmi_dev *uscmi)
 		}
 	}
 	pm_runtime_forbid(dev);
+	pm_runtime_put_noidle(dev);
 
 	return 0;
 }
@@ -1525,7 +1530,6 @@ static int qcom_uscmi_probe(struct platform_device *pdev)
 static int qcom_uscmi_remove(struct platform_device *pdev)
 {
 	struct qcom_uscmi_dev *uscmi = platform_get_drvdata(pdev);
-	struct qcom_uscmi_client *cl, *tmp;
 	int i;
 
 	if (!uscmi)
@@ -1542,14 +1546,6 @@ static int qcom_uscmi_remove(struct platform_device *pdev)
 	misc_deregister(&uscmi->miscdev);
 
 	dev_info(uscmi->dev, "/dev/%s node removed\n", uscmi->name);
-
-	/* Clean up any remaining clients (defensive, should be empty) */
-	mutex_lock(&uscmi->dev_lock);
-	list_for_each_entry_safe(cl, tmp, &uscmi->clients, node) {
-		list_del(&cl->node);
-		qcom_uscmi_client_free(cl);
-	}
-	mutex_unlock(&uscmi->dev_lock);
 
 	/* Detach power domains if still attached */
 	if (uscmi->pd_list)
