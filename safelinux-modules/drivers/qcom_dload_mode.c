@@ -96,6 +96,12 @@ static int set_dump_mode(enum qcom_download_mode mode)
 		return -EIO;
 	}
 
+	if (mode == QCOM_DOWNLOAD_NODUMP) {
+		ret = qcom_scm_disable_sdi();
+		if (ret)
+			pr_err("dload: failed to disable SDI, ret = %d\n", ret);
+	}
+
 	dump_mode = mode;
 	return 0;
 }

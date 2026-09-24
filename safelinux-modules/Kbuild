@@ -84,3 +84,40 @@ qcom_remote_virq-objs := drivers/qcom_remote_virq.o
 
 obj-m += qcom_vm_cpufreq.o
 qcom_vm_cpufreq-objs := drivers/qcom_vm_cpufreq.o
+
+# ----------------------------------------------------------------------------
+# Secure DMA-BUF stack (qli2.0 only)
+#   qcom_secure_buffer.ko -> hyp_assign, SCM assign_mem glue
+#   mem_buf.ko            -> mem_buf_vmperm, mem_buf_dma_buf_export
+#   qcom_dma_heaps.ko     -> qcom,system, qcom,secure-pixel, qcom,secure-non-pixel
+# Load order at boot: qcom_secure_buffer -> mem_buf -> qcom_dma_heaps
+# ----------------------------------------------------------------------------
+
+ifeq ($(QLI2_SECURE_DMABUF),1)
+
+# Source tree mirrors qli1.0's in-kernel layout under drivers/qli2.0/:
+#   drivers/qli2.0/soc/qcom/            <- drivers/soc/qcom/
+#   drivers/qli2.0/soc/qcom/mem_buf/    <- drivers/soc/qcom/mem_buf/
+#   drivers/qli2.0/dma-buf/heaps/       <- drivers/dma-buf/heaps/
+#   drivers/qli2.0/include/             <- include/
+ccflags-y += -I$(SAFELINUX_MODULES_ROOT)/drivers/qli2.0/include
+
+obj-m += qcom_secure_buffer.o
+qcom_secure_buffer-objs := drivers/qli2.0/soc/qcom/secure_buffer.o
+
+obj-m += mem_buf.o
+mem_buf-objs := drivers/qli2.0/soc/qcom/mem_buf/mem-buf-dev.o \
+                drivers/qli2.0/soc/qcom/mem_buf/mem_buf_dma_buf.o \
+                drivers/qli2.0/soc/qcom/mem_buf/mem-buf-ids.o
+
+obj-m += qcom_dma_heaps.o
+qcom_dma_heaps-objs := drivers/qli2.0/dma-buf/heaps/qcom_dma_heap.o \
+                       drivers/qli2.0/dma-buf/heaps/qcom_dt_parser.o \
+                       drivers/qli2.0/dma-buf/heaps/qcom_sg_ops.o \
+                       drivers/qli2.0/dma-buf/heaps/qcom_system_heap.o \
+                       drivers/qli2.0/dma-buf/heaps/qcom_dynamic_page_pool.o \
+                       drivers/qli2.0/dma-buf/heaps/qcom_secure_system_heap.o \
+                       drivers/qli2.0/dma-buf/heaps/qcom_carveout_heap.o \
+                       drivers/qli2.0/dma-buf/heaps/qcom_dma_heap_secure_utils.o
+
+endif
