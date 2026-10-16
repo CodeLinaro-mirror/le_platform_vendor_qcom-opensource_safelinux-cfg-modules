@@ -69,6 +69,9 @@ qcom_l3_cache_config-objs := drivers/qcom_l3_cache_config.o
 obj-m += qcom_ethqos_filter.o
 qcom_ethqos_filter-objs := drivers/qcom_ethqos_filter.o
 
+obj-m += named_dmabuf.o
+named_dmabuf-objs := drivers/named_dmabuf.o
+
 ifdef CONFIG_MHI_BUS_EP
 obj-m += mhi_ep_net.o
 mhi_ep_net-objs := drivers/mhi_ep_net.o
