@@ -49,13 +49,22 @@ struct vdev_data {
 	struct device *dev;
 	int num_regions;
 	struct vdev_region *regions;
-	int num_irqs;
+	u32 num_irqs;
 	struct vdev_irq *irqs;
 	int num_reserved_regions;
 	struct miscdevice mdev;
 };
 
 #define miscdev_to_data(d) container_of(d, struct vdev_data, mdev)
+
+static struct vdev_irq *vdev_get_irq(struct vdev_data *vdev_data,
+		u32 irq_index)
+{
+	if (!vdev_data->irqs || irq_index >= vdev_data->num_irqs)
+		return NULL;
+
+	return &vdev_data->irqs[irq_index];
+}
 
 /**
  * vdev_register_eventfd - Register an eventfd for a given IRQ
@@ -73,11 +82,11 @@ static int vdev_register_eventfd(struct vdev_data *vdev_data, int eventfd, u32 i
 	struct eventfd_ctx *eventfd_ctx;
 	int hwirq;
 
-	if (irq_index >= vdev_data->num_irqs)
+	irq_ctx = vdev_get_irq(vdev_data, irq_index);
+	if (!irq_ctx)
 		return -EINVAL;
 
-	irq_ctx = &vdev_data->irqs[irq_index];
-	hwirq = vdev_data->irqs[irq_index].hwirq;
+	hwirq = irq_ctx->hwirq;
 	if (irq_ctx->eventfd_ctx) {
 		disable_irq(hwirq);
 		eventfd_ctx_put(irq_ctx->eventfd_ctx);
@@ -116,10 +125,9 @@ static int vdev_mask_interrupt(struct vdev_data *vdev_data, u32 irq_index)
 {
 	struct vdev_irq  *irq_ctx;
 
-	if (irq_index >= vdev_data->num_irqs)
+	irq_ctx = vdev_get_irq(vdev_data, irq_index);
+	if (!irq_ctx)
 		return -EINVAL;
-
-	irq_ctx = &vdev_data->irqs[irq_index];
 
 	if (!(irq_ctx->flags & VDEV_IRQ_INFO_MASKABLE))
 		return 0;
@@ -148,10 +156,9 @@ static int vdev_unmask_interrupt(struct vdev_data *vdev_data, u32 irq_index)
 {
 	struct vdev_irq  *irq_ctx;
 
-	if (irq_index >= vdev_data->num_irqs)
+	irq_ctx = vdev_get_irq(vdev_data, irq_index);
+	if (!irq_ctx)
 		return -EINVAL;
-
-	irq_ctx = &vdev_data->irqs[irq_index];
 
 	if (!(irq_ctx->flags & VDEV_IRQ_INFO_MASKABLE))
 		return 0;
@@ -524,20 +531,25 @@ static int vdev_irq_init(struct platform_device *pdev,
 					struct vdev_data *vdev_data)
 {
 	int ret = 0, i, hwirq;
+	int num_irqs;
+	struct vdev_irq *irqs;
 
-	vdev_data->num_irqs = platform_irq_count(pdev);
-	if (vdev_data->num_irqs <= 0) {
+	num_irqs = platform_irq_count(pdev);
+	if (num_irqs < 0)
+		return dev_err_probe(&pdev->dev, num_irqs,
+				"failed to get irq count\n");
+
+	if (!num_irqs) {
 		dev_info(&pdev->dev, "no IRQ resources provided\n");
-		return ret;
+		return 0;
 	}
 
-	vdev_data->irqs = devm_kzalloc(&pdev->dev,
-			vdev_data->num_irqs * sizeof(struct vdev_irq), GFP_KERNEL);
-	if (!vdev_data->irqs)
+	irqs = devm_kzalloc(&pdev->dev, num_irqs * sizeof(*irqs), GFP_KERNEL);
+	if (!irqs)
 		return dev_err_probe(&pdev->dev, -ENOMEM,
 				"failed to allocate memory\n");
 
-	for (i = 0; i < vdev_data->num_irqs; i++) {
+	for (i = 0; i < num_irqs; i++) {
 		irq_handler_t handler = vdev_irq_handler;
 
 		hwirq = platform_get_irq(pdev, i);
@@ -546,22 +558,25 @@ static int vdev_irq_init(struct platform_device *pdev,
 				"failed to get interrupt %d\n", i);
 
 		if (irq_get_trigger_type(hwirq) & IRQ_TYPE_LEVEL_MASK) {
-			vdev_data->irqs[i].flags |= VDEV_IRQ_INFO_MASKABLE;
+			irqs[i].flags |= VDEV_IRQ_INFO_MASKABLE;
 			handler = vdev_automasked_irq_handler;
 		}
 
-		vdev_data->irqs[i].count = 1;
-		vdev_data->irqs[i].hwirq = hwirq;
-		vdev_data->irqs[i].masked = false;
-		vdev_data->irqs[i].name = devm_kstrdup(&pdev->dev, vdev_data->name, GFP_KERNEL);
+		irqs[i].count = 1;
+		irqs[i].hwirq = hwirq;
+		irqs[i].masked = false;
+		irqs[i].name = devm_kstrdup(&pdev->dev, vdev_data->name, GFP_KERNEL);
 
-		ret = devm_request_irq(&pdev->dev, vdev_data->irqs[i].hwirq, handler,
-				IRQF_NO_AUTOEN, vdev_data->name, &vdev_data->irqs[i]);
+		ret = devm_request_irq(&pdev->dev, irqs[i].hwirq, handler,
+				IRQF_NO_AUTOEN, vdev_data->name, &irqs[i]);
 		if (ret)
 			return dev_err_probe(&pdev->dev, ret,
 					"failed to register interrupt handler for IRQ %d\n",
-						vdev_data->irqs[i].hwirq);
+						irqs[i].hwirq);
 	}
+
+	vdev_data->irqs = irqs;
+	vdev_data->num_irqs = num_irqs;
 
 	return ret;
 }
