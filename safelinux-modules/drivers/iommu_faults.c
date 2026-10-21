@@ -53,10 +53,11 @@ struct iommu_fault_entry {
  *
  * @fsr:              Fault Status Register value of the last recorded fault.
  * @iova:             IOVA of the last recorded fault.
+ * @fsynr1:           Fault Syndrome Register value of the last recorded fault.
  * @flag:             Set when fsr/iova hold an unread fault; cleared on sysfs
  *                     read. While set, new faults are dropped rather than
  *                     overwriting the unread record.
- * @lock:             Protects fsr/iova/flag (IRQ vs sysfs context).
+ * @lock:             Protects fsynr1/fsr/iova/flag (IRQ vs sysfs context).
  * @dev:              Device pointer.
  * @kobj:             kobject for this device's sysfs directory.
  * @fault_attr:       sysfs attribute (fsr_iova).
@@ -65,6 +66,7 @@ struct iommu_fault_entry {
 struct device_fault_info {
 	uint32_t fsr;
 	uint64_t iova;
+	uint32_t fsynr1;
 	bool flag;
 	spinlock_t lock;
 	struct device *dev;
@@ -115,8 +117,8 @@ static struct iommu_domain *get_default_iommu_domain(struct device *dev)
 
 /**
  * fsr_iova_show() - sysfs read for fsr_iova.
- * Returns "0x<fsr>:0x<iova>\n" for the most recently recorded unread fault,
- * or zeros if none is pending. Reading consumes the record: fsr/iova/flag
+ * Returns "0x<fsr>:0x<iova>:0x<fsynr1>\n" for the most recently recorded unread fault,
+ * or zeros if none is pending. Reading consumes the record: fsr/iova/fsynr1/flag
  * are cleared so a subsequent read returns zeros until the next fault.
  */
 static ssize_t fsr_iova_show(struct kobject *kobj, struct kobj_attribute *attr,
@@ -126,23 +128,26 @@ static ssize_t fsr_iova_show(struct kobject *kobj, struct kobj_attribute *attr,
 	unsigned long irqflags;
 	uint64_t iova = 0;
 	uint32_t fsr = 0;
+	uint32_t fsynr1 = 0;
 
 	fault_info = container_of(attr, struct device_fault_info, fault_attr);
 
 	spin_lock_irqsave(&fault_info->lock, irqflags);
 	if (fault_info->flag) {
-		fsr  = fault_info->fsr;
+		fsr = fault_info->fsr;
 		iova = fault_info->iova;
+		fsynr1 = fault_info->fsynr1;
 		fault_info->fsr = 0;
 		fault_info->iova = 0;
+		fault_info->fsynr1 = 0;
 		fault_info->flag = false;
 	}
 	spin_unlock_irqrestore(&fault_info->lock, irqflags);
 
 	/* Fire trace outside the spinlock to minimise lock hold time. */
-	trace_iommu_fault(fault_info->kobj->name, "sysfs_read", iova, fsr, 1);
+	trace_iommu_fault(fault_info->kobj->name, "sysfs_read", iova, fsr, fsynr1, 1);
 
-	return scnprintf(buf, PAGE_SIZE, "0x%x:0x%llx\n", fsr, iova);
+	return scnprintf(buf, PAGE_SIZE, "0x%x:0x%llx:0x%x\n", fsr, iova, fsynr1);
 }
 
 /**
@@ -171,6 +176,7 @@ static int iommu_fault_custom_handler(struct iommu_domain *domain,
 	struct arm_smmu_cfg *cfg;
 	unsigned long irqflags;
 	uint32_t fsr;
+	uint32_t fsynr1;
 	int ret = 0;
 
 	rcu_read_lock();
@@ -213,17 +219,19 @@ static int iommu_fault_custom_handler(struct iommu_domain *domain,
 	spin_unlock_irqrestore(&fault_info->lock, irqflags);
 
 	fsr = arm_smmu_cb_read(smmu_domain->smmu, cfg->cbndx, ARM_SMMU_CB_FSR);
+	fsynr1 = arm_smmu_cb_read(smmu_domain->smmu, cfg->cbndx, ARM_SMMU_CB_FSYNR1);
 
 	spin_lock_irqsave(&fault_info->lock, irqflags);
 	fault_info->fsr = fsr;
 	fault_info->iova = iova;
+	fault_info->fsynr1 = fsynr1;
 	fault_info->flag = true;
 	spin_unlock_irqrestore(&fault_info->lock, irqflags);
 
 	kernfs_notify(fault_info->kn);
 
 	/* No rate limit on tracepoints — use to observe fault storms. */
-	trace_iommu_fault(fault_info->kobj->name, "fault", iova, fsr, flags);
+	trace_iommu_fault(fault_info->kobj->name, "fault", iova, fsr, fsynr1, flags);
 
 	/*
 	 * FSR bit legend: TF=Translation Fault, AFF=Access Flag Fault,
@@ -232,7 +240,7 @@ static int iommu_fault_custom_handler(struct iommu_domain *domain,
 	 * UUT=Unsupported Upstream Transaction, SS=Stall State, MULTI=Multiple Faults.
 	 */
 	if (__ratelimit(&iommufault_rs))
-		dev_err(dev, "SMMU fault: iova=0x%lx fsr=0x%08x [%s%s%s%s%s%s%s%s%s%s] flags=0x%x\n",
+		dev_err(dev, "SMMU fault: iova=0x%lx fsr=0x%08x [%s%s%s%s%s%s%s%s%s%s] fsynr1=0x%x flags=0x%x\n",
 			iova, fsr,
 			(fsr & ARM_SMMU_FSR_TF)     ? "TF "     : "",
 			(fsr & ARM_SMMU_FSR_AFF)    ? "AFF "    : "",
@@ -244,7 +252,7 @@ static int iommu_fault_custom_handler(struct iommu_domain *domain,
 			(fsr & ARM_SMMU_FSR_UUT)    ? "UUT "    : "",
 			(fsr & ARM_SMMU_FSR_SS)     ? "SS "     : "",
 			(fsr & ARM_SMMU_FSR_MULTI)  ? "MULTI "  : "",
-			flags);
+			fsynr1, flags);
 
 out_unlock:
 	rcu_read_unlock();
@@ -391,7 +399,7 @@ static int match_and_register_fault(struct device *dev,
 
 	mutex_unlock(&fault_registry_mutex);
 
-	trace_iommu_fault(dev_name(dev), "register", 0, 0, 0);
+	trace_iommu_fault(dev_name(dev), "register", 0, 0, 0, 0);
 	dev_info(dev, "fault handler active at /sys/kernel/smmu_faults/%s/fsr_iova\n",
 		 dev_name(dev));
 
@@ -489,7 +497,7 @@ static int iommu_fault_bus_notifier(struct notifier_block *nb,
 		if (!dev_has_fault_property(dev))
 			return NOTIFY_DONE;
 
-		trace_iommu_fault(dev_name(dev), "bound_driver", 0, 0, 0);
+		trace_iommu_fault(dev_name(dev), "bound_driver", 0, 0, 0, 0);
 		if (!dev_iommu_ready(dev, &domain))
 			return NOTIFY_DONE;
 
