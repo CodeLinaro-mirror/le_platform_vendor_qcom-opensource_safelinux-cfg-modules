@@ -3,6 +3,7 @@
 
 #include <linux/cpu.h>
 #include <linux/cpumask.h>
+#include <linux/cpufreq.h>
 #include <linux/kref.h>
 #include <linux/ktime.h>
 #include <linux/limits.h>
@@ -1377,10 +1378,28 @@ static struct scmi_driver vm_cpufreq_drv = {
 	.id_table = scmi_id_table,
 };
 
+static bool vm_cpufreq_framework_disabled(void)
+{
+	/*
+	 * cpufreq_register_driver() returns -ENODEV as its very first check
+	 * when cpufreq.off=1 is set, before validating any driver callbacks.
+	 * Passing an empty driver data (no callbacks) returns -EINVAL when
+	 * the framework is active. Neither path registers anything or alters
+	 * state, so no cleanup is needed.
+	 */
+
+	return cpufreq_register_driver(NULL) == -ENODEV;
+}
+
 static int __init vm_cpufreq_init(void)
 {
 	struct device *cpu_dev;
 	int ret;
+
+	if (!vm_cpufreq_framework_disabled()) {
+		pr_info("cpufreq.off not set, skipping init\n");
+		return 0;
+	}
 
 	/* Create global kobject for userspace compatibility */
 	cpu_dev = get_cpu_device(0);

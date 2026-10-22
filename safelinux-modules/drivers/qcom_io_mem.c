@@ -1430,6 +1430,7 @@ static int umd_kgsl_init(struct device *parent_dev, struct device_node *child_np
 
 
 	kiumd_ctx = kgsl_data->kiumdctx;
+	xa_init_flags(&kiumd_ctx->kiumd_xa_smap, XA_FLAGS_ALLOC);
 	xa_init_flags(&kiumd_ctx->kiumd_xa_kgsl_pt, XA_FLAGS_ALLOC);
 
 	for (i = 0; i < num_irqs; i++) {
