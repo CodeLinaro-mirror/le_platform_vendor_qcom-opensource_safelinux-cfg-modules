@@ -376,9 +376,9 @@ static int qcom_dload_probe(struct platform_device *pdev)
 	struct qcom_dload_caps caps = {0};
 	int ret;
 
-	scm_dev = of_find_node_by_name(NULL, "qcom_scm");
+	scm_dev = of_find_node_with_property(NULL, "qcom,dload-mode");
 	if (!scm_dev) {
-		dev_err(dev, "Unable to find 'qcom_scm' node!\n");
+		dev_err(dev, "Unable to find node with 'qcom,dload-mode' property!\n");
 		return -ENODEV;
 	}
 
