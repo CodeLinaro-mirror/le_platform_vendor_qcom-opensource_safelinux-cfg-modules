@@ -573,6 +573,18 @@ static const struct conf_data sa8797_ddr_info = {
 	.gemnoc_channels = 8,
 };
 
+static const struct conf_data sa8797dc_ddr_info = {
+	.num_llcc_channels = 16,
+	.num_gemnoc_metrics = 8,
+	.num_hf_metrics = 0,
+	.num_sf_metrics = 0,
+	.llcc_offset = 0x69010,
+	.cabo_offset = 0x10B0A0,
+	.mmnoc_hf_offset = 0x46140,
+	.mmnoc_sf_offset = 0x9140,
+	.gemnoc_channels = 8,
+};
+
 static const struct conf_data sa8775_ddr_info = {
 	.num_llcc_channels = 6,
 	.num_gemnoc_metrics = 8,
@@ -599,6 +611,7 @@ static const struct conf_data sa7255_ddr_info = {
 static const struct of_device_id bwprofiler_of_match[] = {
 	{ .compatible = "qcom,seca_ddr_bwprofiler", .data = &seca_ddr_info},
 	{ .compatible = "qcom,sa8797_ddr_bwprofiler", .data = &sa8797_ddr_info},
+	{ .compatible = "qcom,sa8797dc_ddr_bwprofiler", .data = &sa8797dc_ddr_info},
 	{ .compatible = "qcom,sa8775_ddr_bwprofiler", .data = &sa8775_ddr_info},
 	{ .compatible = "qcom,sa8255_ddr_bwprofiler", .data = &sa8775_ddr_info},
 	{ .compatible = "qcom,sa8620_ddr_bwprofiler", .data = &sa7255_ddr_info},
