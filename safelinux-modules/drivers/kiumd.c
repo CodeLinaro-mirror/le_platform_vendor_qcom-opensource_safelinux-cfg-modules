@@ -6,7 +6,6 @@
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
-#include <linux/version.h>
 
 #define CREATE_TRACE_POINTS
 #include "safelinux_modules_trace.h"
@@ -30,12 +29,10 @@
 
 static struct kmem_cache *iommu_addr_cache;
 
-#if KERNEL_VERSION(6, 6, 145) > LINUX_VERSION_CODE
 /**
- * Added in kernel tag v6.12-rc1, backported to v6.6.145 in include/linux/file.h
+ * Added in kernel tag v6.12-rc1
  */
 DEFINE_FREE(fput, struct file *, if (_T) fput(_T))
-#endif
 
 /**
  * @Brief: This function provide the device
